@@ -1,0 +1,21 @@
+# Build products and local indexes
+/target/
+/.codeindex/
+*.crate
+*.bun-build
+.DS_Store
+__pycache__/
+
+# Private workloads, reports, archived implementations, and local tooling
+/old_prototype/
+/private/
+/.local/
+/benches/*
+!/benches/content.rs
+/.agents/
+/.claude/
+/docs/*.yml
+
+# Machine-local credentials and configuration
+.env
+.env.*
