@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/andybrewer/mvp",
+  "commit": "629ba5eb91362afe2504fdd09a1ac039e2fca420",
+  "evidence": "The custom property has one :root declaration outside media conditions. The authored CSS has exactly one var(--width-content) read; the example in index.html is plain preformatted text."
+}

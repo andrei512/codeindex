@@ -5,13 +5,28 @@ use super::{
 };
 use crate::domain::content_lookup::ExtentRead;
 use std::{io, ops::Range};
+pub(super) fn write_words(w: &mut impl io::Write, values: &[u64]) -> io::Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        // u64 has no padding and its native representation is the wire format.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        w.write_all(bytes)
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in values {
+            w.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
 pub(super) fn finish(w: &mut impl ExtentSink, start: u64, tables: [Vec<u64>; 2]) -> io::Result<()> {
     let directory = w.offset() - start;
     for offsets in tables {
         put(w, offsets.len())?;
-        for off in offsets {
-            w.write_all(&off.to_le_bytes())?;
-        }
+        write_words(w, &offsets)?;
     }
     w.write_all(&directory.to_le_bytes())
 }

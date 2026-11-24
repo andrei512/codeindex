@@ -1,0 +1,4 @@
+symbol	save	App.swift:2,App.swift:1
+definition	App.swift:3:14	App.swift:2:6	resolved
+references	App.swift:2:6	App.swift:3:14	resolved
+callers	App.swift:2:6	App.swift:3:14	resolved

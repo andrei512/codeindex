@@ -1,0 +1,5 @@
+# Only the nested var() is a variable use. String contents and the commented selector are inert.
+symbol	card	style.css:2:2
+symbol	phantom	-
+definition	style.css:3:28	style.css:1:9
+references	style.css:1:9	style.css:3:28

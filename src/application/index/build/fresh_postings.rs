@@ -1,6 +1,7 @@
 //! Bulk-load disjoint runs of file IDs. Joining runs in input order keeps
 //! every posting sorted without sorting or deduplicating owner IDs.
-use super::Unit;
+use super::{Unit, incremental::Postings};
+use crate::domain::content::fresh::{Product, Run};
 use crate::domain::{Document, FileId, content::ContentBuilder};
 use std::io;
 
@@ -21,14 +22,15 @@ fn run(first: usize, files: &[Unit<'_>]) -> io::Result<(ContentBuilder, ContentB
     Ok((paths, bodies))
 }
 
-pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, ContentBuilder)> {
+pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, Postings)> {
     let bytes: usize = units.iter().map(|u| u.text.len() + u.path.len()).sum();
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(8)
         .min(bytes.div_ceil(2 * 1024 * 1024));
-    if workers <= 1 {
-        return run(0, units);
+    if workers <= 1 || units.len() > u32::MAX as usize {
+        let (paths, bodies) = run(0, units)?;
+        return Ok((paths, Postings::Built(bodies)));
     }
     let target = bytes.div_ceil(workers);
     std::thread::scope(|scope| {
@@ -39,7 +41,19 @@ pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, ContentBu
             if size >= target || i + 1 == units.len() {
                 let first = start;
                 let slice = &units[first..=i];
-                jobs.push(scope.spawn(move || run(first, slice)));
+                jobs.push(scope.spawn(move || -> io::Result<_> {
+                    let mut paths = ContentBuilder::default();
+                    let mut bodies = Run::new();
+                    for (i, unit) in slice.iter().enumerate() {
+                        let id = first + i;
+                        paths.add(Document {
+                            file: FileId(id as u64),
+                            text: unit.path,
+                        })?;
+                        bodies.add(id as u32, unit.text);
+                    }
+                    Ok((paths, bodies))
+                }));
                 start = i + 1;
                 size = 0;
             }
@@ -48,12 +62,13 @@ pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, ContentBu
             job.join()
                 .map_err(|_| io::Error::other("posting worker failed"))?
         });
-        let (mut paths, mut bodies) = results.next().expect("nonempty input")?;
+        let (mut paths, first) = results.next().expect("nonempty input")?;
+        let mut bodies = vec![first];
         for result in results {
             let (p, b) = result?;
             paths.append_later(p);
-            bodies.append_later(b);
+            bodies.push(b);
         }
-        Ok((paths, bodies))
+        Ok((paths, Postings::Fresh(Product::transpose(bodies)?)))
     })
 }

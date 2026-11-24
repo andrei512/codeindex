@@ -1,0 +1,5 @@
+# The nowdoc body is an uninterpolated string. It cannot declare phantom or invoke actual. The invocation on line 6 is an ordinary global call.
+symbol	phantom	-
+symbol	actual	work.php:5:10
+definition	work.php:6:1	work.php:5:10	resolved
+references	work.php:5:10	work.php:6:1	resolved

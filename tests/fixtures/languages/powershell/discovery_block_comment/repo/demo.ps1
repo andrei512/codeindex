@@ -1,0 +1,4 @@
+<#
+function Phantom {}
+#>
+function Visible {}

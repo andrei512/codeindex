@@ -100,6 +100,32 @@ fn update_links(
         }
     }
 }
+struct RecordEdit {
+    old: Vec<u8>,
+    previous: Option<Parsed>,
+    next: Vec<u8>,
+}
+
+impl RecordEdit {
+    fn load(p: &dyn Previous, id: usize, old: Option<&Range<u64>>, next: Option<&Parsed>) -> io::Result<Self> {
+        let mut before = Vec::new();
+        let previous = if let Some(range) = old {
+            p.copy_bytes(range.clone(), &mut before)?;
+            let mut d = Decoder(&before);
+            if d.num()? != id { return Err(bad()); }
+            let mut data = d.0;
+            let parsed = Parsed::read_from(&mut data)?;
+            if !data.is_empty() { return Err(bad()); }
+            Some(parsed)
+        } else { None };
+        let mut after = Vec::new();
+        if let Some(parsed) = next {
+            put(&mut after, id)?;
+            parsed.write_to(&mut after)?;
+        }
+        Ok(Self { old: before, previous, next: after })
+    }
+}
 pub(super) fn write(
     w: &mut impl ExtentSink,
     p: &dyn Previous,
@@ -110,13 +136,30 @@ pub(super) fn write(
     let md = p.extent(MD);
     let base = md.start;
     let relevant = |f: &Entry| f.bytes.is_some() && markdown::is_markdown(f.path());
-    if files
-        .iter()
-        .zip(p.entries())
-        .zip(reuse)
-        .all(|((new, old), id)| id.is_some() || (!relevant(new) && !relevant(old)))
-    {
+    let mut edited = files.iter().zip(p.entries()).zip(reuse).enumerate()
+        .filter(|(_, ((new, old), prior))| prior.is_none() && (relevant(new) || relevant(old)));
+    let Some((id, _)) = edited.next() else {
         return retained::range(p, w, md);
+    };
+    // Equal-size records keep every directory offset. Equal destination sequences
+    // keep every (file, link ordinal) reverse posting, even when link spans move.
+    let mut prepared = None;
+    if edited.next().is_none()
+        && let Some(new) = locals[id].markdown.as_ref()
+        && let Some(record) = p.markdown_record(id)?
+    {
+        let edit = RecordEdit::load(p, id, Some(&record), Some(new))?;
+        if edit.old == edit.next {
+            return retained::range(p, w, md);
+        }
+        if edit.old.len() == edit.next.len() && keys(edit.previous.as_ref()).eq(keys(Some(new))) {
+            let mut run = Run::new(Some(p), w);
+            run.borrow(base..record.start)?;
+            run.replacement(record.start, &edit.old, &edit.next)?;
+            run.borrow(record.end..md.end)?;
+            return run.flush();
+        }
+        prepared = Some((id, edit));
     }
     let trailer = md
         .end
@@ -167,30 +210,18 @@ pub(super) fn write(
             }
             continue;
         }
-        let old_bytes = if let Some(r) = &old_range {
-            read(p, r.clone())?
-        } else {
-            vec![]
-        };
-        let old_parsed = if old_range.is_some() {
-            let mut d = Decoder(&old_bytes);
-            if d.num()? != id {
-                return Err(bad());
-            }
-            Some(Parsed::read_from(d.0)?)
-        } else {
-            None
-        };
         let new = local.markdown.as_ref();
-        update_links(id, old_parsed.as_ref(), new, &mut changes);
-        if let Some(m) = new {
-            let mut new_bytes = Vec::new();
-            put(&mut new_bytes, id)?;
-            m.write_to(&mut new_bytes)?;
+        let edit = if let Some((_, edit)) = prepared.take_if(|(file, _)| *file == id) {
+            edit
+        } else {
+            RecordEdit::load(p, id, old_range.as_ref(), new)?
+        };
+        update_links(id, edit.previous.as_ref(), new, &mut changes);
+        if new.is_some() {
             if let Some(r) = old_range {
-                run.replacement(r.start, &old_bytes, &new_bytes)?
+                run.replacement(r.start, &edit.old, &edit.next)?
             } else {
-                run.bytes(&new_bytes)?
+                run.bytes(&edit.next)?
             }
         }
     }

@@ -1,0 +1,10 @@
+# The parse subroutine accepts a signature, belongs to package Main and has three direct calls in that package.
+definition	brainfuck/bf.pl:92:41	brainfuck/bf.pl:82:5	resolved
+definition	brainfuck/bf.pl:128:24	brainfuck/bf.pl:82:5	resolved
+definition	brainfuck/bf.pl:155:24	brainfuck/bf.pl:82:5	resolved
+references	brainfuck/bf.pl:82:5	brainfuck/bf.pl:92:41,brainfuck/bf.pl:128:24,brainfuck/bf.pl:155:24	resolved
+callers	brainfuck/bf.pl:82:5	brainfuck/bf.pl:92:41,brainfuck/bf.pl:128:24,brainfuck/bf.pl:155:24	resolved
+# The similarly named assignment targets $parsed_loop and $parsed are variables.
+definition	brainfuck/bf.pl:92:18	-	unresolved
+definition	brainfuck/bf.pl:128:10	-	unresolved
+definition	brainfuck/bf.pl:155:10	-	unresolved

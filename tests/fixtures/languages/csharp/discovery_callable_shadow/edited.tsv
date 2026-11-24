@@ -1,0 +1,7 @@
+# Rename only the parameter. The original call now names the implementation and must leave the old lexical binding.
+definition	Scope.cs:4:30	Scope.cs:2:17	resolved
+references	Scope.cs:2:17	Scope.cs:4:30,Scope.cs:3:48	resolved
+callers	Scope.cs:2:17	Scope.cs:4:30|positive,Scope.cs:3:48|shadow	resolved
+definition	Scope.cs:3:48	Scope.cs:2:17	resolved
+references	Scope.cs:3:38	-	resolved
+callers	Scope.cs:3:38	-	resolved

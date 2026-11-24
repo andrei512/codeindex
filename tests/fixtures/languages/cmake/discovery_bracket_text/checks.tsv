@@ -1,0 +1,5 @@
+# A bracket comment hides ghost and a bracket argument stores ping() literally. Only line 9 invokes the function.
+symbol	ping	CMakeLists.txt:3:10
+symbol	ghost	-
+references	CMakeLists.txt:3:10	CMakeLists.txt:9:1
+definition	CMakeLists.txt:9:1	CMakeLists.txt:3:10

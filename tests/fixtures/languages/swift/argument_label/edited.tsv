@@ -1,0 +1,4 @@
+definition	App.swift:3:14	App.swift:1:6	resolved
+references	App.swift:1:6	App.swift:3:14	resolved
+callers	App.swift:1:6	App.swift:3:14	resolved
+references	App.swift:2:6	-	resolved

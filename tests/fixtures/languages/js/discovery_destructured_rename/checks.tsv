@@ -1,0 +1,3 @@
+# The destructuring parameter binds renamed; neither property key is a use of the outer value. Node prints 42 then 1.
+references	app.mjs:1:7	app.mjs:5:31	resolved
+definition	app.mjs:3:10	app.mjs:2:22	resolved

@@ -1,0 +1,6 @@
+# The explicit super receiver selects Parent.emit. The explicit this receiver statically selects Scope.emit. Neither call is a use of the other declaration.
+symbol	emit	Scope.java:2:10,Scope.java:5:20
+definition	Scope.java:6:33	Scope.java:2:10	resolved
+definition	Scope.java:7:31	Scope.java:5:20	resolved
+references	Scope.java:2:10	Scope.java:6:33	resolved
+references	Scope.java:5:20	Scope.java:7:31	resolved

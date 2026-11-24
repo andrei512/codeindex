@@ -1,4 +1,4 @@
-use super::{Binding, Language, Lookup, Names, Site, Unit};
+use super::{Binding, Language, Lookup, ForwardNames, Site, Unit};
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
@@ -192,7 +192,7 @@ fn namespace<'a>(
 pub(in crate::domain::code) fn resolve(
     units: &[Unit],
     paths: &HashMap<&str, usize>,
-    out: &mut Names,
+    out: &mut ForwardNames,
 ) {
     let projects = super::projects::Projects::read(units);
     let mut modules = Vec::with_capacity(units.len());
@@ -343,6 +343,25 @@ pub(in crate::domain::code) fn resolve(
             let c = &u.analysis.calls[local];
             let name = &u.text[c.span.clone()];
             let target = match lookup {
+                Lookup::Super {
+                    scope,
+                    base_scope,
+                    base,
+                } => {
+                    // Only the builtin zero-argument form on a single written base.
+                    let owner = match e.binding(*base_scope, &u.text[base.clone()]) {
+                        Some(Binding::Local(id)) => Some(Site { file, local: *id }),
+                        Some(Binding::Import(n)) => exported(file, *n, None),
+                        _ => None,
+                    };
+                    owner
+                        .filter(|s| {
+                            e.binding(*scope, "super").is_none()
+                                && units[s.file].analysis.declarations[s.local].kind
+                                    == "class_definition"
+                        })
+                        .and_then(|s| member(units, s, name, false, |f, n| exported(f, n, None)))
+                }
                 Lookup::Construct { scope } => {
                     let definition = match e.binding(*scope, name) {
                         Some(Binding::Local(id)) => Some(Site { file, local: *id }),
@@ -388,11 +407,11 @@ pub(in crate::domain::code) fn resolve(
                     if let Some(n) = package {
                         exported(file, n, Some(name))
                     } else {
-                        let targets = out.targets.get(&Site {
+                        let targets = out.row(Site {
                             file,
                             local: *prior,
                         });
-                        targets.and_then(|ids| ids.first()).and_then(|&d| {
+                        targets.first().and_then(|&d| {
                             member(units, d, name, u.analysis.calls[*prior].is_call, |f, n| {
                                 exported(f, n, None)
                             })
@@ -458,6 +477,9 @@ pub(in crate::domain::code) fn resolve(
                                 result = Some(shape);
                                 break;
                             }
+                            if e.scopes[i].this_boundary {
+                                break;
+                            }
                             here = e.scopes[i].parent;
                         }
                         result
@@ -474,7 +496,19 @@ pub(in crate::domain::code) fn resolve(
                                 Some(Site { file, local: *id })
                             }
                             Some(Binding::Import(n)) => {
-                                exported(file, *n, receiver.as_ref().map(|_| name))
+                                let result = exported(file, *n, receiver.as_ref().map(|_| name));
+                                result.or_else(|| {
+                                    receiver.as_ref()?;
+                                    let owner = exported(file, *n, None)?;
+                                    if units[owner.file].analysis.declarations[owner.local].kind
+                                        != "module_declaration"
+                                    {
+                                        return None;
+                                    }
+                                    member(units, owner, name, false, |f, imp| {
+                                        exported(f, imp, None)
+                                    })
+                                })
                             }
                             Some(Binding::Local(id)) if receiver.is_some() => {
                                 member(units, Site { file, local: *id }, name, false, |f, n| {

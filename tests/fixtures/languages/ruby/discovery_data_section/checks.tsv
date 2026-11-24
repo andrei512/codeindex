@@ -1,0 +1,5 @@
+# Ruby lexer stops at a column-one __END__. The last class is DATA text. Only line 4 invokes Job.visible().
+symbol	Phantom	-
+symbol	decoy	-
+symbol	visible	demo.rb:2:12
+references	demo.rb:2:12	demo.rb:4:5	resolved

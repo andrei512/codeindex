@@ -1,0 +1,5 @@
+# The bracket level of the long string is two. All of line 2 is text, so its apparent declaration and call are inert.
+symbol	phantom	-
+symbol	real	app.lua:4:16
+definition	app.lua:5:1	app.lua:4:16	resolved
+references	app.lua:4:16	app.lua:5:1	resolved

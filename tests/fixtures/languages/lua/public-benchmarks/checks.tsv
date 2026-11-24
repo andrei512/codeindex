@@ -1,0 +1,5 @@
+# The parse function is local inside Brainfuck. Its only uses are the direct recursive call and a second call from the nested run function.
+definition	brainfuck/bf.lua:78:24	brainfuck/bf.lua:62:18	resolved
+definition	brainfuck/bf.lua:107:10	brainfuck/bf.lua:62:18	resolved
+references	brainfuck/bf.lua:62:18	brainfuck/bf.lua:78:24,brainfuck/bf.lua:107:10	resolved
+callers	brainfuck/bf.lua:62:18	brainfuck/bf.lua:78:24,brainfuck/bf.lua:107:10	resolved

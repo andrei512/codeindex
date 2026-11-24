@@ -9,6 +9,8 @@ A profile defines which evidence a language pack supplies, which contextual look
 
 Within an analysis, a written declaration or use has a typed local ordinal and a source span. Binding gives the site a role and target in a file and context. Merged declarations can contribute several sites for one symbol. Two overloaded methods can have identical spellings and distinct targets. Intern the language key once per retained namespace. Store target ordinals in bindings. Order of worker completion must never allocate a public label.
 
+For a call through a parameter, `definition` on the callable name returns the parameter declaration and `references` on the parameter includes the invocation. The parameter identifies the lexical binding. A `callers` edge to a function requires evidence that the invocation reaches that implementation. Taking a function as a value also contributes a reference and leaves its callers list unchanged.
+
 When a language introduces an entity without a separately written declaration, use a generated key with the producing semantic namespace, owning symbol or expansion site, generated role, and a deterministic discriminator supplied by the pack. Multiple outputs of the same macro invocation require distinct discriminators. Preserve the mapping to a source site when the reference oracle exposes one. An implicit symbol can have no user-visible declaration span. Derive exported keys from the language's actual package instance and descriptor. A spelling or byte offset in isolation is insufficient.
 
 For compatibility, a public label can be a projection of a native identity. Preserve the archived logical label when comparing frozen graph rows and public output. Two key encoders are relevant:

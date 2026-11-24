@@ -80,17 +80,77 @@ fn identity(pin: &Pin, d: &Decl) -> String {
         format!("{engine} {path} {} {}", d.span.start, d.name)
     }
 }
+pub enum Subject<'a> {
+    Name(&'a str),
+    Position(&'a str, usize, usize),
+}
+
 pub fn query(
     pin: &Pin,
     cwd: &Path,
     op: &str,
-    path: &str,
-    line: usize,
-    col: usize,
+    subject: Subject<'_>,
+    display: &super::Display,
+    outcome: &mut super::Outcome,
 ) -> io::Result<String> {
-    let path = relative(&pin.root, cwd, path)?;
-    let file = pin.files.binary_search_by(|f| f.path().cmp(&path)).ok();
-    let profile = Language::for_path(&path);
+    let compact = display.public && !display.json;
+    let mut symbols = SymbolLookup::open(pin.reader(SYMBOLS)?, pin.files.len())?;
+    let mut decls = BTreeMap::new();
+    let (path, file, position) = match subject {
+        Subject::Name(name) => {
+            let (id, decl) = match symbols.named_target(name) {
+                Err(e) if display.public && e.kind() == io::ErrorKind::NotFound => {
+                    outcome.code = 1;
+                    outcome.diagnostics = format!("cx: unresolved name {name}\n");
+                    return Ok(if compact {
+                        String::new()
+                    } else {
+                        response(
+                            pin,
+                            op,
+                            false,
+                            "unresolved",
+                            "[]".into(),
+                            vec![],
+                            vec![],
+                            false,
+                        )
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                    let symbol = name.rsplit("::").next().unwrap_or(name);
+                    let advice = if display.public {
+                        format!("cx --symbol {symbol} --column and pass the selected path, line and byte column to cx --reference from the repository root")
+                    } else {
+                        format!("cx --symbol {symbol} --json and pass the selected path, line and col to cx --cx {op} from the repository root")
+                    };
+                    return Err(io::Error::new(e.kind(), format!("{e}; use {advice}")));
+                }
+                result => result?,
+            };
+            let file = decl.file;
+            decls.insert(id, decl);
+            (pin.files[file].path().to_owned(), Some(file), None)
+        }
+        Subject::Position(input, line, col) => {
+            let path = relative(&pin.root, cwd, input)?;
+            let file = pin.files.binary_search_by(|f| f.path().cmp(&path)).ok();
+            (path, file, Some((line, col)))
+        }
+    };
+    let mut profile = Language::for_path(&path);
+    if profile == Some(Language::Sql)
+        && let Some(file) = file
+    {
+        symbols.visit_file(file, |_, declaration| {
+            if matches!(
+                declaration.kind.as_str(),
+                "plpgsql_function" | "plpgsql_procedure"
+            ) {
+                profile = Some(Language::PlPgSql);
+            }
+        })?;
+    }
     let unsupported = op == "callers"
         && matches!(
             profile,
@@ -100,6 +160,7 @@ pub fn query(
                     | Language::Css
                     | Language::Sql
                     | Language::Starlark
+                    | Language::Procfile
             )
         );
     let indexed = file.is_some_and(|i| pin.files[i].bytes.is_some())
@@ -107,6 +168,18 @@ pub fn query(
         && !matches!(profile, Some(Language::Sql | Language::Starlark));
     let context_id = context_key(pin, &path, profile);
     if !indexed || unsupported {
+        if display.public {
+            outcome.code = 2;
+        }
+        if compact {
+            outcome.diagnostics = if indexed {
+                "cx: unsupported operation\n"
+            } else {
+                "cx: unindexed document\n"
+            }
+            .into();
+            return Ok(String::new());
+        }
         let contexts = if indexed {
             array([object(&[
                 ("context", quote(&context_id)),
@@ -133,54 +206,68 @@ pub fn query(
         ));
     }
     let file = file.ok_or_else(bad)?;
-    let start = pin.files[file]
-        .line_start(line)
-        .ok_or_else(|| io::Error::other("line outside document"))?;
-    let entry = &pin.files[file];
-    let end = entry
-        .line_ends
-        .get(line - 1)
-        .map(|&n| n as u64)
-        .unwrap_or_else(|| entry.bytes.as_ref().map_or(0, |r| r.end - r.start));
-    let at = start + byte_at(&pin.source_slice(file, start as u64..end)?, 0, col)?;
-    let mut symbols = SymbolLookup::open(pin.reader(SYMBOLS)?, pin.files.len())?;
     let mut graph = Relations::open(pin.reader(REL)?, pin.files.len(), symbols.count())?;
     let mut targets = BTreeSet::new();
     let mut bindings = BTreeMap::<&str, BTreeSet<usize>>::new();
-    let mut shortest = usize::MAX;
-    let mut select = |span: &std::ops::Range<usize>, ids: &[usize], role: &'static str| {
-        if span.contains(&at) && span.len() <= shortest {
-            if span.len() < shortest {
-                targets.clear();
-                bindings.clear();
-                shortest = span.len();
-            }
-            targets.extend(ids.iter().copied());
-            bindings
-                .entry(role)
-                .or_default()
-                .extend(ids.iter().copied());
-        }
-    };
-    symbols.visit_file(file, |id, d| {
-        if d.kind != "source_file" {
-            select(&d.span, &[id], "definition");
-        }
-    })?;
-    graph.visit_file(file, |u| {
-        select(
-            &u.span,
-            &u.targets,
-            if u.is_call {
-                "call_target"
+    if let Some((line, col)) = position {
+        let start = pin.files[file]
+            .line_start(line)
+            .ok_or_else(|| io::Error::other("line outside document"))?;
+        let entry = &pin.files[file];
+        let end = entry
+            .line_ends
+            .get(line - 1)
+            .map(|&n| n as u64)
+            .unwrap_or_else(|| entry.bytes.as_ref().map_or(0, |r| r.end - r.start));
+        let text = pin.source_slice(file, start as u64..end)?;
+        let at = start
+            + if display.public {
+                let offset = col - 1;
+                let body = text.trim_end_matches(['\r', '\n']);
+                if offset >= body.len() || !body.is_char_boundary(offset) {
+                    return Err(io::Error::other("invalid byte column"));
+                }
+                offset
             } else {
-                "reference"
-            },
-        )
-    })?;
-    let mut decls = BTreeMap::new();
-    for &id in &targets {
-        decls.insert(id, symbols.semantic_declaration(id as u64)?);
+                byte_at(&text, 0, col)?
+            };
+        let mut shortest = usize::MAX;
+        let mut select = |span: &std::ops::Range<usize>, ids: &[usize], role: &'static str| {
+            if span.contains(&at) && span.len() <= shortest {
+                if span.len() < shortest {
+                    targets.clear();
+                    bindings.clear();
+                    shortest = span.len();
+                }
+                targets.extend(ids.iter().copied());
+                bindings
+                    .entry(role)
+                    .or_default()
+                    .extend(ids.iter().copied());
+            }
+        };
+        symbols.visit_file(file, |id, d| {
+            if d.kind != "source_file" {
+                select(&d.span, &[id], "definition");
+            }
+        })?;
+        graph.visit_file(file, |u| {
+            select(
+                &u.span,
+                &u.targets,
+                if u.is_call {
+                    "call_target"
+                } else {
+                    "reference"
+                },
+            )
+        })?;
+        for &id in &targets {
+            decls.insert(id, symbols.semantic_declaration(id as u64)?);
+        }
+    } else {
+        targets.extend(decls.keys().copied());
+        bindings.insert("definition", targets.clone());
     }
     // Keep only the first 50 distinct public rows. A later candidate can
     // displace the largest key; once truncated, the flag can never clear.
@@ -223,6 +310,22 @@ pub fn query(
         }
     }
     let mut hits = Vec::new();
+    if display.public {
+        outcome.code = u8::from(ordered.is_empty());
+    }
+    if compact {
+        if truncated {
+            outcome.diagnostics.push_str("cx: results truncated\n");
+        }
+        if targets.is_empty() {
+            outcome.diagnostics.push_str("cx: unresolved position\n");
+        }
+        outcome
+            .diagnostics
+            .push_str("cx: partial reference coverage\n");
+        let sites = ordered.into_keys().map(|(f, b, _, _)| (f, b)).collect();
+        return super::display::render(pin, cwd, sites, display, false);
+    }
     let mut evidence = Vec::new();
     let mut previous = None;
     for ((f, byte, symbol, caller), ids) in ordered {
@@ -340,6 +443,7 @@ fn context_key(pin: &Pin, path: &str, profile: Option<Language>) -> String {
         Some(Language::Html) => ("html", None),
         Some(Language::Sql) => ("sql", None),
         Some(Language::Starlark) => ("starlark", None),
+        Some(lang) => (lang.extended_name().unwrap_or("unknown"), None),
         None => ("unknown", None),
     };
     let entry = manifest

@@ -1,0 +1,6 @@
+# A textarea exposes text and a JSON data block contains no JavaScript functions. Only the module contains a call.
+symbol	live	index.html:3:10
+symbol	ghost	-
+symbol	fake	-
+definition	index.html:4:42	index.html:4:32
+references	index.html:4:32	index.html:4:42

@@ -1,0 +1,6 @@
+# COPY heredoc stores the inner FROM line as file contents. Only build and final are stages.
+symbol	build	Dockerfile:2:16
+symbol	final	Dockerfile:6:17
+symbol	phantom	-
+definition	Dockerfile:7:13	Dockerfile:2:16
+references	Dockerfile:2:16	Dockerfile:7:13

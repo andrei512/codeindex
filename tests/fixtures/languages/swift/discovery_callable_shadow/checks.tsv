@@ -1,0 +1,8 @@
+# A function-valued parameter shadows the outer function for the entire body of shadow. The call in positive binds to the outer definition; a block-local integer, where present, goes out of scope before the call in scoped. The fixture does not infer which function is passed at runtime.
+# swiftc -typecheck -dump-ast Scope.swift reports the lexical declaration at 2:15 in shadow and at 1:6 in positive.
+definition	Scope.swift:3:19	Scope.swift:1:6	resolved
+references	Scope.swift:1:6	Scope.swift:3:19	resolved
+callers	Scope.swift:1:6	Scope.swift:3:19|positive	resolved
+definition	Scope.swift:2:37	Scope.swift:2:15	resolved
+references	Scope.swift:2:15	Scope.swift:2:37	resolved
+callers	Scope.swift:2:15	-	resolved

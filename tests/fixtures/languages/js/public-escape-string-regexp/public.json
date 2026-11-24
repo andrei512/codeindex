@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/sindresorhus/escape-string-regexp",
+  "commit": "a7f7dabaf336bda98d2166848af15d9168b10bcf",
+  "evidence": "TypeScript 5.9.3 language-service getDefinitionAtPosition (NodeNext, allowJs and checkJs) selects index.d.ts:16:25 for test.js:6:3. Both index.js and index.d.ts have written declarations."
+}

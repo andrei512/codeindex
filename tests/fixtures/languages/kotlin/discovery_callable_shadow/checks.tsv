@@ -1,0 +1,8 @@
+# A function-valued parameter shadows the outer function for the entire body of shadow. The call in positive binds to the outer definition; a block-local integer, where present, goes out of scope before the call in scoped. The fixture does not infer which function is passed at runtime.
+definition	Scope.kt:3:18	Scope.kt:1:5	resolved
+references	Scope.kt:1:5	Scope.kt:3:18,Scope.kt:4:46	resolved
+callers	Scope.kt:1:5	Scope.kt:3:18|positive,Scope.kt:4:46|scoped	resolved
+definition	Scope.kt:2:34	Scope.kt:2:12	resolved
+references	Scope.kt:2:12	Scope.kt:2:34	resolved
+definition	Scope.kt:4:46	Scope.kt:1:5	resolved
+callers	Scope.kt:2:12	-	resolved

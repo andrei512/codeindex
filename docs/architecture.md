@@ -42,3 +42,4 @@ Moving unchanged Markdown from `a/notes.md` to `b/notes.md` preserves its headin
 - [System catalog](boxes/README.md) locates each of the eight components and its contracts.
 - [Build and query cases](build-cases.md) traces ownership and required work across refresh, failure and concurrent reads.
 - [Comparing implementations](conformance.md) defines independent query witnesses and experiments for physical design choices.
+- [Repairing the conformance findings](conformance-repair.md) assigns the known discrepancies to owners and defines how to verify their fixes.

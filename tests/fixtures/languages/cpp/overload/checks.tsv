@@ -1,0 +1,4 @@
+symbol	save	app.cpp:2,app.cpp:1
+definition	app.cpp:3:20	app.cpp:2:5	resolved
+references	app.cpp:2:5	app.cpp:3:20	resolved
+callers	app.cpp:2:5	app.cpp:3:20	resolved

@@ -1,0 +1,2 @@
+symbol	UserAccountLogic_checkExists	samples/PLpgSQL/useraccount.pgsql:69:28
+definition	samples/PLpgSQL/useraccount.pgsql:69:28	samples/PLpgSQL/useraccount.pgsql:69:28	resolved

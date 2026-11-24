@@ -1,0 +1,8 @@
+# Rename only the parameter. The original call now names the implementation and must leave the old lexical binding.
+definition	scope.dart:3:19	scope.dart:1:6	resolved
+references	scope.dart:1:6	scope.dart:3:19,scope.dart:4:49,scope.dart:2:39	resolved
+callers	scope.dart:1:6	scope.dart:3:19|positive,scope.dart:4:49|scoped,scope.dart:2:39|shadow	resolved
+definition	scope.dart:2:39	scope.dart:1:6	resolved
+references	scope.dart:2:29	-	resolved
+definition	scope.dart:4:49	scope.dart:1:6	resolved
+callers	scope.dart:2:29	-	resolved

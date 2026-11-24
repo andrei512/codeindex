@@ -1,0 +1,7 @@
+symbol	size	default.nix:2:3,default.nix:4:5
+symbol	doubled	default.nix:5:5
+definition	default.nix:5:15	default.nix:4:5	resolved
+references	default.nix:4:5	default.nix:5:15,default.nix:5:22	resolved
+definition	default.nix:7:4	default.nix:2:3	resolved
+references	default.nix:2:3	default.nix:7:4	resolved
+callers	default.nix:4:5	-	resolved

@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/NixOS/templates.git",
+  "commit": "3348e5b68b7a53c1ef9d20605c3cad169f65899a",
+  "evidence": "In the Pandoc template all three selected expressions use the lexically enclosing let binding of pkgs. This checks selected forward targets only."
+}

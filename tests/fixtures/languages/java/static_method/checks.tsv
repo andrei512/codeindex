@@ -1,0 +1,11 @@
+# The static method is invoked inside Worker. Other is a separate class.
+symbol	emit	Worker.java:2,Worker.java:9
+symbol	flush	Worker.java:3
+symbol	run	Worker.java:4
+definition	Worker.java:5:9	Worker.java:2:17	resolved
+references	Worker.java:2:17	Worker.java:5:9	resolved
+callers	Worker.java:2:17	Worker.java:5:9	resolved
+references	Worker.java:3:17	-	resolved
+callers	Worker.java:3:17	-	resolved
+references	Worker.java:9:17	-	resolved
+callers	Worker.java:9:17	-	resolved

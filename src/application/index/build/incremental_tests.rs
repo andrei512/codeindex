@@ -1,3 +1,4 @@
+use crate::domain::code::Names;
 use super::{tests::MemorySink, *};
 use std::{ops::Range, sync::Mutex};
 
@@ -84,7 +85,7 @@ fn markdown_edit_forwards_sources_and_evidence_and_borrows_graph() {
             ))
         };
         let mut wire = MemorySink::default();
-        let (dir,_) = build_with_allowance(
+        let Output {dir, ..} = build_with_allowance(
             Path::new("."),
             &mut obs,
             &read,
@@ -93,6 +94,8 @@ fn markdown_edit_forwards_sources_and_evidence_and_borrows_graph() {
             &|_, _, text, id| Ok((id,id.and_then(|i|old?.files[i].blob).or_else(||text.map(|s|crate::adapters::repository::raw_blob_id(s.as_bytes(), false))))),
             &mut wire,
             1000,
+            None,
+            None,
         )
         .unwrap();
         let file_extent = dir.0[FILES - 1].clone();

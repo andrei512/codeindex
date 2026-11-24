@@ -1,0 +1,10 @@
+CREATE FUNCTION example() RETURNS void LANGUAGE plpgsql AS $$
+<<finish>>
+BEGIN
+  <<finish>>
+  BEGIN
+    EXIT finish;
+  END;
+  EXIT finish;
+END;
+$$;

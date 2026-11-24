@@ -1,0 +1,4 @@
+symbol	save	app.ts:2,app.ts:1
+definition	app.ts:3:32	app.ts:2:10	resolved
+references	app.ts:2:10	app.ts:3:32	resolved
+callers	app.ts:2:10	app.ts:3:32	resolved

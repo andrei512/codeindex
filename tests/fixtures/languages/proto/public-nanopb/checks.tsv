@@ -1,0 +1,4 @@
+symbol	NanoPBOptions	generator/proto/nanopb.proto:54
+definition	generator/proto/nanopb.proto:198:14	generator/proto/nanopb.proto:54:9	resolved
+references	generator/proto/nanopb.proto:54:9	generator/proto/nanopb.proto:198:14,generator/proto/nanopb.proto:202:14,generator/proto/nanopb.proto:206:14,generator/proto/nanopb.proto:210:14	resolved
+callers	generator/proto/nanopb.proto:54:9	-	unsupported

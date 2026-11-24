@@ -73,17 +73,21 @@ Selector         = NameMembership(name, symbol_space) | ExportSignature(symbol)
                  | ModuleMembership | LanguageDefinedProjection
 RoleBinding      = { role: Definition | Reference | CallTarget, outcome: Outcome }
 Outcome          = Exact(SymbolId) | Candidates(Slice<SymbolId>) | Unresolved(Reason)
-SymbolKey        = Local(language, file, declaring analysis, declaration ordinal, semantic namespace)
+SymbolKey        = Local(language, persistent file, retained declaration slot, semantic namespace)
                  | Export(language, package instance, qualified descriptor, semantic namespace)
                  | Generated(language, owner or expansion site, role, discriminator, semantic namespace)
 SymbolId         = ordinal of a SymbolKey in its retained namespace
 Coverage         = Complete | Partial(Reason) | Unsupported(Reason)
-BoundSite        = { partition: BindingPartitionId, site: Site }
+BoundSite        = { partition: BindingPartitionId, site: Site }    // within one pinned revision
+PersistentSite   = { file: PersistentFileId, slot: DeclSlot | UseSlot }
+ReverseMember    = { source: PersistentSite, context, capability, role, target: SymbolId, certainty }
 ```
+
+In the keyed storage design, each generation maps its analysis-local ordinals to persistent owner slots. A persistent binding-partition key identifies the file, context and capability independently of its current payload revision. Persist reverse memberships against retained site slots and roles, then resolve them through the pinned mapping. The physical IDs remain internal. [Keyed storage](boxes/generations/keyed-storage.md)
 
 One site can have several independently certain bindings. In a TypeScript object literal, the shorthand token in `{x}` can denote a property and read the local value `x`. Retain both role bindings at the same span. Reserve Candidates for alternatives within a role. A call-target binding contributes to caller lookup and, when required by the language contract, reference lookup. Store the target once and project it into the required directories.
 
-Context-sensitive identities include the distinguishing context in the semantic namespace. A language supplies descriptor rules for overloads, merged declarations, generated symbols and external definitions. Two shadowed locals or identical sources at different paths must remain distinct. A role with several jointly proven targets records several exact edges; an uncertain choice records one candidate group. Reverse lookup carries the role and certainty through to the result. A reverse edge addresses its BoundSite plus the role-binding ordinal and the ordinal of the selected target within that outcome.
+Context-sensitive identities include the distinguishing context in the semantic namespace. A language supplies descriptor rules for overloads, merged declarations, generated symbols and external definitions. Two shadowed locals or identical sources at different paths must remain distinct. A role with several jointly proven targets records several exact edges; an uncertain choice records one candidate group. Reverse lookup carries the role and certainty through to the result. Within a pinned partition, role and target ordinals address the selected outcome. Across revisions the reverse membership uses the persistent source slot, role and target identity. Reordering a candidate array cannot redirect an existing reference.
 
 A symbol can have several declaration sites. A declaration can denote different symbols in different contexts. A failed name lookup depends on the membership of the searched scope: adding a declaration can change its outcome without changing the use's source bytes. The binder seals a partition only when its relevant scopes have closed or their coverage has been recorded. “No matching callers in the searched coverage,” “no callers anywhere in a fully covered scope,” and “more callers exist than the result limit” are different answers.
 

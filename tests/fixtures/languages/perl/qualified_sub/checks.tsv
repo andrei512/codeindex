@@ -1,0 +1,11 @@
+# The call explicitly qualifies its package as Worker. Other defines a separate package sub.
+symbol	emit	work.pl:4,work.pl:10
+symbol	flush	work.pl:5
+symbol	run	work.pl:6
+definition	work.pl:7:13	work.pl:4:5	resolved
+references	work.pl:4:5	work.pl:7:13	resolved
+callers	work.pl:4:5	work.pl:7:13	resolved
+references	work.pl:5:5	-	resolved
+callers	work.pl:5:5	-	resolved
+references	work.pl:10:5	-	resolved
+callers	work.pl:10:5	-	resolved

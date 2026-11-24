@@ -1,0 +1,6 @@
+syntax = "proto3";
+message Item {}
+message Outer {
+  message Item {}
+  .Item child = 1;
+}

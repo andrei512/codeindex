@@ -1,0 +1,8 @@
+# Only Public is exported by Helpers.psm1. Here-string text cannot declare a function.
+definition	main.ps1:2:9	Helpers.psm1:1:10	resolved
+definition	main.ps1:3:9	-	unresolved
+definition	main.ps1:4:9	-	unresolved
+references	Helpers.psm1:1:10	main.ps1:2:9	resolved
+references	Helpers.psm1:2:10	-	resolved
+symbol	Phantom	-
+symbol	Visible	main.ps1:9:10

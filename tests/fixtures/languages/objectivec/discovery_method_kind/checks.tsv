@@ -1,0 +1,6 @@
+# The + and - methods have identical selectors and compiler-enforced direct dispatch. The only call is inside the instance method, so it targets -mark:; the class method has no uses.
+# clang -S -emit-llvm Scope.m emits a direct call from -[Scope fromInstance] to -[Scope mark:].
+symbol	mark	Scope.m:5:9,Scope.m:6:9
+definition	Scope.m:8:30	Scope.m:6:9	resolved
+references	Scope.m:5:9	-	resolved
+references	Scope.m:6:9	Scope.m:8:30	resolved

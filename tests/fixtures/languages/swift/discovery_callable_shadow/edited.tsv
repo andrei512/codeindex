@@ -1,0 +1,7 @@
+# Rename only the parameter. The original call now names the implementation and must leave the old lexical binding.
+definition	Scope.swift:3:19	Scope.swift:1:6	resolved
+references	Scope.swift:1:6	Scope.swift:3:19,Scope.swift:2:37	resolved
+callers	Scope.swift:1:6	Scope.swift:3:19|positive,Scope.swift:2:37|shadow	resolved
+definition	Scope.swift:2:37	Scope.swift:1:6	resolved
+references	Scope.swift:2:15	-	resolved
+callers	Scope.swift:2:15	-	resolved

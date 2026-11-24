@@ -1,0 +1,5 @@
+# Program.parse is private. Both the init block and recursive method body call it. The fixture enumerates both occurrences.
+definition	brainfuck/bf2.kt:54:15	brainfuck/bf2.kt:57:17	resolved
+definition	brainfuck/bf2.kt:66:40	brainfuck/bf2.kt:57:17	resolved
+references	brainfuck/bf2.kt:57:17	brainfuck/bf2.kt:54:15,brainfuck/bf2.kt:66:40	resolved
+callers	brainfuck/bf2.kt:57:17	brainfuck/bf2.kt:54:15,brainfuck/bf2.kt:66:40	resolved

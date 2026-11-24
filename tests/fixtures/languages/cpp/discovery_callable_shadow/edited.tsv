@@ -1,0 +1,7 @@
+# Rename only the parameter. The original call now names the implementation and must leave the old lexical binding.
+definition	scope.cpp:3:19	scope.cpp:1:6	resolved
+references	scope.cpp:1:6	scope.cpp:3:19,scope.cpp:2:33	resolved
+callers	scope.cpp:1:6	scope.cpp:3:19|positive,scope.cpp:2:33|shadow	resolved
+definition	scope.cpp:2:33	scope.cpp:1:6	resolved
+references	scope.cpp:2:20	-	resolved
+callers	scope.cpp:2:20	-	resolved

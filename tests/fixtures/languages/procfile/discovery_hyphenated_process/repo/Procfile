@@ -1,0 +1,3 @@
+release-task: echo worker: ignored
+worker: echo release-task
+# ghost: echo hidden

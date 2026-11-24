@@ -1,0 +1,4 @@
+CREATE TEMP TABLE IF NOT EXISTS sample (id INTEGER);
+INSERT INTO sample VALUES (1);
+/* CREATE TABLE ghost (id INTEGER); */
+CREATE VIEW summary AS SELECT id FROM sample;

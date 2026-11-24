@@ -1,0 +1,3 @@
+symbol	spawner	data/example/Procfile:4:1
+definition	data/example/Procfile:4:10	-	unresolved
+callers	data/example/Procfile:4:1	-	unsupported

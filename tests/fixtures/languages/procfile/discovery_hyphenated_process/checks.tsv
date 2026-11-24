@@ -1,0 +1,5 @@
+# Foreman recognizes names containing hyphens. A colon inside command text does not introduce a process.
+symbol	release-task	Procfile:1:1
+symbol	worker	Procfile:2:1
+symbol	ghost	-
+symbol	ignored	-

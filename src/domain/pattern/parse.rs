@@ -21,7 +21,7 @@ struct Parser {
     names: std::collections::HashSet<String>,
 }
 type Result<T> = std::result::Result<T, String>;
-pub(super) fn parse(pattern: &str) -> Result<Expr> {
+pub(super) fn parse(pattern: &str, fold: bool) -> Result<Expr> {
     if pattern.len() > 128 * 1024 {
         return Err("pattern too long".into());
     }
@@ -29,6 +29,7 @@ pub(super) fn parse(pattern: &str) -> Result<Expr> {
         chars: pattern.chars().collect(),
         cursor: 0,
         flags: Flags {
+            fold,
             unicode: true,
             ..Flags::default()
         },

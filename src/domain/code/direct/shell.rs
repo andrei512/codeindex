@@ -1,6 +1,6 @@
 //! Static shell commands and parameter expansions. Never execute a word during lookup.
 use super::{Analysis, Call, Declaration};
-use crate::domain::code::{Names, Site, Unit};
+use crate::domain::code::{ForwardNames, Site, Unit};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -524,7 +524,7 @@ fn evidence<'a>(u: &'a Unit) -> Option<&'a Evidence> {
         _ => None,
     }
 }
-fn path_for(source: &str, import: &str, paths: &HashMap<&str, usize>) -> Option<usize> {
+pub(super) fn path_for(source: &str, import: &str, paths: &HashMap<&str, usize>) -> Option<usize> {
     let mut p = Path::new(source).parent()?.to_owned();
     for comp in Path::new(import).components() {
         match comp {
@@ -604,7 +604,7 @@ fn exports(
     );
     true
 }
-pub(super) fn resolve(units: &[Unit], paths: &HashMap<&str, usize>, names: &mut Names) {
+pub(super) fn resolve(units: &[Unit], paths: &HashMap<&str, usize>, names: &mut ForwardNames) {
     let sources: SourceEdges = units
         .iter()
         .enumerate()

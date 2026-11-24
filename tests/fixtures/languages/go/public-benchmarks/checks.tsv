@@ -1,0 +1,4 @@
+# NewOpLoop is a package function in package main. Its single written use constructs a loop inside parse.
+definition	brainfuck/go/bf/bf.go:133:9	brainfuck/go/bf/bf.go:25:6	resolved
+references	brainfuck/go/bf/bf.go:25:6	brainfuck/go/bf/bf.go:133:9	resolved
+callers	brainfuck/go/bf/bf.go:25:6	brainfuck/go/bf/bf.go:133:9	resolved

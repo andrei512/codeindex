@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/rxi/log.c",
+  "commit": "f9ea34994bd58ed342d2245cd4110bb5c6790153",
+  "evidence": "File-local static function. A word search followed by source inspection identifies one direct call, in log_log."
+}

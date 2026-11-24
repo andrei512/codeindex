@@ -1,0 +1,7 @@
+# A function-valued parameter shadows the outer function for the entire body of shadow. The call in positive binds to the outer definition; a block-local integer, where present, goes out of scope before the call in scoped. The fixture does not infer which function is passed at runtime.
+# rustc --crate-type=lib --emit=mir src/lib.rs distinguishes copying the parameter from the direct outer function call.
+definition	src/lib.rs:3:21	src/lib.rs:1:4	resolved
+references	src/lib.rs:1:4	src/lib.rs:3:21	resolved
+callers	src/lib.rs:1:4	src/lib.rs:3:21|positive	resolved
+definition	src/lib.rs:2:27	src/lib.rs:2:11	resolved
+references	src/lib.rs:2:11	src/lib.rs:2:27	resolved

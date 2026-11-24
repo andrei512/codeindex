@@ -1,0 +1,3 @@
+symbol	unproved_feature	-
+symbol	unaffected_feature	source.c:13:5
+symbol	unconditional_site	source.c:15:5

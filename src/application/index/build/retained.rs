@@ -88,22 +88,40 @@ pub(super) fn evidence(
     locals: &[Local],
     files: &[Entry],
 ) -> io::Result<Vec<u64>> {
+    let capacity = files
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("evidence table too large"))?;
+    let mut offsets = Vec::new();
+    offsets
+        .try_reserve_exact(capacity)
+        .map_err(io::Error::other)?;
+    append_evidence(sink, prior, reuse, locals, files, &mut offsets)?;
+    offsets.push(sink.offset());
+    Ok(offsets)
+}
+
+pub(super) fn append_evidence(
+    sink: &mut impl ExtentSink,
+    prior: Option<&dyn Previous>,
+    reuse: &[Option<usize>],
+    locals: &[Local],
+    files: &[Entry],
+    offsets: &mut Vec<u64>,
+) -> io::Result<()> {
     let mut run = Run::new(prior, sink);
-    let mut offsets = Vec::with_capacity(files.len() + 1);
     let mut scratch = Vec::new();
     for ((local, file), &old) in locals.iter().zip(files).zip(reuse) {
         offsets.push(run.offset());
         if let Some(id) = old {
             run.borrow(prior.unwrap().entries()[id].evidence.clone())?;
-        } else if file.bytes.is_some() && Language::for_path(file.path()).is_some() {
+        } else if file.bytes.is_some() && (Language::for_path(file.path()).is_some() || super::c_project::database(file.path())) {
             scratch.clear();
             local.code.encode(&mut scratch);
             run.bytes(&scratch)?;
         }
     }
-    offsets.push(run.offset());
-    run.flush()?;
-    Ok(offsets)
+    run.flush()
 }
 
 impl<W: ExtentSink> std::io::Write for Run<'_, W> {

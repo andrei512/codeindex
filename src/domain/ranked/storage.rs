@@ -130,29 +130,32 @@ pub(super) fn term(input: &mut impl Read, rows: usize, tokens: usize) -> io::Res
 }
 impl RankedIndex {
     pub fn write_to(&self, out: impl Write) -> io::Result<()> {
+        self.write_with(out, None)
+    }
+    pub(super) fn write_with(&self, out: impl Write, bulk: Option<&BulkRank>) -> io::Result<()> {
         // Collect record starts as the encoded bytes go to their final destination.
         let mut out = Count {
             out: io::BufWriter::with_capacity(64 * 1024, out),
             pos: 0,
         };
         out.write_all(b"CIRANK04")?;
-        let bases = self.file_bases()?;
-        let hints = grouped::file_hints(self.tokens, &bases);
+        let bases = if bulk.is_some() { Vec::new() } else { self.file_bases()? };
+        let hints = if bulk.is_some() { Vec::new() } else { grouped::file_hints(self.tokens, &bases) };
         put(&mut out, self.files.len())?;
         let mut starts = Vec::with_capacity(self.files.len() + self.terms.len() + 2);
         let mut scratch = Vec::new();
-        for f in &self.files {
-            scratch.clear();
-            starts.push(out.pos);
-            sized(&mut scratch, f.path.as_bytes())?;
-            put(&mut scratch, f.spans.len())?;
-            let mut prev = 0;
-            for s in &f.spans {
-                put(&mut scratch, s.start - prev)?;
-                put(&mut scratch, s.len())?;
-                prev = s.end;
+        if let Some(bulk) = bulk {
+            for range in bulk.file_ranges.windows(2) {
+                starts.push(out.pos);
+                out.write_all(&bulk.file_bytes[range[0]..range[1]])?;
             }
-            out.write_all(&scratch)?;
+        } else {
+            for f in &self.files {
+                scratch.clear();
+                starts.push(out.pos);
+                bulk::encode_file(f, &mut scratch);
+                out.write_all(&scratch)?;
+            }
         }
         starts.push(out.pos);
         put(&mut out, self.rows.len())?;
@@ -181,9 +184,16 @@ impl RankedIndex {
             starts.push(out.pos);
             sized(&mut out, key)?;
             let t = &self.terms[id];
-            scratch.clear();
-            grouped::write_term(&mut scratch, t, &bases, &hints)?;
-            out.write_all(&scratch)?;
+            if let Some(bulk) = bulk {
+                let term = &bulk.terms[id];
+                put(&mut out, t.document_frequency)?;
+                put(&mut out, term.count)?;
+                out.write_all(&term.groups)?;
+            } else {
+                scratch.clear();
+                grouped::write_term(&mut scratch, t, &bases, &hints)?;
+                out.write_all(&scratch)?;
+            }
         }
         let directory = out.pos;
         starts.push(directory);

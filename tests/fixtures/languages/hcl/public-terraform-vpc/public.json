@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/terraform-aws-modules/terraform-aws-vpc.git",
+  "commit": "577ad620abe00da27a3a0f1e5acee041959fb3be",
+  "evidence": "Enumerated all len_public_subnets tokens in the module. The first locals block defines it; line 146 reads it twice at different positions."
+}

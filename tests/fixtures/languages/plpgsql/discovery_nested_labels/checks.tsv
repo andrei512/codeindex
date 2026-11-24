@@ -1,0 +1,5 @@
+# EXIT selects the nearest enclosing named block. The second EXIT follows the inner END and targets the outer block.
+definition	scope.plpgsql:6:10	scope.plpgsql:4:5
+definition	scope.plpgsql:8:8	scope.plpgsql:2:3
+references	scope.plpgsql:2:3	scope.plpgsql:8:8
+references	scope.plpgsql:4:5	scope.plpgsql:6:10

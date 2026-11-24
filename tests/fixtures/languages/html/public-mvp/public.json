@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/andybrewer/mvp",
+  "commit": "629ba5eb91362afe2504fdd09a1ac039e2fca420",
+  "evidence": "The currentVersion id is written once. The dialog variable in the inline script is declared at line 425 and used as the receiver at 441; quoted selector strings are separate HTML/JS entities."
+}

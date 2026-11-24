@@ -1,5 +1,5 @@
 use super::{Analysis, Call, Declaration, Kind, Token};
-use crate::domain::code::{Names, Site, Unit};
+use crate::domain::code::{ForwardNames, Site, Unit};
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, Path},
@@ -165,7 +165,7 @@ fn locate_import(path: &str, import: &str, paths: &HashMap<&str, usize>) -> Opti
         .ancestors()
         .find_map(|base| paths.get(base.join(input).to_str()?).copied())
 }
-pub(super) fn resolve(units: &[Unit], paths: &HashMap<&str, usize>, names: &mut Names) {
+pub(super) fn resolve(units: &[Unit], paths: &HashMap<&str, usize>, names: &mut ForwardNames) {
     let imports: HashMap<_, _> = units
         .iter()
         .enumerate()

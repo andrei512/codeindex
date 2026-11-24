@@ -1,0 +1,8 @@
+# A function-valued parameter shadows the outer function for the entire body of shadow. The call in positive binds to the outer definition; a block-local integer, where present, goes out of scope before the call in scoped. The fixture does not infer which function is passed at runtime.
+# clang -Xclang -ast-dump -fsyntax-only scope.c shows a DeclRefExpr to ParmVar in shadow and to Function in positive.
+definition	scope.c:3:23	scope.c:1:6	resolved
+references	scope.c:1:6	scope.c:3:23	resolved
+callers	scope.c:1:6	scope.c:3:23|positive	resolved
+definition	scope.c:2:37	scope.c:2:20	resolved
+references	scope.c:2:20	scope.c:2:37	resolved
+callers	scope.c:2:20	-	resolved

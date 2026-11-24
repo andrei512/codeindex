@@ -28,6 +28,7 @@ struct Pack {
     by_offset: std::cell::OnceCell<Vec<usize>>,
 }
 pub(super) struct Objects {
+    pack_files: std::cell::RefCell<Vec<(PathBuf, fs::File)>>,
     directories: Vec<PathBuf>,
     packs: Vec<Pack>,
     hash: usize,
@@ -73,6 +74,7 @@ impl Objects {
             i += 1;
         }
         Ok(Self {
+            pack_files: Default::default(),
             directories: dirs,
             packs,
             hash,
@@ -117,24 +119,39 @@ impl Objects {
         if depth > 64 {
             return Err(invalid("Git tree delta depth limit"));
         }
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = fs::File::open(&pack.path)?;
-        f.seek(SeekFrom::Start(offset as u64))?;
-        // Read only this object's compressed range. Pack indexes record every object offset.
-        let end = match pack.next_offset(offset, self.hash)? {
-            Some(next) => next,
-            None => (f.metadata()?.len() as usize)
-                .checked_sub(self.hash)
-                .ok_or_else(|| invalid("short Git pack"))?,
+        use std::os::unix::fs::FileExt;
+        // One cache per open commit tree. Cap descriptors across repositories with many packs.
+        // Release the borrow before a delta recursively requests its base.
+        let data = {
+            let mut cache = self.pack_files.borrow_mut();
+            let index = if let Some(i) = cache.iter().position(|(p, _)| p == &pack.path) {
+                i
+            } else {
+                let file = fs::File::open(&pack.path)?;
+                if cache.len() == 8 {
+                    cache.remove(0);
+                }
+                cache.push((pack.path.clone(), file));
+                cache.len() - 1
+            };
+            let f = &cache[index].1;
+            // Read only this object's compressed range. Pack indexes record every object offset.
+            let end = match pack.next_offset(offset, self.hash)? {
+                Some(next) => next,
+                None => (f.metadata()?.len() as usize)
+                    .checked_sub(self.hash)
+                    .ok_or_else(|| invalid("short Git pack"))?,
+            };
+            let n = end
+                .checked_sub(offset)
+                .ok_or_else(|| invalid("invalid packed tree offset"))?;
+            if n > 256 << 20 {
+                return Err(invalid("Git tree size limit"));
+            }
+            let mut data = vec![0; n];
+            f.read_exact_at(&mut data, offset as u64)?;
+            data
         };
-        let n = end
-            .checked_sub(offset)
-            .ok_or_else(|| invalid("invalid packed tree offset"))?;
-        if n > 256 << 20 {
-            return Err(invalid("Git tree size limit"));
-        }
-        let mut data = vec![0; n];
-        f.read_exact(&mut data)?;
         let mut data = &data[..];
         let first = take(&mut data, 1)?[0];
         let kind = (first >> 4) & 7;

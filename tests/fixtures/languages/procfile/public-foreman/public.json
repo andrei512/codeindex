@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/ddollar/foreman.git",
+  "commit": "f65ddba83932bd4670e014389d6e27ea1e20b469",
+  "evidence": "The example defines one spawner process type. The executable ./spawner in the command value is external to the Procfile process-name namespace."
+}

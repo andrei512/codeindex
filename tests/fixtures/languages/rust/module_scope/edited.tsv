@@ -1,0 +1,4 @@
+definition	src/lib.rs:3:23	src/lib.rs:1:20	resolved
+references	src/lib.rs:1:20	src/lib.rs:3:23	resolved
+callers	src/lib.rs:1:20	src/lib.rs:3:23	resolved
+references	src/lib.rs:2:4	-	resolved

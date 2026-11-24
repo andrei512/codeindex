@@ -1,0 +1,8 @@
+# A function-valued parameter shadows the outer function for the entire body of shadow. The call in positive binds to the outer definition; a block-local integer, where present, goes out of scope before the call in scoped. The fixture does not infer which function is passed at runtime.
+definition	scope.dart:3:19	scope.dart:1:6	resolved
+references	scope.dart:1:6	scope.dart:3:19,scope.dart:4:49	resolved
+callers	scope.dart:1:6	scope.dart:3:19|positive,scope.dart:4:49|scoped	resolved
+definition	scope.dart:2:39	scope.dart:2:29	resolved
+references	scope.dart:2:29	scope.dart:2:39	resolved
+definition	scope.dart:4:49	scope.dart:1:6	resolved
+callers	scope.dart:2:29	-	resolved

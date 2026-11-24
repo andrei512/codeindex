@@ -1,0 +1,6 @@
+symbol	render	CMakeLists.txt:3:10
+symbol	wrapper	CMakeLists.txt:6:10
+definition	CMakeLists.txt:7:3	CMakeLists.txt:3:10	resolved
+references	CMakeLists.txt:3:10	CMakeLists.txt:7:3	resolved
+callers	CMakeLists.txt:3:10	CMakeLists.txt:7:3	resolved
+definition	CMakeLists.txt:9:1	CMakeLists.txt:6:10	resolved

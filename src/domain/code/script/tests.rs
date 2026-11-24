@@ -452,3 +452,54 @@ fn methods_skip_python_class_locals_and_nested_js_functions_reset_this() {
         }
     }
 }
+
+#[test]
+fn exported_namespace_members_and_ambient_signatures_survive_imports() {
+    let files = [
+        (
+            "lib.ts",
+            "export namespace Api { export function send() {} function hidden() {} }",
+        ),
+        (
+            "types.d.ts",
+            "export declare function parse(s: string): number\nexport default function decode(): string",
+        ),
+        (
+            "use.ts",
+            "import {Api} from './lib'; import read, {parse} from './types'; Api.send(); Api.hidden(); parse(''); read();",
+        ),
+    ];
+    let facts = files.map(|(_, text)| super::super::analyze(Language::Js, text));
+    let units: Vec<_> = files
+        .iter()
+        .zip(&facts)
+        .map(|(&(path, text), analysis)| Unit {
+            path,
+            text,
+            analysis,
+        })
+        .collect();
+    let graph = Names::build(&units);
+    for name in ["send", "parse", "decode"] {
+        let site = graph.by_name[name][0];
+        assert!(
+            graph.incoming[&site]
+                .iter()
+                .any(|call| call.file == 2 && facts[2].calls[call.local].is_call),
+            "{name}"
+        );
+    }
+    assert!(!graph.incoming.contains_key(&graph.by_name["hidden"][0]));
+}
+
+#[test]
+fn super_call_requires_builtin_and_one_written_parent() {
+    let source = "class Base:\n    def save(self): pass\nclass Child(Base):\n    def run(self, super):\n        super().save()\nclass Other: pass\nclass Multiple(Base, Other):\n    def run(self):\n        super().save()\n";
+    let analysis = super::super::analyze(Language::Python, source);
+    let graph = Names::build(&[Unit {
+        path: "a.py",
+        text: source,
+        analysis: &analysis,
+    }]);
+    assert!(!graph.incoming.contains_key(&graph.by_name["save"][0]));
+}

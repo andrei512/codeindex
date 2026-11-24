@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/martinus/robin-hood-hashing",
+  "commit": "7697343363af4cc3f42cab17be49e6af9ab181e2",
+  "evidence": "The helper has anonymous-namespace linkage. Every written use in this translation unit directly invokes that unique helper, including calls inside REQUIRE arguments."
+}

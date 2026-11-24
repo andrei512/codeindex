@@ -1,0 +1,6 @@
+# Nested lexical let shadows the outer value only in the inner expression. outer retains the original definition.
+symbol	value	scope.nix:2:3,scope.nix:5:3
+definition	scope.nix:3:11	scope.nix:2:3
+references	scope.nix:2:3	scope.nix:3:11
+definition	scope.nix:6:12	scope.nix:5:3
+references	scope.nix:5:3	scope.nix:6:12

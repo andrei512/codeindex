@@ -51,6 +51,16 @@ const fn rule(id: u16, products: u8) -> Rule {
         products,
     }
 }
+const fn revised(id: u16, products: u8) -> Rule {
+    Rule { revision: 2, from: &[1], ..rule(id, products) }
+}
+
+// Revision 2 checkpoints predate final callable, module-export and
+// translation-unit dependency evidence. Either earlier writer needs reanalysis.
+const fn repaired_profile(id: u16) -> Rule {
+    Rule { revision: 3, from: &[1, 2], ..rule(id, CODE) }
+}
+
 const CODE: u8 = bit(FILES) | bit(SYMBOLS) | bit(REL);
 const RULES: &[Rule] = &[
     rule(1, ALL),                  // worktree membership, observations and eligibility
@@ -60,7 +70,7 @@ const RULES: &[Rule] = &[
     rule(5, bit(RANK)),            // ranked chunk boundaries
     rule(6, bit(MD) | bit(RANK)),  // Markdown sections and heading anchors
     rule(7, bit(MD)),              // relative link extraction and qualification
-    rule(8, bit(SYMBOLS) | bit(REL)), // project and binding rules
+    revised(8, bit(SYMBOLS) | bit(REL)), // project and binding rules
     rule(9, ALL),                  // file ID namespace and key ordering
     rule(10, bit(FILES) | bit(MD) | bit(RANK)), // source line boundaries
     // The parser evidence is packed into FILES. Each profile can evolve on its
@@ -68,19 +78,21 @@ const RULES: &[Rule] = &[
     // proves a consumer unchanged. Rust, JS, Python, Starlark, shell, PowerShell,
     // C#, Swift, C, C++, Protobuf, CSS, HTML and SQL.
     rule(32, CODE),
-    rule(33, CODE),
-    rule(34, CODE),
+    revised(33, CODE),
+    revised(34, CODE),
     rule(35, CODE),
     rule(36, CODE),
-    rule(37, CODE),
-    rule(38, CODE),
-    rule(39, CODE),
-    rule(40, CODE),
-    rule(41, CODE),
+    repaired_profile(37),
+    repaired_profile(38),
+    repaired_profile(39),
+    // Earlier C evidence lacks external-header receipts. Rebuild before decoding.
+    Rule { revision: 4, from: &[1, 2, 3], ..rule(40, CODE) },
+    Rule { revision: 4, from: &[1, 2, 3], ..rule(41, CODE) },
     rule(42, CODE),
     rule(43, CODE),
-    rule(44, CODE),
-    rule(45, CODE),
+    revised(44, CODE),
+    revised(45, CODE), // SQL dollar-quoted bodies
+    repaired_profile(46), // Additional native language profiles and their evidence.
 ];
 const _: () = assert!(N == 8 && SOURCE == 2);
 
@@ -128,10 +140,14 @@ fn plan(bytes: &[u8], registry: &[Rule]) -> io::Result<Migration> {
     if bytes.len() - 28 != count * 4 {
         return Err(malformed());
     }
-    if count != registry.len() {
+    // Protocols 1–3 originally ended at rule 45. The following loop still
+    // verifies every historical ID and revision before recognizing this edge.
+    let predates_profiles = count + 1 == registry.len()
+        && registry.last().is_some_and(|rule| rule.id == 46);
+    if count != registry.len() && !predates_profiles {
         return Err(incompatible("unsupported checkpoint contract set"));
     }
-    let mut rebuild = 0;
+    let mut rebuild = if predates_profiles { CODE } else { 0 };
     let mut previous = 0;
     for (raw, rule) in bytes[28..].chunks_exact(4).zip(registry) {
         let id = u16::from_le_bytes([raw[0], raw[1]]);
@@ -186,19 +202,18 @@ pub(crate) fn legacy_migration(fingerprint: &[u8]) -> Migration {
     Migration { rebuild }
 }
 
-#[cfg(test)]
-pub(crate) fn legacy_rules_match(fingerprint: &[u8]) -> bool {
-    legacy_migration(fingerprint).reusable()
-}
-
 // Exercise a recognized edge using the registered product dependencies without
 // declaring a fictitious historical revision in a shipping binary.
 #[cfg(test)]
 pub(super) fn fixture_upgrade(id: u16) -> Migration {
     let mut next = RULES.iter().map(|r| Rule { ..*r }).collect::<Vec<_>>();
     let producer = next.iter_mut().find(|r| r.id == id).unwrap();
-    producer.revision = 2;
-    producer.from = &[1];
+    producer.from = match producer.revision {
+        1 => &[1],
+        2 => &[2],
+        _ => panic!("undeclared test revision"),
+    };
+    producer.revision += 1;
     plan(&write_contracts(), &next).unwrap()
 }
 
@@ -248,6 +263,59 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_before_the_new_parsers_require_new_evidence_and_bindings() {
+        let mut old = write_contracts();
+        let len = old.len();
+        old.truncate(len - 4);
+        old[26..28].copy_from_slice(&((RULES.len() - 1) as u16).to_le_bytes());
+        assert_eq!(check_contracts(&old).unwrap().rebuild, CODE);
+        old[28] = 0;
+        assert!(check_contracts(&old).is_err());
+    }
+
+    #[test]
+    fn previous_conformance_rules_invalidate_cached_parser_facts_and_edges() {
+        for id in [8u16, 33, 34, 37, 38, 39, 40, 41, 44, 46] {
+            let mut old = write_contracts();
+            let row = old[28..].chunks_exact_mut(4)
+                .find(|row| row[..2] == id.to_le_bytes()).unwrap();
+            row[2..].copy_from_slice(&1u16.to_le_bytes());
+            let expected = if id == 8 { bit(SYMBOLS) | bit(REL) } else { CODE };
+            assert_eq!(check_contracts(&old).unwrap().rebuild, expected, "rule {id}");
+        }
+    }
+
+    #[test]
+    fn intermediate_repair_checkpoints_rebuild_changed_profile_evidence() {
+        for id in [37u16, 38, 39, 40, 41, 46] {
+            let mut old = write_contracts();
+            let row = old[28..].chunks_exact_mut(4)
+                .find(|row| row[..2] == id.to_le_bytes()).unwrap();
+            row[2..].copy_from_slice(&2u16.to_le_bytes());
+            assert_eq!(check_contracts(&old).unwrap().rebuild, CODE, "rule {id}");
+        }
+    }
+
+    #[test]
+    fn c_checkpoints_without_sdk_receipts_require_reanalysis() {
+        for id in [40u16, 41] {
+            let mut old = write_contracts();
+            let row = old[28..].chunks_exact_mut(4)
+                .find(|row| row[..2] == id.to_le_bytes()).unwrap();
+            row[2..].copy_from_slice(&3u16.to_le_bytes());
+            assert_eq!(check_contracts(&old).unwrap().rebuild, CODE);
+        }
+    }
+
+    #[test]
+    fn old_sql_evidence_cannot_retain_symbols_from_dollar_quoted_bodies() {
+        let mut old = write_contracts();
+        let row = old[28..].chunks_exact_mut(4).find(|row| row[..2] == 45u16.to_le_bytes()).unwrap();
+        row[2..].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(check_contracts(&old).unwrap().rebuild, CODE);
+    }
+
+    #[test]
     fn unsupported_writer_and_malformed_bodies_are_distinct() {
         let mut bytes = write_contracts();
         bytes[8] = WRITER_PROTOCOL as u8 + 1;
@@ -266,7 +334,7 @@ mod tests {
     #[test]
     fn historical_import_has_a_target_specific_allowlist() {
         if let Some(hash) = baseline_hash() {
-            assert!(legacy_rules_match(hash))
+            assert_eq!(legacy_migration(hash).rebuild, CODE);
         }
         for unknown in [b"".as_slice(), b"0123456789abcdef"] {
             let plan = legacy_migration(unknown);

@@ -1,0 +1,8 @@
+# Rename only the parameter. The original call now names the implementation and must leave the old lexical binding.
+definition	main.go:4:19	main.go:2:6	resolved
+references	main.go:2:6	main.go:4:19,main.go:5:54,main.go:3:30	resolved
+callers	main.go:2:6	main.go:4:19|positive,main.go:5:54|scoped,main.go:3:30|shadow	resolved
+definition	main.go:3:30	main.go:2:6	resolved
+references	main.go:3:13	-	resolved
+definition	main.go:5:54	main.go:2:6	resolved
+callers	main.go:3:13	-	resolved

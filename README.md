@@ -1,6 +1,6 @@
 # Codeindex
 
-Codeindex gives coding agents a local, searchable map of a Git working tree. It installs one command, `cx`. An agent can search for a concept in the docs, jump to a declaration, and follow a call back to the code that uses it. Each answer is JSON with repository-relative paths and source locations the agent can open next.
+Codeindex gives coding agents a local, searchable map of a Git working tree. It installs one command, `cx`. An agent can search for a concept in the docs, jump to a declaration, and follow a call back to the code that uses it. Bare searches print matching source lines. Named queries return JSON with repository-relative paths and locations the agent can open next.
 
 Before changing a retry policy, an agent needs to know where it is documented, which function implements the delay, and who calls that function. Those are three different questions about the same checkout. Codeindex indexes source text, paths, code relationships, and Markdown together so an agent can follow that trail across files.
 
@@ -14,9 +14,34 @@ cargo install --locked codeindex
 
 To install from a checkout, run `cargo install --locked --path .`. The CLI targets macOS and Linux. On macOS, a watcher keeps the index warm for five minutes after the last request.
 
+## Search from the shell
+
+The examples below describe this checkout. The design target, including differences from current behavior, is in the [CLI invocation contract](docs/boxes/cli/invocation.md).
+
+Use `cx PATTERN [PATH...]` for regular expressions. Use `-n` for line numbers, `-H` for filenames, `-F` for literal text, and `-A`, `-B`, or `-C` for context. Ordinary searches use Codeindex's native index. A single explicit file with piped stdout prints source text by default.
+
+```console
+$ cx '^fn main' src/main.rs | head -1
+fn main() -> std::process::ExitCode {
+$ cx -nH '^fn main' src/main.rs
+src/main.rs:1:fn main() -> std::process::ExitCode {
+```
+
+Use `cx -k 'retry policy'` for ranked passages, `cx --symbol NAME` for declarations, and `cx --reference NAME` for uses. These modes return `path:line:source`. Add `--column` for the byte column or `--json` for structured evidence. Partial-coverage notices go to stderr. Existing scripts can reach the advanced JSON commands through `cx --cx COMMAND`.
+
+## Give an agent the quick start
+
+Paste the output of `cx --cx intro` into the agent’s instructions once. It works from any directory. For example, to include it in a Codex CLI task:
+
+```sh
+codex exec "$(cx --cx intro)
+
+Where is the retry policy defined, and who calls it?"
+```
+
 ## From a question to the code
 
-These examples use a small Rust client with a retry guide. `cx` writes JSON directly. The optional `jq` filters show the fields an agent would use for its next step.
+These examples use a small Rust client with a retry guide. These named commands write JSON directly. The optional `jq` filters show the fields an agent would use for its next step.
 
 <details>
 <summary>Create the example repository to try these queries</summary>
@@ -34,10 +59,10 @@ printf '# Client\nSee [Retries](docs/guide.md#retries).\n' > README.md
 
 ### Where is the retry policy documented?
 
-`search` ranks passages with BM25. A Markdown hit includes the heading trail and a handle for the matching section.
+`-k` ranks passages with BM25. A Markdown hit includes the heading trail and a handle for the matching section.
 
 ```sh
-cx search 'retry policy' | jq '.hits[0] | {path, line, excerpt, section: .breadcrumbs[-1].handle}'
+cx -k 'retry policy' --json | jq '.hits[0] | {path, line, excerpt, section: .breadcrumbs[-1].handle}'
 ```
 
 ```json
@@ -52,7 +77,7 @@ cx search 'retry policy' | jq '.hits[0] | {path, line, excerpt, section: .breadc
 Use the returned handle to read exactly that section. Add `--parent` to read its enclosing section.
 
 ```sh
-cx section 'docs/guide.md#retries' | jq -r '.body'
+cx --cx section 'docs/guide.md#retries' | jq -r '.body'
 ```
 
 ```markdown
@@ -63,7 +88,7 @@ The retry policy allows three attempts.
 ### Where is the delay defined, and who calls it?
 
 ```sh
-cx symbol retry_delay | jq '.hits[]'
+cx --cx symbol retry_delay | jq '.hits[]'
 ```
 
 ```json
@@ -71,15 +96,16 @@ cx symbol retry_delay | jq '.hits[]'
   "path": "src/lib.rs",
   "line": 1,
   "byte_column": 8,
+  "col": 8,
   "name": "retry_delay",
   "kind": "function_item"
 }
 ```
 
-Here the declaration is on an ASCII line, so byte column 8 is also UTF-16 column 8. Use that position to find the enclosing caller.
+Ask for callers by name. For an indexed Rust inherent method, use `cx --cx callers Type::method`. When several declarations share a name, select a symbol hit and pass its `path`, `line`, and `col` from the repository root. The same forms work with `cx --cx references`.
 
 ```sh
-cx callers src/lib.rs 1 8 | jq '{relationship_status, callers: [.result[] | {caller, path, line, col}]}'
+cx --cx callers retry_delay | jq '{relationship_status, callers: [.result[] | {caller, path, line, col}]}'
 ```
 
 ```json
@@ -103,7 +129,7 @@ cx callers src/lib.rs 1 8 | jq '{relationship_status, callers: [.result[] | {cal
 **Exact text.** Find the words that set the retry limit and get their byte column on the matching line.
 
 ```sh
-cx content 'three attempts' | jq -c '.hits[] | {path, line, byte_column}'
+cx --cx content 'three attempts' | jq -c '.hits[] | {path, line, byte_column}'
 ```
 
 ```json
@@ -113,7 +139,7 @@ cx content 'three attempts' | jq -c '.hits[] | {path, line, byte_column}'
 **Content regex.** Find either spelling of the function name wherever it appears in the source.
 
 ```sh
-cx regex 'retry_(delay|timeout)' | jq -c '[.hits[] | {path, line, byte_column}]'
+cx --cx regex 'retry_(delay|timeout)' | jq -c '[.hits[] | {path, line, byte_column}]'
 ```
 
 ```json
@@ -123,22 +149,22 @@ cx regex 'retry_(delay|timeout)' | jq -c '[.hits[] | {path, line, byte_column}]'
 **Path queries.** Use a substring when you remember part of a name, an exact path to check membership, a regex for a naming rule, or a glob for a directory pattern. Each command below projects matching paths as a JSON array.
 
 ```console
-$ cx path guide | jq -c '[.hits[].path]'
+$ cx --cx path guide | jq -c '[.hits[].path]'
 ["docs/guide.md"]
 ```
 
 ```console
-$ cx path-exact src/lib.rs | jq -c '[.hits[].path]'
+$ cx --cx path-exact src/lib.rs | jq -c '[.hits[].path]'
 ["src/lib.rs"]
 ```
 
 ```console
-$ cx path-regex '^docs/.*\.md$' | jq -c '[.hits[].path]'
+$ cx --cx path-regex '^docs/.*\.md$' | jq -c '[.hits[].path]'
 ["docs/guide.md"]
 ```
 
 ```console
-$ cx glob '**/*.rs' | jq -c '[.hits[].path]'
+$ cx --cx glob '**/*.rs' | jq -c '[.hits[].path]'
 ["src/lib.rs"]
 ```
 
@@ -147,7 +173,7 @@ $ cx glob '**/*.rs' | jq -c '[.hits[].path]'
 **Definition.** Start on the call to `retry_delay` inside `send` and locate its declaration.
 
 ```sh
-cx definition src/lib.rs 3 24 | jq -c '[.result[] | {path, line, col}]'
+cx --cx definition src/lib.rs 3 24 | jq -c '[.result[] | {path, line, col}]'
 ```
 
 ```json
@@ -157,7 +183,7 @@ cx definition src/lib.rs 3 24 | jq -c '[.result[] | {path, line, col}]'
 **References.** Start on the declaration and locate uses of the symbol. Use `callers` from the walkthrough when you also want the enclosing function.
 
 ```sh
-cx references src/lib.rs 1 8 | jq -c '[.result[] | {path, line, col}]'
+cx --cx references src/lib.rs 1 8 | jq -c '[.result[] | {path, line, col}]'
 ```
 
 ```json
@@ -169,7 +195,7 @@ cx references src/lib.rs 1 8 | jq -c '[.result[] | {path, line, col}]'
 **Parent section.** Move up from the retry policy to its enclosing heading.
 
 ```sh
-cx section 'docs/guide.md#retries' --parent | jq -c '{title, handle, line}'
+cx --cx section 'docs/guide.md#retries' --parent | jq -c '{title, handle, line}'
 ```
 
 ```json
@@ -179,36 +205,14 @@ cx section 'docs/guide.md#retries' --parent | jq -c '{title, handle, line}'
 **Backlinks.** Before renaming the heading, find the documents that link to it and the section containing each link.
 
 ```sh
-cx backlinks 'docs/guide.md#retries' | jq -c '[.hits[] | {path, line, handle}]'
+cx --cx backlinks 'docs/guide.md#retries' | jq -c '[.hits[] | {path, line, handle}]'
 ```
 
 ```json
 [{"path":"README.md","line":2,"handle":"README.md#client"}]
 ```
 
-## Inspect the index
-
-**Status.** Check how many paths are indexed and which query products are published.
-
-```sh
-cx status | jq '{indexed_paths, products: (.products | map_values(.state))}'
-```
-
-```json
-{
-  "indexed_paths": 3,
-  "products": {
-    "paths": "published",
-    "content": "published",
-    "ranked": "published",
-    "symbols": "published",
-    "relationships": "published",
-    "markdown": "published"
-  }
-}
-```
-
-Run `cx help` for all commands or `cx help references` for a single command. Definition, reference, and caller queries take one-based lines and UTF-16 columns.
+Run `cx --help` for all commands or `cx --cx help references` for a single command. Advanced positional JSON commands take one-based UTF-16 columns. Public `--reference FILE LINE COL` takes a one-based byte column.
 
 ## License
 

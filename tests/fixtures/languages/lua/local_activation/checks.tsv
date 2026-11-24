@@ -1,0 +1,4 @@
+# Lua evaluates local initializers before introducing locals; repeat locals reach until.
+references	work.lua:1:16	work.lua:2:17,work.lua:6:8	resolved
+references	work.lua:5:23	work.lua:5:52	resolved
+definition	work.lua:5:52	work.lua:5:23	resolved

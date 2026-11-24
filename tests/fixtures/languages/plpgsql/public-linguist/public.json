@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/github-linguist/linguist.git",
+  "commit": "cfd7a0113aa1efab99faeff38756f0ed4d48add8",
+  "evidence": "The VirtualBox Test Manager SQL sample declares this specific PL/pgSQL routine once, with LANGUAGE plpgsql following its dollar-quoted body. This case verifies the symbol and declaration location; it does not establish routine call coverage."
+}

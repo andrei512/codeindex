@@ -1,0 +1,4 @@
+symbol	makerow	test/templates/gettext.mako:44:13
+definition	test/templates/gettext.mako:26:11	test/templates/gettext.mako:44:13	resolved
+definition	test/templates/gettext.mako:28:7	test/templates/gettext.mako:44:13	resolved
+references	test/templates/gettext.mako:44:13	test/templates/gettext.mako:26:11,test/templates/gettext.mako:28:7	resolved

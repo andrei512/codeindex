@@ -1,0 +1,4 @@
+symbol	save	left.mjs:1,right.mjs:1
+definition	app.mjs:2:25	left.mjs:1:17	resolved
+callers	left.mjs:1:17	app.mjs:2:25	resolved
+callers	right.mjs:1:17	-	resolved

@@ -1,0 +1,5 @@
+# The quoted heredoc is cat's stdin. Its apparent function and both consume spellings are literal bytes. The only command invocation is line 6.
+symbol	consume	demo.sh:1:1
+symbol	phantom	-
+definition	demo.sh:6:1	demo.sh:1:1	resolved
+references	demo.sh:1:1	demo.sh:6:1	resolved

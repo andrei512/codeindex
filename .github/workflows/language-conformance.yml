@@ -1,0 +1,45 @@
+name: Language conformance
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  affected:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npx nx affected -t conformance --base="$NX_BASE" --head=HEAD
+        env:
+          NX_BASE: ${{ github.event.pull_request.base.sha }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: affected-conformance
+          path: target/conformance/
+          if-no-files-found: ignore
+
+  discovery:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+      - run: pipx install uv
+      - run: python3 tests/discover_languages.py --public
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: language-discovery
+          path: |
+            target/discovery/
+            target/language-*.json

@@ -13,14 +13,44 @@ use std::{
 #[cfg(target_os = "macos")]
 const FLAGS: (i32, i32, i32, i32) = (0x100, 0x100000, 0x1000000, 4);
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const FLAGS: (i32, i32, i32, i32) = (0o400000, 0o200000, 0o2000000, 0o4000);
+const FLAGS: (i32, i32, i32, i32) = if cfg!(any(target_arch = "arm", target_arch = "aarch64")) {
+    (0o100000, 0o40000, 0o2000000, 0o4000)
+} else {
+    (0o400000, 0o200000, 0o2000000, 0o4000)
+};
 unsafe extern "C" {
     fn openat(fd: c_int, path: *const c_char, options: c_int, ...) -> c_int;
 }
 
-fn open_relative(root: &Path, path: &Path) -> io::Result<File> {
+fn open_relative(root: &File, path: &Path) -> io::Result<File> {
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin's O_NOFOLLOW_ANY checks every component in one name lookup.
+        const NOFOLLOW_ANY: i32 = 0x20000000;
+        let name = CString::new(path.as_os_str().as_bytes()).map_err(invalid)?;
+        let (_, _, cloexec, nonblock) = FLAGS;
+        let fd = unsafe {
+            openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                NOFOLLOW_ANY | cloexec | nonblock,
+                0 as c_int,
+            )
+        };
+        if fd >= 0 {
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::InvalidInput {
+            return Err(error);
+        }
+    }
+    open_components(root, path)
+}
+
+fn open_components(root: &File, path: &Path) -> io::Result<File> {
     let (nofollow, directory, cloexec, nonblock) = FLAGS;
-    let mut file = File::open(root)?;
+    let mut file = None::<File>;
     let mut parts = path.components().peekable();
     while let Some(component) = parts.next() {
         let Component::Normal(name) = component else {
@@ -35,13 +65,14 @@ fn open_relative(root: &Path, path: &Path) -> io::Result<File> {
                 nonblock
             };
         // Each component is relative to the already-open directory and rejects symlinks.
-        let fd = unsafe { openat(file.as_raw_fd(), name.as_ptr(), options) };
+        let parent = file.as_ref().unwrap_or(root);
+        let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), options, 0 as c_int) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        file = unsafe { File::from_raw_fd(fd) };
+        file = Some(unsafe { File::from_raw_fd(fd) });
     }
-    Ok(file)
+    file.ok_or_else(|| invalid("empty path"))
 }
 pub(super) fn stamp(m: &Metadata) -> [u64; 7] {
     [
@@ -59,7 +90,8 @@ const BLOCK: usize = 64 * 1024;
 fn read_text(mut input: impl Read, len: u64) -> io::Result<Option<String>> {
     // Read into the allocation retained by the snapshot builder. Take caps
     // each read before a binary prefix can reserve an entire large file.
-    let mut all = Vec::with_capacity(len.min(BLOCK as u64) as usize);
+    // Leave space for read_to_end's final EOF check on short regular files.
+    let mut all = Vec::with_capacity((len.min(BLOCK as u64) as usize) + 1);
     let mut good = 0;
     loop {
         let previous = all.len();
@@ -104,13 +136,23 @@ fn stable_read<T>(
     expected: [u64; 7],
     read: impl FnOnce(&File) -> io::Result<T>,
 ) -> io::Result<T> {
+    let file = open_relative(&File::open(root)?, path)?;
+    stable_read_open(root, path, expected, &file, read)
+}
+
+fn stable_read_open<T>(
+    root: &Path,
+    path: &Path,
+    expected: [u64; 7],
+    file: &File,
+    read: impl FnOnce(&File) -> io::Result<T>,
+) -> io::Result<T> {
     let changed = || io::Error::other("repository file changed during capture");
-    let file = open_relative(root, path)?;
     let opened = file.metadata()?;
     if !opened.is_file() || stamp(&opened) != expected {
         return Err(changed());
     }
-    let result = read(&file)?;
+    let result = read(file)?;
     if stamp(&file.metadata()?) != expected
         || stamp(&std::fs::symlink_metadata(root.join(path))?) != expected
     {
@@ -126,6 +168,38 @@ pub(super) fn read_control(root: &Path, path: &Path, metadata: &Metadata) -> io:
         Ok(bytes)
     })
 }
+pub(crate) struct CaptureRoot<'a> {
+    root: &'a Path,
+    dir: File,
+}
+
+impl<'a> CaptureRoot<'a> {
+    pub fn new(root: &'a Path) -> io::Result<Self> {
+        Ok(Self {
+            root,
+            dir: File::open(root)?,
+        })
+    }
+
+    pub fn capture(&self, path: &str, expected: [u64; 7]) -> io::Result<Option<String>> {
+        let path = checked_path(path)?;
+        match open_relative(&self.dir, path) {
+            Ok(file) => stable_read_open(self.root, path, expected, &file, |file| {
+                read_text(file, expected[2])
+            }),
+            Err(error) => {
+                // Observed symlinks intentionally have path rows but no source.
+                let current = std::fs::symlink_metadata(self.root.join(path))?;
+                if current.is_symlink() && stamp(&current) == expected {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
 pub fn capture_observed(root: &Path, path: &str, expected: [u64; 7]) -> io::Result<Option<String>> {
     let path = checked_path(path)?;
     let before = std::fs::symlink_metadata(root.join(path))?;

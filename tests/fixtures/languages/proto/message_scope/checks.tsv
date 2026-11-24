@@ -1,0 +1,5 @@
+symbol	Item	scope.proto:2,scope.proto:4
+definition	scope.proto:5:3	scope.proto:4:11	resolved
+references	scope.proto:4:11	scope.proto:5:3	resolved
+references	scope.proto:2:9	-	resolved
+callers	scope.proto:4:11	-	unsupported

@@ -8,7 +8,9 @@ mod projects;
 mod resolution;
 mod strings;
 mod syntax;
-use super::{Analysis, Call, Declaration, Kind, Language, Names, Site, Token, Unit};
+#[cfg(test)]
+use super::Names;
+use super::{Analysis, Call, Declaration, Kind, Language, ForwardNames, Site, Token, Unit};
 use imports::imports;
 pub(super) use resolution::resolve;
 use std::{
@@ -52,6 +54,11 @@ enum Lookup {
         callee: Range<usize>,
     },
     Known(usize),
+    Super {
+        scope: usize,
+        base_scope: usize,
+        base: Range<usize>,
+    },
     Chained {
         prior: usize,
         scope: usize,
@@ -141,7 +148,6 @@ fn keyword(lang: Language, s: &str) -> bool {
             | "continue"
             | "else"
             | "for"
-            | "from"
             | "if"
             | "import"
             | "in"
@@ -166,6 +172,7 @@ fn keyword(lang: Language, s: &str) -> bool {
                     | "elif"
                     | "except"
                     | "finally"
+                    | "from"
                     | "global"
                     | "is"
                     | "lambda"
@@ -282,6 +289,8 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
     let mut comp_stack: Vec<(usize, usize)> = Vec::new();
     let mut extra_vars = HashSet::new();
     let mut pending_shapes = HashMap::new();
+    let mut python_bases = HashMap::new();
+    let mut namespace_scopes = HashSet::new();
     let mut mixed_returns = HashSet::new();
     let mut written_uses = HashMap::new();
     let mut signatures: HashMap<(usize, String), Vec<usize>> = HashMap::new();
@@ -406,6 +415,60 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
                 i += 2;
             }
             continue;
+        }
+        let export = || {
+            t[..i]
+                .iter()
+                .rev()
+                .map(|x| x.text)
+                .take_while(|s| {
+                    matches!(*s, "default" | "async" | "export" | "declare" | "abstract")
+                })
+                .find(|s| matches!(*s, "default" | "export"))
+        };
+        if !python
+            && matches!(token.text, "namespace" | "module")
+            && prev != "."
+            && t.get(i + 1).is_some_and(word)
+            && tok(t, i + 2) == "{"
+        {
+            let name = &t[i + 1];
+            let id = bind_token(name, scope, "module_declaration", &mut a, &mut e);
+            if export().is_some() {
+                if scope == 0 {
+                    e.exports.insert(name.text.into(), id);
+                } else if namespace_scopes.contains(&scope) {
+                    e.members.insert((scope, name.text.into()), id);
+                }
+            }
+            let child = e.scopes.len();
+            e.scopes.push(Scope {
+                parent: Some(scope),
+                ..Default::default()
+            });
+            namespace_scopes.insert(child);
+            e.shapes.insert(id, child);
+            active.push((child, end[i + 2]));
+            i += 3;
+            continue;
+        }
+        if !python && token.text == "function" && prev != "." {
+            let head = i + usize::from(next == "*");
+            if let Some(paren) = args(t, head + 1)
+                && let Some(body) = method_body(t, &end, end[paren])
+            {
+                let child = e.scopes.len();
+                e.scopes.push(Scope {
+                    parent: Some(scope),
+                    this_boundary: true,
+                    ..Default::default()
+                });
+                signature(t, &end, head, paren, body, child, &mut a, &mut e);
+                parameters(t, &end, paren + 1, end[paren], child, &mut a, &mut e);
+                active.push((child, end[body]));
+                i = body + 1;
+                continue;
+            }
         }
         if !python && token.text == "{" && end[i] < t.len() {
             let id = e.scopes.len();
@@ -569,18 +632,31 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
                 && method_body(t, &end, end[paren]).is_none()
             {
                 let mut stop = end[paren].saturating_add(1);
-                while stop < t.len() && !matches!(tok(t, stop), ";" | "}" | "export" | "function") {
+                while stop < t.len()
+                    && !matches!(tok(t, stop), ";" | "}" | "export" | "declare" | "function")
+                {
                     if matches!(tok(t, stop), "(" | "{" | "[") {
                         stop = end[stop];
                     }
                     stop += 1;
                 }
-                if tok(t, stop) == ";" {
+                if end[paren] < t.len() {
                     let id = a.declarations.len();
                     a.declarations.push(Declaration {
                         span: t[name].span.clone(),
                         kind: "function_overload",
                     });
+                    if scope == 0
+                        && let Some(tag) = export()
+                    {
+                        let key = if tag == "default" {
+                            "default"
+                        } else {
+                            t[name].text
+                        };
+                        e.forward
+                            .insert(key.into(), Forward::Local(t[name].text.into()));
+                    }
                     signatures
                         .entry((scope, t[name].text.to_owned()))
                         .or_default()
@@ -593,7 +669,7 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
                     });
                     parameters(t, &end, paren + 1, end[paren], child, &mut a, &mut e);
                     signature(t, &end, name, paren, stop, child, &mut a, &mut e);
-                    i = stop + 1;
+                    i = stop + usize::from(tok(t, stop) == ";");
                     continue;
                 }
                 i = name + 1;
@@ -705,25 +781,21 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
                 }
             }
 
-            let exported = python
-                || t[..i]
-                    .iter()
-                    .rev()
-                    .take_while(|x| {
-                        matches!(
-                            x.text,
-                            "default" | "async" | "export" | "declare" | "abstract"
-                        )
-                    })
-                    .any(|x| x.text == "export");
-            if exported && scope == 0 {
-                let default = t[..i]
-                    .iter()
-                    .rev()
-                    .take_while(|x| matches!(x.text, "async" | "default" | "export"))
-                    .any(|x| x.text == "default");
-                e.exports
-                    .insert(if default { "default" } else { t[name].text }.into(), id);
+            let export_tag = if python { Some("export") } else { export() };
+            if let Some(tag) = export_tag {
+                if scope == 0 {
+                    e.exports.insert(
+                        if tag == "default" {
+                            "default"
+                        } else {
+                            t[name].text
+                        }
+                        .into(),
+                        id,
+                    );
+                } else if namespace_scopes.contains(&scope) {
+                    e.members.insert((scope, t[name].text.into()), id);
+                }
             }
             if !python && kind == "variable_declarator" && tok(t, name + 1) == "=" {
                 let mut first = name + 2;
@@ -789,6 +861,9 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
                     if python && token.text == "class" {
                         e.scopes[child].shape = true;
                         e.shapes.insert(id, child);
+                        if close == paren + 2 && word(&t[paren + 1]) {
+                            python_bases.insert(child, (scope, t[paren + 1].span.clone()));
+                        }
                     }
                     if python
                         && function
@@ -1071,6 +1146,32 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
             i += 1;
             continue;
         }
+        if python
+            && prev == "."
+            && i >= 4
+            && tok(t, i - 4) == "super"
+            && tok(t, i - 3) == "("
+            && tok(t, i - 2) == ")"
+            && (i == 4 || tok(t, i - 5) != ".")
+            && let Some((base_scope, base)) =
+                e.scopes[scope].receiver.and_then(|s| python_bases.get(&s))
+        {
+            written_uses.insert(i, a.calls.len());
+            add_use(
+                &mut a,
+                &mut e,
+                token,
+                scope,
+                next == "(",
+                Lookup::Super {
+                    scope,
+                    base_scope: *base_scope,
+                    base: base.clone(),
+                },
+            );
+            i += 1;
+            continue;
+        }
         if prev == "." && i >= 2 {
             let base = i - 2;
             let key = if tok(t, base) == ")" && end[base] > 0 && end[base] < base {
@@ -1143,6 +1244,7 @@ pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
             Some(Binding::Local(id)) => *id,
             None => {
                 let id = ids.remove(0);
+                a.declarations[id].kind = "function_declaration";
                 e.declare(scope, &name, Binding::Local(id));
                 id
             }
@@ -1163,11 +1265,96 @@ crate::domain::code::cache::record!(Scope { shape, receiver, this_boundary, pare
 
 crate::domain::code::cache::record!(Import { module, name });
 
-impl crate::domain::code::cache::Wire for Binding{fn save(&self,w:&mut Vec<u8>){match self{Self::Local(a)=>{ w.push(0); a.save(w);},Self::Import(a)=>{ w.push(1); a.save(w);},Self::Package=>{ w.push(2); },Self::Conflicting=>{ w.push(3); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Local(Wire::load(r)?)),1=>Ok(Self::Import(Wire::load(r)?)),2=>Ok(Self::Package),3=>Ok(Self::Conflicting),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Binding{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Local(a)=>{ w.push(0); a.save(w);},Self::Import(a)=>{ w.push(1); a.save(w);},Self::Package=>{ w.push(2); },Self::Conflicting=>{ w.push(3); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Local(Wire::load(r)?)),1=>Ok(Self::Import(Wire::load(r)?)),2=>Ok(Self::Package),3=>Ok(Self::Conflicting),_=>Err(crate::domain::code::cache::bad())}}}
 
-impl crate::domain::code::cache::Wire for Forward{fn save(&self,w:&mut Vec<u8>){match self{Self::Namespace(a)=>{ w.push(0); a.save(w);},Self::Local(a)=>{ w.push(1); a.save(w);},Self::Import(a)=>{ w.push(2); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Namespace(Wire::load(r)?)),1=>Ok(Self::Local(Wire::load(r)?)),2=>Ok(Self::Import(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Forward{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Namespace(a)=>{ w.push(0); a.save(w);},Self::Local(a)=>{ w.push(1); a.save(w);},Self::Import(a)=>{ w.push(2); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Namespace(Wire::load(r)?)),1=>Ok(Self::Local(Wire::load(r)?)),2=>Ok(Self::Import(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
 
-impl crate::domain::code::cache::Wire for Lookup{fn save(&self,w:&mut Vec<u8>){match self{Self::Name {scope, receiver}=>{ w.push(0); scope.save(w);receiver.save(w);},Self::Argument {scope, callee}=>{ w.push(1); scope.save(w);callee.save(w);},Self::Known(a)=>{ w.push(2); a.save(w);},Self::Chained {prior, scope, qualification}=>{ w.push(3); prior.save(w);scope.save(w);qualification.save(w);},Self::Construct {scope}=>{ w.push(4); scope.save(w);},Self::Prop {scope, component}=>{ w.push(5); scope.save(w);component.save(w);},Self::Imported(a)=>{ w.push(6); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Name {scope:Wire::load(r)?, receiver:Wire::load(r)?}),1=>Ok(Self::Argument {scope:Wire::load(r)?, callee:Wire::load(r)?}),2=>Ok(Self::Known(Wire::load(r)?)),3=>Ok(Self::Chained {prior:Wire::load(r)?, scope:Wire::load(r)?, qualification:Wire::load(r)?}),4=>Ok(Self::Construct {scope:Wire::load(r)?}),5=>Ok(Self::Prop {scope:Wire::load(r)?, component:Wire::load(r)?}),6=>Ok(Self::Imported(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Lookup {
+    fn save(&self, w: &mut impl crate::domain::code::cache::Output) {
+        match self {
+            Self::Name { scope, receiver } => {
+                w.push(0);
+                scope.save(w);
+                receiver.save(w);
+            }
+            Self::Argument { scope, callee } => {
+                w.push(1);
+                scope.save(w);
+                callee.save(w);
+            }
+            Self::Known(a) => {
+                w.push(2);
+                a.save(w);
+            }
+            Self::Chained {
+                prior,
+                scope,
+                qualification,
+            } => {
+                w.push(3);
+                prior.save(w);
+                scope.save(w);
+                qualification.save(w);
+            }
+            Self::Construct { scope } => {
+                w.push(4);
+                scope.save(w);
+            }
+            Self::Prop { scope, component } => {
+                w.push(5);
+                scope.save(w);
+                component.save(w);
+            }
+            Self::Imported(a) => {
+                w.push(6);
+                a.save(w);
+            }
+            Self::Super {
+                scope,
+                base_scope,
+                base,
+            } => {
+                w.push(7);
+                scope.save(w);
+                base_scope.save(w);
+                base.save(w);
+            }
+        }
+    }
+    fn load(r: &mut &[u8]) -> std::io::Result<Self> {
+        use crate::domain::code::cache::Wire;
+        match usize::load(r)? {
+            0 => Ok(Self::Name {
+                scope: Wire::load(r)?,
+                receiver: Wire::load(r)?,
+            }),
+            1 => Ok(Self::Argument {
+                scope: Wire::load(r)?,
+                callee: Wire::load(r)?,
+            }),
+            2 => Ok(Self::Known(Wire::load(r)?)),
+            3 => Ok(Self::Chained {
+                prior: Wire::load(r)?,
+                scope: Wire::load(r)?,
+                qualification: Wire::load(r)?,
+            }),
+            4 => Ok(Self::Construct {
+                scope: Wire::load(r)?,
+            }),
+            5 => Ok(Self::Prop {
+                scope: Wire::load(r)?,
+                component: Wire::load(r)?,
+            }),
+            6 => Ok(Self::Imported(Wire::load(r)?)),
+            7 => Ok(Self::Super {
+                scope: Wire::load(r)?,
+                base_scope: Wire::load(r)?,
+                base: Wire::load(r)?,
+            }),
+            _ => Err(crate::domain::code::cache::bad()),
+        }
+    }
+}
 
 /// Source bytes read by the script resolver and public-label writer after parsing.
 /// Call only when both files have the same serialized parser evidence.
@@ -1181,6 +1368,7 @@ pub(super) fn same_binding_text(analysis: &Analysis, lang: Language, old: &str, 
     }
     e.uses.iter().all(|u| match u {
         Lookup::Name { receiver, .. } => receiver.as_ref().is_none_or(same),
+        Lookup::Super { base, .. } => same(base),
         Lookup::Chained { qualification, .. } => qualification.as_ref().is_none_or(same),
         Lookup::Argument { callee, .. } => same(callee),
         Lookup::Prop { component, .. } => same(component),

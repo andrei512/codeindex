@@ -1,0 +1,4 @@
+symbol	save	app.c:1,other.c:1
+definition	app.c:2:24	app.c:1:12	resolved
+references	app.c:1:12	app.c:2:24	resolved
+callers	app.c:1:12	app.c:2:24	resolved

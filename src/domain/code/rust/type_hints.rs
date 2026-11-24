@@ -138,4 +138,4 @@ pub(super) fn permits(r: &Resolver, at: Address, a: &Argument, p: Projection) ->
 
 crate::domain::code::cache::record!(Argument { outer, inner, index });
 
-impl crate::domain::code::cache::Wire for Projection{fn save(&self,w:&mut Vec<u8>){match self{Self::Value=>{ w.push(0); },Self::Element=>{ w.push(1); },Self::Unwrap=>{ w.push(2); },Self::Tuple(a)=>{ w.push(3); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Value),1=>Ok(Self::Element),2=>Ok(Self::Unwrap),3=>Ok(Self::Tuple(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Projection{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Value=>{ w.push(0); },Self::Element=>{ w.push(1); },Self::Unwrap=>{ w.push(2); },Self::Tuple(a)=>{ w.push(3); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Value),1=>Ok(Self::Element),2=>Ok(Self::Unwrap),3=>Ok(Self::Tuple(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}

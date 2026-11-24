@@ -1,11 +1,15 @@
 //! Native positional search. Token spans belong to the captured file, even
 //! where two overlapping chunks refer to the same source tokens.
+mod bulk;
 mod chunk;
 mod cursor;
 mod directory;
 mod grouped;
-pub(crate) mod patch;
+mod shards;
+pub(crate) use bulk::BulkRank;
+pub(crate) use shards::{FreshRank, ShardSet};
 mod incremental;
+pub(crate) mod patch;
 mod snippet;
 mod storage;
 #[cfg(test)]
@@ -48,6 +52,7 @@ pub struct RankedHit {
     pub line: usize,
     pub last_line: usize,
     pub excerpt: String,
+    pub anchor: usize,
     pub score: f64,
 }
 
@@ -121,22 +126,44 @@ impl RankedIndex {
 
     /// Returns the ordinal supplied to the source accessor when searching.
     pub fn add_file(&mut self, path: &str, body: &str, chunks: &[ChunkRange]) -> usize {
+        self.add_file_with(path, body, chunks, &mut [], |_| {})
+    }
+
+    fn add_file_with(
+        &mut self,
+        path: &str,
+        body: &str,
+        chunks: &[ChunkRange],
+        short: &mut [(u64, usize)],
+        mut first_posting: impl FnMut(usize),
+    ) -> usize {
         let file = self.files.len();
         let mut spans = Vec::new();
         if !chunks.is_empty() {
             let mut path_ids = Vec::new();
             token::tokenize(path, |k, _| path_ids.push(self.intern(k)));
             let mut body_ids = Vec::new();
-            token::tokenize(body, |k, span| {
-                body_ids.push(self.intern(k));
-                spans.push(span);
-            });
             let mut parts = Vec::new();
-            let mut scratch = Vec::new();
-            token::identifier_parts(body, |base, part| {
-                token::tokenize_with(part, &mut scratch, |k, span| {
-                    parts.push((base + span.start, self.intern(k)))
-                })
+            token::ranked_words(body, |is_part, key, span| {
+                let id = if !short.is_empty() && key.len() < 8 {
+                    let mut bytes = [0; 8];
+                    bytes[..key.len()].copy_from_slice(key);
+                    bytes[7] = key.len() as u8;
+                    let packed = u64::from_le_bytes(bytes);
+                    let slot = &mut short[(packed.wrapping_mul(0x9e3779b97f4a7c15) >> 52) as usize];
+                    if slot.0 != packed {
+                        *slot = (packed, self.intern(key));
+                    }
+                    slot.1
+                } else {
+                    self.intern(key)
+                };
+                if is_part {
+                    parts.push((span.start, id));
+                } else {
+                    spans.push(span);
+                    body_ids.push(id);
+                }
             });
             for chunk in chunks {
                 let begin = spans.partition_point(|s| s.start < chunk.bytes.start);
@@ -151,6 +178,9 @@ impl RankedIndex {
                     .chain(parts[part_begin..part_stop].iter().map(|p| p.1))
                 {
                     let term = &mut self.terms[id];
+                    if term.positions.is_empty() {
+                        first_posting(id);
+                    }
                     if term.positions.last().is_none_or(|&p| p < start) {
                         term.document_frequency += 1;
                     }
@@ -263,7 +293,7 @@ impl RankedIndex {
         &self,
         plan: &Query,
         compare_path: impl Fn(usize, usize) -> std::cmp::Ordering,
-        mut excerpt: impl FnMut(&Row, &[snippet::Instance], usize) -> Result<String, String>,
+        mut excerpt: impl FnMut(&Row, &[snippet::Instance], usize) -> Result<(String, usize), String>,
     ) -> Result<(Vec<RankedHit>, bool), String> {
         let Query {
             phrases,
@@ -364,7 +394,7 @@ impl RankedIndex {
                 }
             }
             hits.sort_unstable_by_key(|h| (h.start, h.phrase));
-            let excerpt = excerpt(row, &hits, order.len())?;
+            let (excerpt, anchor) = excerpt(row, &hits, order.len())?;
             results.push((
                 rank,
                 RankedHit {
@@ -373,6 +403,7 @@ impl RankedIndex {
                     last_line: row.chunk.last_line,
                     score,
                     excerpt,
+                    anchor,
                 },
             ));
         }
@@ -391,7 +422,7 @@ fn render(
     base: usize,
     hits: &[snippet::Instance],
     count: usize,
-) -> Result<String, String> {
+) -> Result<(String, usize), String> {
     let region = &row.chunk.bytes;
     if region.start < base
         || text.get(region.start - base..region.end - base).is_none()
@@ -403,12 +434,36 @@ fn render(
     {
         return Err("ranked source does not match the index".into());
     }
-    Ok(snippet::excerpt(
-        text,
-        base,
-        region.clone(),
-        spans,
-        hits,
-        count,
+    let mut anchor = region.start;
+    let mut best = 0;
+    let mut seen = vec![usize::MAX; count];
+    let mut at = region.start;
+    let mut line = 0;
+    let mut distinct = 0;
+    let mut first = at;
+    for hit in hits {
+        let offset = spans[hit.start].start;
+        let breaks = text.as_bytes()[at - base..offset - base]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        if breaks > 0 || distinct == 0 {
+            distinct = 0;
+            first = offset;
+        }
+        line += breaks;
+        if seen[hit.phrase] != line {
+            seen[hit.phrase] = line;
+            distinct += 1;
+            if distinct > best {
+                best = distinct;
+                anchor = first;
+            }
+        }
+        at = offset;
+    }
+    Ok((
+        snippet::excerpt(text, base, region.clone(), spans, hits, count),
+        anchor,
     ))
 }

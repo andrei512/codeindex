@@ -25,3 +25,7 @@ impl<W: ExtentSink> ExtentSink for std::io::BufWriter<&mut W> {
         self.get_ref().offset() + self.buffer().len() as u64
     }
 }
+
+impl ExtentSink for Vec<u8> {
+    fn offset(&self) -> u64 { self.len() as u64 }
+}

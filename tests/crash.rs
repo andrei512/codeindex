@@ -57,7 +57,7 @@ fn reader_can_finish_after_its_segment_has_been_unlinked() {
     }
     fs::write(root.join("a.txt"), "second generation").unwrap();
     let query = Command::new(env!("CARGO_BIN_EXE_cx"))
-        .args(["content", "second"])
+        .args(["--cx", "content", "second"])
         .current_dir(&root)
         .env("HOME", &dir)
         .env("PATH", "")

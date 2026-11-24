@@ -1,0 +1,5 @@
+# This script calls the top-level generate_trie helper from find. This is a coverage probe for a bare Ruby call beyond the documented singleton-call subset.
+symbol	generate_trie	primes/primes.rb:88:5		contains
+?definition	primes/primes.rb:104:10	primes/primes.rb:88:5	resolved
+?references	primes/primes.rb:88:5	primes/primes.rb:104:10	resolved
+?callers	primes/primes.rb:88:5	primes/primes.rb:104:10	resolved

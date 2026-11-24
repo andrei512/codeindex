@@ -1,0 +1,4 @@
+# generateTrie is private and static in Primes. The call in find refers to this class member.
+definition	primes/Primes.java:110:20	primes/Primes.java:92:25	resolved
+references	primes/Primes.java:92:25	primes/Primes.java:110:20	resolved
+callers	primes/Primes.java:92:25	primes/Primes.java:110:20	resolved

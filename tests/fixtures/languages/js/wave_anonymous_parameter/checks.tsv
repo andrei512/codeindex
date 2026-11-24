@@ -1,0 +1,10 @@
+# Each written parameter shadows the outer const. Named and arrow expressions are independent controls.
+definition	main.mjs:2:44	main.mjs:2:28	resolved
+references	main.mjs:2:28	main.mjs:2:44	resolved
+definition	main.mjs:3:46	main.mjs:3:30	resolved
+references	main.mjs:3:30	main.mjs:3:46	resolved
+definition	main.mjs:4:26	main.mjs:4:16	resolved
+references	main.mjs:4:16	main.mjs:4:26	resolved
+references	main.mjs:1:7	main.mjs:5:76	resolved
+definition	main.mjs:6:45	main.mjs:6:30	resolved
+references	main.mjs:6:30	main.mjs:6:45	resolved

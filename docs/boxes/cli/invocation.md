@@ -1,47 +1,75 @@
 ---
 page-type: reference
 ---
-# Invocation contract
+# CLI invocation contract
 
-The CLI translates a process invocation into one application request and renders one result. Help and version work outside a repository. Query commands preserve the archived command vocabulary.
+This is the design target for the native Codeindex CLI. It defines what an agent can type, what bytes it can read back, and how it can tell a miss from an incomplete answer. The compatibility target and the current implementation are tracked separately below.
 
-| Invocation after `cx` | Application request |
+## Four forms an agent needs
+
+| Question | Invocation | Example stdout |
+| --- | --- | --- |
+| Which lines match this regular expression? | `cx PATTERN [PATH…]` with ripgrep arguments | `fn retry_delay() {}` when stdout is piped and one file was specified |
+| Which passages discuss this topic? | `cx -k 'retry policy'` | `docs/retries.md:18:Retry failed requests up to three times.` |
+| Where is this name declared? | `cx --symbol retry_delay` | `src/retry.rs:12:pub fn retry_delay() {` |
+| Where is this declaration used? | `cx --reference retry_delay` | `src/client.rs:47:    retry_delay();` |
+
+Codeindex executes every search natively. Use the installed ripgrep executable only as a test oracle. Repository discovery, pinning and refresh belong to Codeindex. An indexed query observes a single generation.
+
+## Ordinary text search
+
+Inside a Git working tree, the reference for ordinary search is ripgrep 15.2.0, with the same arguments, working directory, locale, configuration, available regex features, input bytes and terminal descriptors. This covers argument interpretation, match selection, prefixes, colors, context, output formats, errors and exit status. For example, a pipe and a terminal can produce different output for the same command. A file operand and a directory containing just one file also have different prefix rules. `cx --json PATTERN` uses ripgrep's event stream. Help and version identify the actual `cx` binary and describe its extensions.
+
+Bare words are patterns, including `help`, `intro`, `symbol` and `references`. Option operands remain opaque. Both `cx -e --reference` and `cx -- --reference` search for the text `--reference`. No arguments follow ripgrep's no-pattern behavior. Repository discovery is a deliberate boundary for search. Help and version work anywhere.
+
+The ordinary search's file selection follows the query. For example, an ignored tracked file can be present in the shared index yet excluded from a default text search. An explicitly named ignored file can be absent from the index yet required by the query. Apply a query-local eligibility filter, use the pin for available bytes, and capture additional requested input with Codeindex's own reader. Stream stdin for `-` and piped-input invocations according to ripgrep's rules. One-off inputs do not expand the persistent index. Whole-repository ranked and semantic queries retain Codeindex's indexed-file eligibility.
+
+## Indexed modes
+
+A leading `-k` (alias `--keywords`), `--symbol` or `--reference` selects one indexed mode. Put the selector first, then its operands, then optional display switches. This keeps `cx --json PATTERN` unambiguous. A selector takes its next operand literally, including a dash-prefixed term. `--reference` takes either one unique name (including an indexed qualified method) or `FILE LINE COL`. An unknown name yields zero hits, an unresolved-name diagnostic and exit 1. A known declaration with zero recorded uses also exits 1. Its status is resolved, and partial coverage earns a warning. Ambiguous names exit 2 and direct the caller to `--symbol`.
+
+| Rule | Contract |
 | --- | --- |
-| `search TEXT`, `content TEXT`, `regex PATTERN` | Ranked text, literal content or regex content |
-| `path TEXT`, `path-exact PATH`, `path-regex PATTERN`, `glob PATTERN` | Substring, exact, regex or glob lookup over repository-relative paths |
-| `symbol NAME` | Declarations with this spelling |
-| `definition FILE LINE COL`, `references FILE LINE COL`, `callers FILE LINE COL` | Relationship query at a one-based UTF-16 position |
-| `section PATH[#ANCHOR] [--parent]`, `backlinks PATH[#ANCHOR]` | Section navigation or written backlinks |
-| `status` | Coverage and state of the refreshed generation |
+| Scope and paths | Search the indexed repository. Text paths are relative to the invocation directory, including `../` when needed. A reported location can be reopened there. JSON paths remain repository-relative. |
+| Match lines | Emit `path:line:source` even when piped. Copy the full source line including indentation, omit its original line terminator, and terminate each record with LF. No scores, highlighting or prose by default. |
+| Coordinates | Line and column start at one. `--column` adds the UTF-8 byte column before the source. The public positional `--reference FILE LINE COL` takes these same byte coordinates. Reject columns outside the line or inside a multibyte character. Appending `--json` leaves the public byte-column input unchanged. The legacy `--cx references FILE LINE COL` consumes UTF-16 columns. Both JSON forms preserve the historical UTF-16 `col` output field. |
+| Ranked anchor | Return one anchor per ranked passage, in existing BM25 order (ties by repository path bytes then passage start). Choose the line containing the starts of the most distinct matched body phrases. Break ties by earliest line. Use the first participating start on that line as the column. A metadata-only hit uses the passage's first line and column one. |
+| Semantic anchors | Use the declaration or reference span's first byte. Sort by repository path bytes then byte offset. Render one match line per source line, using the leftmost retained site for its column. JSON preserves distinct sites. |
+| Context | Accept `-A N`, `-B N`, `-C N` and attached counts such as `-A24`. In semantic modes merge touching or overlapping windows in a file. In ranked mode render each passage's window independently in rank order. Clip windows to file bounds. Use ripgrep context separators (e.g. `src/lib.rs-11-source`), with `--` between disjoint groups when context is requested. Each match keeps its match prefix. |
+| JSON | Append `--json` for the indexed object described below. Preserve scores, excerpts, breadcrumbs, evidence and semantic coordinates where applicable. Text-only switches with indexed JSON are usage errors. |
+| Bounds | Retain the existing first 50 ranked passages or semantic sites before line grouping. Mark truncation only on evidence of another hit. Context lines consume no hit slots. |
+| Streams and status | Compact stdout contains only result records and context separators. Send one stderr notice per applicable condition (partial coverage, truncation, unresolved name or position). Exit 0 for one or more hits, 1 for a valid empty answer, 2 for an invalid or ambiguous request, unsupported operation, unindexed input position or execution failure. Empty partial results still emit the coverage notice. Indexed JSON carries these statuses in its payload when a query was evaluated. A valid empty JSON answer still emits its object. |
 
-## Request lifecycle
+## Existing scripts and discoverability
 
-No arguments, `help`, `--help` and `-h` list commands. Use `cx help COMMAND` for usage and an example. Help works outside a repository. Reject empty search, symbol and path terms, whitespace-only ranked queries, invalid regexes and malformed globs as usage errors. Parse arguments before requesting build resources. Preserve the working directory for repository discovery and interpreting file arguments. Check arity, supported switches and positive numeric coordinates. Retain the distinction between a missing fragment and an explicitly empty fragment. Pass one typed request to the application. A query obtains its pin through refresh; status describes that same generation.
+The target reserves `--cx` as an explicit namespace for existing operations. For example, migrate `cx callers NAME` to `cx --cx callers NAME`, `cx section HANDLE` to `cx --cx section HANDLE`, and scripts using `cx symbol NAME | jq …` to `cx --symbol NAME --json | jq …`. The namespace retains content, regex, path, path-exact, path-regex, glob, symbol, definition, references, callers, section and backlinks, with their existing JSON payloads, empty-result success convention and UTF-16 relationship coordinates. Keep `cx --cx intro` for the short agent guide. List the four primary forms in `cx --help`. Removing positional verb dispatch and changing public positional reference columns require migration notes when shipped.
 
-A successful query writes one machine-readable result to stdout, including coverage and truncation when applicable. A valid empty search succeeds. Process exit codes are as follows. usage errors exit 2; repository, refresh, query or output failures exit 1; success exits 0. Diagnostics go to stderr.
+## Implementation gaps and acceptance
 
-## Acceptance
+The native implementation includes indexed selectors, source anchors, context windows, separate output streams, the advanced namespace, and common ordinary search switches. Differential fixtures cover pipes, terminal prefixes, stdin, context, and explicit paths. Full ripgrep parity is open, including binary and non-UTF-8 input handling, multiline and PCRE2 search, ripgrep configuration, file-type selectors and ignore overrides. Ordinary JSON emits UTF-8 search events and native search statistics. Run `python3 benchmarks/cli_parity.py target/debug/cx` for the current executable comparison. The current default walk uses Codeindex membership, with a hidden-path filter. Ignored tracked files can still differ from ripgrep.
 
-From a nested directory, the same location must resolve to the same file as an equivalent invocation at the repository root. A malformed position fails before opening the repository. An unsupported semantic operation yields explicit capability status. A broken stdout pipe cannot report successful delivery.
+- Run the same fixtures through `cx` and the pinned oracle. Compare stdout bytes, stderr and status in pipes and PTYs for search invocations. Check Codeindex help and version against their own fixtures. Normalize executable identity, nondeterministic timing fields, and unspecified file traversal order only. Force a sort when testing ordering. Repeat native runs with the oracle unavailable on PATH.
+- Exercise single-file and directory operands, multiple paths, stdin, empty matching lines, no matches, invalid regex, CRLF, Unicode, non-UTF-8 paths, ignore overrides, configured flags, grouped options, `-A24`, `-e --reference`, `-- --symbol` and ordinary search for every former verb. A blank matching line has a hit even if it contains zero source bytes.
+- For the indexed modes assert exact stdout, stderr and exit status. Include a metadata-only ranked hit, competing anchor lines, two sites on one line, a multibyte prefix round-trip, nested working directories, partial empty results, ambiguous names, 50 versus 51 hits, and independent ranked context windows. Compare fresh, warm and watcher-served answers from the same inputs.
+- Gate claims of ripgrep compatibility on the differential suite. Track unsupported flags, regex facilities and file-selection behaviors as gaps. An early error or different answer is a failed fixture.
 
 ## Addresses and machine output
 
 A relationship file argument may be absolute within the observed repository or relative to the invocation directory. Resolve it to a path inside the pin. Use repository-relative paths as the keys for path searches and Markdown handles. In a Markdown handle split on the first literal `#`. Escape literal percent and hash in each handle component as `%25` and `%23`. Decode those handle escapes exactly once. Thus `a%23b.md#setup` selects the heading in `a#b.md`. Bare `a.md` selects all destination fragments for backlinks; `a.md#` selects only the empty fragment.
 
-Preserve a JSON object per command response, except for the documented null parent. The frozen indexed query payloads supply the following compatibility fields:
+For indexed JSON output, preserve a JSON object per response, except for the documented null parent. The frozen indexed query payloads supply the following compatibility fields:
 
 | Family | Shape examined by compatibility checks |
 | --- | --- |
 | Search, content, regex, path, glob, exact path, symbol | `root`, `generation`, `mode`, `coverage`, `relationship_status`, `truncated`, and `hits`. Each hit contains only fields belonging to its query type. |
 | Relationships | `root`, `mode`, `generation`, `indexed_document`, `operation_status`, `position_encoding`, `relationship_status`, plus sibling top-level fields `result` (array), `truncated` (boolean), `reused` and `engine`. The new `contexts` and `evidence` fields explain contextual answers. |
 | Section and backlinks | Section returns the section object, with exact source body and ancestry. Backlinks echoes `target` and supplies `hits` and `truncated`. Each backlink points to the source occurrence and gives the normalized target handle. |
-| Status | Report the repository root, checkpoint generation, product generation, indexed HEAD, count of byte-identical committed text files, reuse, source bytes, and path and text counts. Each of the six entries in `products` gives its publication state and extent size in bytes. The separate `relationships.status` field describes semantic coverage. |
 
 Archived relationship status values distinguish unsupported operations, unindexed input, unresolved positions and resolved positions. Preserve the distinctions in native answers. The archived CLI could start a live language server for unindexed files, returning a separate server-shaped payload. A successful legacy live answer is a coverage obligation. Verify a corresponding native answer from captured inputs or record the case as an open parity gap. The design requires every new answer to come from the generation pin.
 
 ## Relationship response schema
 
-Every semantic query exposes the following members. JSON object member order is insignificant. Hit order, presence of nulls, and array order are significant.
+A relationship query in JSON exposes the following members. JSON object member order is insignificant. Hit order, presence of nulls, and array order are significant.
 
 ```text
 root: absolute worktree path                  generation: integer

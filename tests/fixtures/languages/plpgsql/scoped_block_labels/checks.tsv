@@ -1,0 +1,7 @@
+symbol	run_a	work.plpgsql:1:17
+symbol	run_b	work.plpgsql:7:17
+definition	work.plpgsql:4:8	work.plpgsql:2:3	resolved
+definition	work.plpgsql:10:8	work.plpgsql:8:3	resolved
+references	work.plpgsql:2:3	work.plpgsql:4:8	resolved
+references	work.plpgsql:8:3	work.plpgsql:10:8	resolved
+callers	work.plpgsql:1:17	-	resolved

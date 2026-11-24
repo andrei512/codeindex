@@ -235,6 +235,7 @@ fn commit_lookup_uses_pinned_commit_in_loose_and_packed_stores() {
             );
         };
         git(&["init", "--quiet", &format!("--object-format={format}")]);
+        f.put("README.md", b"root file");
         f.put("nested/file.rs", b"committed\n");
         f.put("stable/deep/file.txt", b"identical in both commits");
         symlink("file.rs", f.0.join("nested/link")).unwrap();
@@ -254,7 +255,8 @@ fn commit_lookup_uses_pinned_commit_in_loose_and_packed_stores() {
                 tree.blob("nested/file.rs").unwrap(),
                 Some(raw_blob_id(b"committed\n", format == "sha256"))
             );
-            for absent in ["nested", "nested/link", "missing", "nested/file.rs/child"] {
+            assert!(tree.blob("README.md").unwrap().is_some());
+            for absent in ["nested", "nested/link", "missing", "/README.md", "/nested/file.rs", "nested/file.rs/child"] {
                 assert_eq!(tree.blob(absent).unwrap(), None);
             }
         }
@@ -285,4 +287,66 @@ fn commit_lookup_uses_pinned_commit_in_loose_and_packed_stores() {
         );
         assert!(latest.changed_paths(&next).unwrap().is_empty());
     }
+}
+
+#[test]
+fn capture_root_rejects_stale_replacements_and_symlinked_ancestors() {
+    let fixture = Fixture::new();
+    fixture.put("sub/file", b"original");
+    let root = CaptureRoot::new(&fixture.0).unwrap();
+    let expected = capture::stamp(&fs::symlink_metadata(fixture.0.join("sub/file")).unwrap());
+    assert_eq!(root.capture("sub/file", expected).unwrap().unwrap(), "original");
+
+    // Even a symlink to the *original* directory must not be traversed.
+    fs::rename(fixture.0.join("sub"), fixture.0.join("moved")).unwrap();
+    symlink("moved", fixture.0.join("sub")).unwrap();
+    assert!(root.capture("sub/file", expected).is_err());
+
+    fs::remove_file(fixture.0.join("sub")).unwrap();
+    fixture.put("sub/file", b"original");
+    assert!(root.capture("sub/file", expected).is_err());
+    assert!(root.capture("../sub/file", expected).is_err());
+
+    symlink("sub/file", fixture.0.join("link")).unwrap();
+    let link_stamp = capture::stamp(&fs::symlink_metadata(fixture.0.join("link")).unwrap());
+    assert!(root.capture("link", link_stamp).unwrap().is_none());
+    assert!(root.capture("link", expected).is_err());
+}
+
+#[test]
+fn parallel_directories_inherit_only_ancestor_rules_and_keep_tracked_exceptions() {
+    let f = Fixture::new();
+    let padding: Vec<_> = (0..256).map(|i| format!("unused/{i:03}")).collect();
+    let mut tracked = vec!["component", "hidden/tracked.tmp"];
+    tracked.extend(padding.iter().map(String::as_str));
+    let mut idx = v2_index(&tracked);
+    idx[12 + 24..12 + 28].copy_from_slice(&0o160000u32.to_be_bytes());
+    f.put(".git/index", &idx);
+    f.put(".gitignore", b"*.tmp\nhidden/\n");
+    f.put("component/untracked", b"");
+    f.put("nested/.git/config", b"");
+    f.put("nested/file", b"");
+    f.put("hidden/tracked.tmp", b"");
+    f.put("hidden/.gitignore", b"!untracked.tmp\n");
+    f.put("hidden/untracked.tmp", b"");
+    let mut expected = vec![".gitignore".to_owned(), "hidden/tracked.tmp".to_owned()];
+    for n in 0..12 {
+        let base = format!("branch-{n:02}/deep/nested");
+        f.put(&format!("{base}/visible"), b"");
+        f.put(&format!("{base}/child/keep.tmp"), b"");
+        expected.push(format!("{base}/visible"));
+        if n % 2 == 0 {
+            f.put(&format!("{base}/.gitignore"), b"!keep.tmp\n");
+            expected.push(format!("{base}/.gitignore"));
+            expected.push(format!("{base}/child/keep.tmp"));
+        }
+    }
+    expected.sort_unstable();
+    let got = observe(&f.0).unwrap();
+    for path in &got {
+        if path.path.ends_with("/.gitignore") {
+            assert_eq!(path.captured.as_ref().unwrap().as_deref(), Some("!keep.tmp\n"));
+        }
+    }
+    assert_eq!(got.into_iter().map(|p| p.path).collect::<Vec<_>>(), expected);
 }

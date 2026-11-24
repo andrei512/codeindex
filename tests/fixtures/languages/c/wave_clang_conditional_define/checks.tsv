@@ -1,0 +1,3 @@
+# Both versions compile and have one written definition and one call.
+definition	source.c:5:17	source.c:3:13	resolved
+references	source.c:3:13	source.c:5:17	resolved

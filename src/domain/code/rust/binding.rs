@@ -1,6 +1,28 @@
+mod prepare;
 use super::*;
+use prepare::{Action, prepare_paths};
+
+type ModuleResults =
+    HashMap<(Address, Namespace), HashMap<String, HashMap<Vec<String>, Vec<Site>>>>;
+use std::sync::Arc;
 
 pub(super) struct Resolver<'a, 's> {
+    state: Arc<ResolverState<'a, 's>>,
+    module_results: std::cell::RefCell<ModuleResults>,
+}
+impl<'a, 's> std::ops::Deref for Resolver<'a, 's> {
+    type Target = ResolverState<'a, 's>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for Resolver<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::get_mut(&mut self.state).expect("resolver state is uniquely held during construction")
+    }
+}
+
+pub(super) struct ResolverState<'a, 's> {
     pub(super) units: &'a [Unit<'s>],
     pub(super) modules: HashMap<Address, HashMap<String, Address>>,
     externs: Vec<Option<std::sync::Arc<HashMap<String, usize>>>>,
@@ -8,6 +30,7 @@ pub(super) struct Resolver<'a, 's> {
     roots: HashMap<Address, Option<Address>>,
     disabled: Vec<Vec<std::ops::Range<usize>>>,
     active_files: Vec<bool>,
+    invariant_modules: HashSet<Address>,
 }
 impl<'a, 's> Resolver<'a, 's> {
     pub(super) fn active(&self, file: usize, at: usize) -> bool {
@@ -136,6 +159,33 @@ impl<'a, 's> Resolver<'a, 's> {
             "super" => self.parents.get(&module).copied().flatten(),
             _ => loop {
                 let s = &self.evidence(at.0).scopes[at.1];
+                if at != origin
+                    && at.1 == s.module
+                    && visited.is_empty()
+                    && self.invariant_modules.contains(&at)
+                {
+                    // After lexical scopes have failed, module-level name queries
+                    // cannot see an enclosing function's locals. Cache that suffix
+                    // only when every binding in the module is position-independent.
+                    if let Some(sites) = self
+                        .module_results
+                        .borrow()
+                        .get(&(at, ns))
+                        .and_then(|m| m.get(head))
+                        .and_then(|tails| tails.get(tail))
+                    {
+                        return sites.clone();
+                    }
+                    let sites = self.lookup(at, head, tail, usize::MAX, ns, visited);
+                    self.module_results
+                        .borrow_mut()
+                        .entry((at, ns))
+                        .or_default()
+                        .entry(head.into())
+                        .or_default()
+                        .insert(tail.to_vec(), sites.clone());
+                    return sites;
+                }
                 if tail.is_empty() {
                     let local = self.local(at, head, offset, origin_scope.owner, ns);
                     if !local.is_empty() {
@@ -250,17 +300,21 @@ impl<'a, 's> Resolver<'a, 's> {
 pub(in crate::domain::code) fn resolve(
     units: &[Unit],
     paths: &HashMap<&str, usize>,
-    names: &mut Names,
+    names: &mut ForwardNames,
 ) {
     let cargo = cargo::inputs(units, paths);
     let mut r = Resolver {
-        units,
-        modules: HashMap::new(),
-        externs: cargo.externs,
-        parents: HashMap::new(),
-        roots: HashMap::new(),
-        disabled: config::disabled(units),
-        active_files: vec![true; units.len()],
+        module_results: Default::default(),
+        state: Arc::new(ResolverState {
+            units,
+            modules: HashMap::new(),
+            externs: cargo.externs,
+            parents: HashMap::new(),
+            roots: HashMap::new(),
+            disabled: config::disabled(units),
+            active_files: vec![true; units.len()],
+            invariant_modules: HashSet::new(),
+        }),
     };
     let mut referred = HashSet::new();
     let mut active_links = HashMap::<usize, Vec<usize>>::new();
@@ -375,69 +429,85 @@ pub(in crate::domain::code) fn resolve(
                 .filter(|(scope, item)| *scope == item.module)
             {
                 let addr = (file, scope);
-                r.roots.insert(addr, r.root(addr));
+                let root = r.root(addr);
+                r.roots.insert(addr, root);
+                if e.scopes[scope]
+                    .names
+                    .values()
+                    .flatten()
+                    .all(|b| !b.local && b.visibility == 0)
+                {
+                    r.invariant_modules.insert(addr);
+                }
             }
         }
     }
-    identity::collect(&r, &cargo.target_prefixes, &mut names.public_labels);
-    let mut members = members::Table::build(&r);
-    for (file, u) in units.iter().enumerate() {
-        let Some(e) = &u.analysis.rust else {
-            continue;
+    std::thread::scope(|scope| {
+        let worker = Resolver {
+            state: Arc::clone(&r.state),
+            module_results: Default::default(),
         };
-        for (local, v) in e.uses.iter().enumerate() {
-            if !r.active(file, u.analysis.calls[local].span.start) {
-                continue;
-            }
-            if let Some(&target) = e.direct.get(&local) {
-                names.bind(
-                    Site { file, local },
-                    vec![Site {
-                        file,
-                        local: target,
-                    }],
-                );
-                continue;
-            }
-            let c = &u.analysis.calls[local];
-            let (head, tail) = v
-                .path
-                .split_first()
-                .map(|(h, t)| (h.as_str(), t))
-                .unwrap_or_else(|| (name(&u.text[c.span.clone()]), &[]));
-            let addr = (file, v.scope);
-            let targets =
-                if head == "Self" && tail.is_empty() && !e.members.uses.contains_key(&local) {
-                    // SCIP identifies the impl block itself as Self; it has no
-                    // written definition range. Keep the nominal owner for member lookup.
-                    Vec::new()
-                } else if let Some(receiver) = e.members.uses.get(&local) {
-                    members.receiver(&r, names, addr, receiver, head, c.span.start)
-                } else {
-                    members.path(&r, addr, head, tail, c.span.start, v.ns)
-                };
-            let targets = targets
-                .into_iter()
-                .filter(|target| {
-                    let d = &units[target.file].analysis.declarations[target.local];
-                    if !r.active(target.file, d.span.start) {
-                        return false;
-                    }
-                    let kind = d.kind;
-                    match e.members.uses.get(&local) {
-                        Some(members::Receiver::Literal(_)) => kind == "field_declaration",
-                        Some(members::Receiver::Previous(_)) => {
-                            if c.is_call {
-                                kind.starts_with("function")
-                            } else {
-                                kind == "field_declaration"
-                            }
+        let identity = scope.spawn(move || {
+            let mut labels = HashMap::new();
+            identity::collect(&worker, &cargo.target_prefixes, &mut labels);
+            labels
+        });
+        let mut members = members::Table::build(&r);
+        let groups = prepare_paths(&r, &members, names);
+        // Receiver inference can consult both earlier bindings and an inference
+        // cache. Commit results in baseline source order, including across files.
+        for group in groups {
+            for (file, pending) in group {
+                for (local, action) in pending {
+                    let targets = match action {
+                        Action::One(target) => {
+                            names.bind_one(Site { file, local }, target);
+                            continue;
                         }
-                        None => kind != "field_declaration",
-                    }
-                })
-                .collect();
-            names.bind(Site { file, local }, targets);
+                        Action::Resolved(targets) => targets,
+                        Action::Receiver => {
+                            let u = &units[file];
+                            let e = r.evidence(file);
+                            let lookup = &e.uses[local];
+                            let c = &u.analysis.calls[local];
+                            let head = lookup
+                                .path
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or_else(|| name(&u.text[c.span.clone()]));
+                            let receiver = &e.members.uses[&local];
+                            let mut targets = members.receiver(
+                                &r,
+                                names,
+                                (file, lookup.scope),
+                                receiver,
+                                head,
+                                c.span.start,
+                            );
+                            targets.retain(|t| {
+                                let d = &units[t.file].analysis.declarations[t.local];
+                                r.active(t.file, d.span.start)
+                                    && match receiver {
+                                        members::Receiver::Literal(_) => {
+                                            d.kind == "field_declaration"
+                                        }
+                                        members::Receiver::Previous(_) if c.is_call => {
+                                            d.kind.starts_with("function")
+                                        }
+                                        members::Receiver::Previous(_) => {
+                                            d.kind == "field_declaration"
+                                        }
+                                    }
+                            });
+                            targets
+                        }
+                    };
+                    names.bind(Site { file, local }, targets);
+                }
+            }
         }
-    }
+        names
+            .public_labels
+            .extend(identity.join().expect("identity worker"));
+    });
 }

@@ -1,4 +1,5 @@
 //! One content partition, built from documents in increasing FileId order.
+pub(crate) mod fresh;
 mod incremental;
 pub(crate) use incremental::MergedPostings;
 use std::collections::HashMap;
@@ -52,6 +53,8 @@ pub(crate) fn grams(text: &str) -> impl Iterator<Item = u64> + '_ {
 pub struct ContentBuilder {
     lists: HashMap<u64, Vec<u64>>,
     last_id: Option<u64>,
+    seen_ascii: Vec<u64>,
+    used_words: Vec<usize>,
 }
 
 impl ContentBuilder {
@@ -73,20 +76,64 @@ impl ContentBuilder {
             ));
         }
         self.last_id = Some(doc.file.0);
-        for key in grams(doc.text) {
-            let list = self.lists.entry(key).or_default();
-            if list.last() != Some(&doc.file.0) {
-                list.push(doc.file.0);
+        // The regular source alphabet has only 128³ triples. Reject repeated
+        // ASCII triples before probing a posting vector for each occurrence.
+        if doc.text.len() >= 256 {
+            if self.seen_ascii.is_empty() {
+                self.seen_ascii.resize(1 << 15, 0);
+            }
+            if doc.text.is_ascii() {
+                for triple in doc.text.as_bytes().windows(3) {
+                    let [a, b, c] = [triple[0] as u64, triple[1] as u64, triple[2] as u64];
+                    self.add_ascii(a, b, c, doc.file.0);
+                }
+            } else {
+                let ascii = (127 << 42) | (127 << 21) | 127;
+                for key in grams(doc.text) {
+                    if key & !ascii == 0 {
+                        self.add_ascii(key >> 42, (key >> 21) & 127, key & 127, doc.file.0);
+                    } else {
+                        let owners = self.lists.entry(key).or_default();
+                        if owners.last() != Some(&doc.file.0) {
+                            owners.push(doc.file.0);
+                        }
+                    }
+                }
+            }
+            for word in self.used_words.drain(..) {
+                self.seen_ascii[word] = 0;
+            }
+        } else {
+            for key in grams(doc.text) {
+                let owners = self.lists.entry(key).or_default();
+                if owners.last() != Some(&doc.file.0) {
+                    owners.push(doc.file.0);
+                }
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn add_ascii(&mut self, a: u64, b: u64, c: u64, id: u64) {
+        let compact = ((a << 14) | (b << 7) | c) as usize;
+        let slot = &mut self.seen_ascii[compact >> 6];
+        let mask = 1 << (compact & 63);
+        if *slot & mask == 0 {
+            if *slot == 0 {
+                self.used_words.push(compact >> 6);
+            }
+            *slot |= mask;
+            self.lists.entry((a << 42) | (b << 21) | c).or_default().push(id);
+        }
     }
 
     /// Content product 2, codec 3, stream 1. The caller supplies a buffered sink.
     pub fn seal(self, out: impl Write) -> io::Result<()> {
         self.seal_layout(out, false)
     }
-    pub(crate) fn seal_layout(self, mut out: impl Write, sampled: bool) -> io::Result<()> {
+    pub(crate) fn seal_layout(self, out: impl Write, sampled: bool) -> io::Result<()> {
+        let mut out = io::BufWriter::with_capacity(64 * 1024, out);
         let mut entries: Vec<_> = self.lists.into_iter().collect();
         entries.sort_unstable_by_key(|(key, _)| *key);
         out.write_all(&[if sampled { 2 } else { 1 }])?;
@@ -115,7 +162,7 @@ impl ContentBuilder {
                 out.write_all(&id.to_le_bytes())?;
             }
         }
-        Ok(())
+        out.flush()
     }
 }
 
@@ -321,6 +368,34 @@ mod tests {
         let second_anchor = 9 + 130 * 12 + 8 + 130 * 8 + 8 + 8;
         bytes[second_anchor] ^= 1;
         assert!(ContentRun::open(&bytes).is_err());
+    }
+
+    #[test]
+    fn bulk_ascii_and_unicode_membership_matches_scalar_reference_bytes() {
+        let texts = [
+            "hello hello hello".repeat(500),
+            "a🙂 bÉ and ascii repeat and ascii repeat".repeat(100),
+            "\0\u{7f}~ ~~λ".repeat(254),
+            "hello hello world".into(),
+        ];
+        let mut reference = ContentBuilder::default();
+        let mut batches = [ContentBuilder::default(), ContentBuilder::default()];
+        for (file, text) in texts.iter().enumerate() {
+            for key in grams(text) {
+                let owners = reference.lists.entry(key).or_default();
+                if owners.last() != Some(&(file as u64)) {
+                    owners.push(file as u64);
+                }
+            }
+            batches[file / 2].add(Document { file: FileId(file as u64), text }).unwrap();
+        }
+        let [mut first, second] = batches;
+        first.append_later(second);
+        let mut want = Vec::new();
+        let mut got = Vec::new();
+        first.seal_layout(&mut got, true).unwrap();
+        reference.seal_layout(&mut want, true).unwrap();
+        assert_eq!(got, want);
     }
 
     #[test]

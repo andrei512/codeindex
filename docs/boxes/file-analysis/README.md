@@ -14,3 +14,7 @@ Every supported format implements the same file-local contract: declare capabili
 ### Design
 
 - [Extraction contract](extraction.md) — Specifies analyzer inputs, emitted evidence, scratch lifetime and coverage.
+
+### Reference
+
+- [Additional language profiles](language-profiles.md) lists file selection, declaration coverage and local relationships for twenty languages.

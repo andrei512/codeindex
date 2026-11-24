@@ -1,0 +1,2 @@
+symbol	escapeStringRegexp	index.js:1,index.d.ts:16
+definition	test.js:6:3	index.d.ts:16:25	resolved

@@ -1,0 +1,4 @@
+:root { --accent: red; }
+.a { color: var(--accent); }
+.b { --accent: blue;
+     color: var(--accent); }

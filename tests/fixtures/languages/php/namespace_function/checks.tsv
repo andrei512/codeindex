@@ -1,0 +1,11 @@
+# The functions share a spelling across two namespaces. Function names ignore ASCII case and unqualified lookup starts in Worker.
+symbol	emit	work.php:3,work.php:9
+symbol	flush	work.php:4
+symbol	runWork	work.php:5
+definition	work.php:6:5	work.php:3:10	resolved
+references	work.php:3:10	work.php:6:5	resolved
+callers	work.php:3:10	work.php:6:5	resolved
+references	work.php:4:10	-	resolved
+callers	work.php:4:10	-	resolved
+references	work.php:9:10	-	resolved
+callers	work.php:9:10	-	resolved

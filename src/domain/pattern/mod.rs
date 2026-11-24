@@ -152,9 +152,26 @@ pub struct Regex {
     required: String,
     starts: Starts,
 }
+pub(crate) fn word_char(c: char) -> bool { unicode::word(c) }
 impl Regex {
     pub fn new(pattern: &str) -> Result<Self, String> {
-        let expr = parse::parse(pattern)?;
+        Self::with_case_folding(pattern, false)
+    }
+    pub(crate) fn with_case_folding(pattern: &str, fold: bool) -> Result<Self, String> {
+        Self::compile(parse::parse(pattern, fold)?)
+    }
+    pub(crate) fn folded_literal(text: &str) -> Result<Self, String> {
+        if text.len() > 128 * 1024 {
+            return Err("pattern too long".into());
+        }
+        let chars = text.chars().map(|c| Expr::Class(Class {
+            members: [Member::Range(c, c)].into(),
+            negated: false,
+            fold: true,
+        })).collect();
+        Self::compile(Expr::Sequence(chars))
+    }
+    fn compile(expr: Expr) -> Result<Self, String> {
         let mut program = vec![Inst::Accept];
         let start = emit(&expr, 0, &mut program)?;
         let mut required = String::new();

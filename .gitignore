@@ -19,3 +19,7 @@ __pycache__/
 # Machine-local credentials and configuration
 .env
 .env.*
+
+# Local Nx tooling
+/node_modules/
+/.nx/

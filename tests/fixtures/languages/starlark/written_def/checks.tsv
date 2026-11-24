@@ -1,0 +1,5 @@
+symbol	compile_target	rules.bzl:1
+symbol	phantom	-
+callers	rules.bzl:1:5	-	unsupported
+definition	rules.bzl:1:5	-	unindexed
+references	rules.bzl:1:5	-	unindexed

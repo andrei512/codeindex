@@ -1,0 +1,11 @@
+# Clang AST shows two direct emit methods and a self send in Worker.run. The class of self selects Worker.emit.
+symbol	emit	Worker.m:5,Worker.m:15
+symbol	flush	Worker.m:6
+symbol	run	Worker.m:7
+definition	Worker.m:8:11	Worker.m:5:9	resolved
+references	Worker.m:5:9	Worker.m:8:11	resolved
+callers	Worker.m:5:9	Worker.m:8:11	resolved
+references	Worker.m:6:9	-	resolved
+callers	Worker.m:6:9	-	resolved
+references	Worker.m:15:9	-	resolved
+callers	Worker.m:15:9	-	resolved

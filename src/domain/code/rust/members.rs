@@ -323,20 +323,7 @@ impl Table {
         }
         vec![]
     }
-    fn inferred(
-        &mut self,
-        r: &Resolver,
-        names: &Names,
-        site: Site,
-        projection: Projection,
-        depth: usize,
-    ) -> Vec<Site> {
-        if depth >= 32 {
-            return Vec::new();
-        }
-        if let Some(types) = self.inferred.get(&(site, projection)) {
-            return types.clone();
-        }
+    fn written(&self, r: &Resolver, site: Site, projection: Projection) -> (Vec<Site>, bool) {
         let evidence = &r.evidence(site.file).members;
         let mut types = Vec::new();
         if let Some((scope, arguments)) = evidence.arguments.get(&site.local) {
@@ -381,6 +368,47 @@ impl Table {
             } else {
                 self.path(r, at, &path[0], &path[1..], usize::MAX, Namespace::Type)
             };
+            return (declared, true);
+        }
+        (types, false)
+    }
+
+    // Initializer rows and alias recursion depend on the ordered inference cache.
+    // Only a terminal declaration can be resolved by a path preparation worker.
+    pub(super) fn terminal(&self, r: &Resolver, site: Site) -> Option<Vec<Site>> {
+        let (mut types, expand) = self.written(r, site, Projection::Value);
+        if expand && types.iter().any(|&ty| ty != site &&
+            r.units[ty.file].analysis.declarations[ty.local].kind == "type_item") {
+            return None;
+        }
+        if types.is_empty() {
+            if r.evidence(site.file).members.initializers.contains_key(&site.local) {
+                return None;
+            }
+            if r.units[site.file].analysis.declarations[site.local].kind == "struct_item" {
+                types.push(site);
+            }
+        }
+        Some(types)
+    }
+    fn inferred(
+        &mut self,
+        r: &Resolver,
+        names: &ForwardNames,
+        site: Site,
+        projection: Projection,
+        depth: usize,
+    ) -> Vec<Site> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        if let Some(types) = self.inferred.get(&(site, projection)) {
+            return types.clone();
+        }
+        let evidence = &r.evidence(site.file).members;
+        let (mut types, expand) = self.written(r, site, projection);
+        if expand {
+            let declared = std::mem::take(&mut types);
             for ty in declared {
                 if r.units[ty.file].analysis.declarations[ty.local].kind == "type_item"
                     && ty != site
@@ -401,14 +429,10 @@ impl Table {
             } else {
                 return types;
             };
-            for &s in names
-                .targets
-                .get(&Site {
+            for &s in names.row(Site {
                     file: site.file,
                     local,
                 })
-                .into_iter()
-                .flatten()
             {
                 types.extend(self.inferred(r, names, s, next, depth + 1));
             }
@@ -423,7 +447,7 @@ impl Table {
     pub fn receiver(
         &mut self,
         r: &Resolver,
-        names: &Names,
+        names: &ForwardNames,
         at: Address,
         receiver: &Receiver,
         key: &str,
@@ -435,22 +459,23 @@ impl Table {
             }
             Receiver::Previous(prev) => {
                 let mut types = Vec::new();
-                for site in names
-                    .targets
-                    .get(&Site {
+                for site in names.row(Site {
                         file: at.0,
                         local: *prev,
                     })
-                    .into_iter()
-                    .flatten()
                 {
                     types.extend(self.inferred(r, names, *site, Projection::Value, 0));
                 }
                 types
             }
         };
+        self.select(r, at, key, offset, &types)
+    }
+    pub(super) fn select(
+        &self, r: &Resolver, at: Address, key: &str, offset: usize, types: &[Site],
+    ) -> Vec<Site> {
         let mut found = Vec::new();
-        for ty in types {
+        for &ty in types {
             if let Some(items) = self.by_type.get(&ty).and_then(|m| m.get(key)) {
                 found.extend_from_slice(items);
                 continue;
@@ -578,4 +603,4 @@ pub fn result_suffix(t: &[Token], mut end: usize) -> (usize, Projection) {
 
 crate::domain::code::cache::record!(Members { bounds, initializers, arguments, definitions, simple_impls, plain_types, trait_scopes, impls, types, uses });
 
-impl crate::domain::code::cache::Wire for Receiver{fn save(&self,w:&mut Vec<u8>){match self{Self::Previous(a)=>{ w.push(0); a.save(w);},Self::Literal(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Previous(Wire::load(r)?)),1=>Ok(Self::Literal(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Receiver{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Previous(a)=>{ w.push(0); a.save(w);},Self::Literal(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Previous(Wire::load(r)?)),1=>Ok(Self::Literal(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}

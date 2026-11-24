@@ -1,0 +1,5 @@
+# GNU make stores the define body as text. Without eval it adds no rule or prerequisite. The all rule is the only use of real.
+symbol	phantom	-
+symbol	real	Makefile:5:1
+definition	Makefile:4:6	Makefile:5:1
+references	Makefile:5:1	Makefile:4:6

@@ -1,0 +1,5 @@
+# x86-64 call shares its source line with a label. The data string contributes no call instruction.
+symbol	helper	entry.s:4:1
+definition	entry.s:2:13	entry.s:4:1
+references	entry.s:4:1	entry.s:2:13
+callers	entry.s:4:1	entry.s:2:13

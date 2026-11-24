@@ -1,0 +1,4 @@
+symbol	bats_check_valid_version	lib/bats-core/common.bash:26
+definition	lib/bats-core/common.bash:35:3	lib/bats-core/common.bash:26:1	resolved
+references	lib/bats-core/common.bash:26:1	lib/bats-core/common.bash:35:3,lib/bats-core/common.bash:36:3	resolved
+callers	lib/bats-core/common.bash:26:1	lib/bats-core/common.bash:35:3,lib/bats-core/common.bash:36:3	resolved

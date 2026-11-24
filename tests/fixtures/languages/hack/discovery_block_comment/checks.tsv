@@ -1,0 +1,5 @@
+# The block comment contains a fake declaration and call; line 4 holds the only call to visible.
+symbol	phantom	-
+symbol	visible	main.hack:3:10
+definition	main.hack:4:26	main.hack:3:10	resolved
+references	main.hack:3:10	main.hack:4:26	resolved

@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/bats-core/bats-core",
+  "commit": "3a45b53d71cd488dcfc095593ff60398b3894653",
+  "evidence": "The two command positions in bats_version_lt call the declared function. Whole-checkout search contains just these three literal occurrences."
+}

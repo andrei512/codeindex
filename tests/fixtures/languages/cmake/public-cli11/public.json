@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/CLIUtils/CLI11.git",
+  "commit": "4fa080f70b6768d30e2fcf58ab5a9de162d5f8fd",
+  "evidence": "The examples list file defines its own add_cli_exe command before both invocations. The book/code subproject has a separate definition with the same name. The selected forward checks do not assert repository-wide recall."
+}

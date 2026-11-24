@@ -1,0 +1,11 @@
+# The local emit in the later do/end block is outside the lexical scope of the earlier call.
+symbol	emit	work.lua:1,work.lua:7
+symbol	flush	work.lua:2
+symbol	run	work.lua:3
+definition	work.lua:4:3	work.lua:2:16	resolved
+references	work.lua:2:16	work.lua:4:3	resolved
+callers	work.lua:2:16	work.lua:4:3	resolved
+references	work.lua:1:16	-	resolved
+callers	work.lua:1:16	-	resolved
+references	work.lua:7:18	-	resolved
+callers	work.lua:7:18	-	resolved

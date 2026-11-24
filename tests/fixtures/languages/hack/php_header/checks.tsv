@@ -1,0 +1,11 @@
+# The PHP file starts with a Hack header. The unqualified call names a global function; the Other method requires a receiver.
+symbol	emit	work.php:2,work.php:8
+symbol	flush	work.php:3
+symbol	run_work	work.php:4
+definition	work.php:5:3	work.php:2:10	resolved
+references	work.php:2:10	work.php:5:3	resolved
+callers	work.php:2:10	work.php:5:3	resolved
+references	work.php:3:10	-	resolved
+callers	work.php:3:10	-	resolved
+references	work.php:8:26	-	resolved
+callers	work.php:8:26	-	resolved

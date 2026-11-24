@@ -1,0 +1,5 @@
+# A Terraform heredoc contains text and interpolation. The first var.zone is interpolated and the double-dollar spelling escapes the second.
+symbol	zone	main.tf:1:11
+symbol	ghost	-
+definition	main.tf:5:17	main.tf:1:11
+references	main.tf:1:11	main.tf:5:17

@@ -36,8 +36,26 @@ impl<R: ExtentRead> SymbolLookup<R> {
     pub fn count(&self) -> usize {
         ((self.declarations.end - self.declarations.start) / 8 - 1) as usize
     }
+    /// Fixed-width end coordinate of the last declaration owned by this file.
+    pub(crate) fn source_end_word(&mut self, file: usize, end: usize) -> io::Result<Option<u64>> {
+        let (mut lo, mut hi) = (0, self.count() as u64);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let pos = word(&mut self.reader, self.declarations.start + mid * 8)?;
+            if pos >= self.row_end { return Err(bad()); }
+            if word(&mut self.reader, pos)? <= file as u64 { lo = mid + 1; } else { hi = mid; }
+        }
+        let Some(id) = lo.checked_sub(1) else { return Ok(None) };
+        let range = row(&mut self.reader, &self.declarations, id, self.row_end)?;
+        let decl = self.decode_declaration(range.clone())?;
+        Ok((decl.file == file && decl.kind == "source_file" && decl.span == (0..end))
+            .then_some(range.start + 16))
+    }
     pub fn declaration(&mut self, id: u64) -> io::Result<Decl> {
         let r = row(&mut self.reader, &self.declarations, id, self.row_end)?;
+        self.decode_declaration(r)
+    }
+    fn decode_declaration(&mut self, r: Range<u64>) -> io::Result<Decl> {
         let bytes = read_bytes(&mut self.reader, r)?;
         let mut d = super::binary::Decoder(&bytes);
         let item = super::graph::decode_decl(&mut d, self.file_count)?;
@@ -67,7 +85,7 @@ impl<R: ExtentRead> SymbolLookup<R> {
         }
         Ok(())
     }
-    pub fn get(&mut self, name: &str, limit: usize) -> io::Result<(Vec<Decl>, bool)> {
+    fn name_row(&mut self, name: &str) -> io::Result<Range<u64>> {
         let mut low = 0;
         let mut high = (self.names.end - self.names.start) / 8 - 1;
         while low < high {
@@ -86,18 +104,62 @@ impl<R: ExtentRead> SymbolLookup<R> {
                     {
                         return Err(bad());
                     }
-                    let count = n.min(limit as u64) as usize;
-                    let mut ids = vec![0; count * 8];
-                    self.reader.read(at + 8, &mut ids)?;
-                    let mut results = Vec::with_capacity(count);
-                    for b in ids.as_chunks::<8>().0 {
-                        results.push(self.declaration(u64::from_le_bytes(*b))?);
-                    }
-                    return Ok((results, n > count as u64));
+                    return Ok(at + 8..r.end);
                 }
             }
         }
-        Ok((Vec::new(), false))
+        Ok(0..0)
+    }
+
+    pub fn get(&mut self, name: &str, limit: usize) -> io::Result<(Vec<Decl>, bool)> {
+        let row = self.name_row(name)?;
+        let count = (row.end - row.start) / 8;
+        let mut ids = vec![0; count.min(limit as u64) as usize * 8];
+        if !ids.is_empty() {
+            self.reader.read(row.start, &mut ids)?;
+        }
+        let mut results = Vec::with_capacity(ids.len() / 8);
+        for b in ids.as_chunks::<8>().0 {
+            results.push(self.declaration(u64::from_le_bytes(*b))?);
+        }
+        Ok((results, count > limit as u64))
+    }
+
+    /// Stop at the second match. An ambiguous name requires a source position.
+    pub fn named_target(&mut self, input: &str) -> io::Result<(usize, Decl)> {
+        let (owner, name) = match input.rsplit_once("::") {
+            Some((owner, method)) => (Some(format!("impl#[{owner}]{method}().")), method),
+            None => (None, input),
+        };
+        let row = self.name_row(name)?;
+        let mut found = None;
+        let mut at = row.start;
+        let mut buf = [0; 256];
+        while at < row.end {
+            let len = (row.end - at).min(buf.len() as u64) as usize;
+            self.reader.read(at, &mut buf[..len])?;
+            at += len as u64;
+            for bytes in buf[..len].as_chunks::<8>().0 {
+                let id = u64::from_le_bytes(*bytes);
+                let decl = self.semantic_declaration(id)?;
+                if decl.kind == "source_file"
+                    || owner.as_ref().is_some_and(|suffix| {
+                        !decl
+                            .label
+                            .as_deref()
+                            .and_then(|label| label.rsplit(['/', ' ']).next())
+                            .is_some_and(|last| last == suffix)
+                    })
+                {
+                    continue;
+                }
+                if found.is_some() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("ambiguous declaration {input}")));
+                }
+                found = Some((id as usize, decl));
+            }
+        }
+        found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no matching indexed declaration for {input}; use cx --symbol {name} or supply FILE LINE COL")))
     }
 }
 

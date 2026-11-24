@@ -1,0 +1,11 @@
+# The unqualified top-level call has no receiver of type Other.
+symbol	emit	work.dart:1,work.dart:7
+symbol	flush	work.dart:2
+symbol	runWork	work.dart:3
+definition	work.dart:4:3	work.dart:1:6	resolved
+references	work.dart:1:6	work.dart:4:3	resolved
+callers	work.dart:1:6	work.dart:4:3	resolved
+references	work.dart:2:6	-	resolved
+callers	work.dart:2:6	-	resolved
+references	work.dart:7:8	-	resolved
+callers	work.dart:7:8	-	resolved

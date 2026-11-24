@@ -1,0 +1,6 @@
+# Clang resolves both receiver calls independently; redefining OWNER to empty introduces a free function.
+definition	source.cpp:4:37	source.cpp:2:11	resolved
+references	source.cpp:2:11	source.cpp:4:37	resolved
+definition	source.cpp:5:41	source.cpp:3:11	resolved
+references	source.cpp:3:11	source.cpp:5:41	resolved
+definition	source.cpp:9:22	source.cpp:8:11	resolved

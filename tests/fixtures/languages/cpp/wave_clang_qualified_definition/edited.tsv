@@ -1,0 +1,2 @@
+# Clang -fsyntax-only accepts both versions. Only the source definition is the expected hit.
+symbol	reset	source.cpp:1:22		contains

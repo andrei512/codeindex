@@ -1,0 +1,6 @@
+symbol	entry	main.s:2:1
+symbol	emit	main.s:5:1
+definition	main.s:3:10	main.s:5:1	resolved
+references	main.s:5:1	main.s:3:10	resolved
+callers	main.s:5:1	main.s:3:10	resolved
+references	main.s:2:1	-	resolved

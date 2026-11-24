@@ -1,0 +1,4 @@
+# MemoryExtensions.AsSpan(string) returns ReadOnlySpan<char>. Only the project aliases change.
+definition	Demo.cs:5:43	Demo.cs:3:16	resolved
+references	Demo.cs:3:16	Demo.cs:5:43	resolved
+references	Demo.cs:4:16	-	resolved

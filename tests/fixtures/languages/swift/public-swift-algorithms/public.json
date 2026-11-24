@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/apple/swift-algorithms",
+  "commit": "8fdd7fe21dc07a4538d6b3b7c873f497ab4d60fe",
+  "evidence": "Inspect the containing types and argument labels: the one-argument calls belong to the one-argument declaration, the two-argument calls to the overload with offset. Both methods are internal and uniquely named within their distinct types."
+}

@@ -1,0 +1,2 @@
+# Clang -fsyntax-only accepts both versions. Only the source definition is the expected hit.
+symbol	marked	source.c:2:12		contains

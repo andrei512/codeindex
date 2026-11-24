@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-const LEGACY: u64 = 1 << 63;
+pub(super) const LEGACY: u64 = 1 << 63;
 const MAX_PIN_FILES: usize = 32;
 const MAX_RETAINED_SPANS: usize = 16384;
 fn invalid() -> io::Error {
@@ -91,6 +91,12 @@ impl Map {
             start = s.end;
         }
         Ok(())
+    }
+    pub fn append_rank(&mut self, generation: u64, range: Range<u64>) -> io::Result<()> {
+        if generation == 0 || generation >= LEGACY || self.len() != range.start || range.end <= range.start {
+            return Err(invalid());
+        }
+        self.push(LEGACY | generation, 0, range.end - range.start)
     }
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.spans.len() * 24);

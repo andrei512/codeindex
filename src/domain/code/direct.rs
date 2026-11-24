@@ -1,11 +1,15 @@
 //! Project-local evidence for written script source directives and protobuf imports.
 use super::{Analysis, Call, Declaration, Kind, Token};
 use std::collections::HashMap;
+pub(super) mod powershell;
 mod proto;
 mod shell;
 pub(super) enum Evidence {
     Proto(proto::Evidence),
     Shell(shell::Evidence),
+    Powershell(powershell::Evidence),
+    Csharp(super::cfamily::csharp::Evidence),
+    CIncludes(HashMap<String, Vec<String>>, Vec<super::CReceipt>),
 }
 pub(super) fn analyze_proto(t: &[Token]) -> Analysis {
     proto::analyze(t)
@@ -16,7 +20,7 @@ pub(super) fn analyze_shell(text: &str) -> Analysis {
 pub(super) fn resolve(
     units: &[super::Unit],
     paths: &HashMap<&str, usize>,
-    names: &mut super::Names,
+    names: &mut super::ForwardNames,
 ) {
     proto::resolve(units, paths, names);
     shell::resolve(units, paths, names);
@@ -134,4 +138,42 @@ mod tests {
     }
 }
 
-impl crate::domain::code::cache::Wire for Evidence{fn save(&self,w:&mut Vec<u8>){match self{Self::Proto(a)=>{ w.push(0); a.save(w);},Self::Shell(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Proto(Wire::load(r)?)),1=>Ok(Self::Shell(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Evidence {
+    fn save(&self, w: &mut impl crate::domain::code::cache::Output) {
+        match self {
+            Self::Proto(a) => {
+                w.push(0);
+                a.save(w);
+            }
+            Self::Shell(a) => {
+                w.push(1);
+                a.save(w);
+            }
+            Self::Powershell(a) => {
+                w.push(2);
+                a.save(w);
+            }
+            Self::Csharp(a) => {
+                w.push(3);
+                a.save(w);
+            }
+            Self::CIncludes(a, sdk) => {
+                w.push(5);
+                a.save(w);
+                sdk.save(w);
+            }
+        }
+    }
+    fn load(r: &mut &[u8]) -> std::io::Result<Self> {
+        use crate::domain::code::cache::Wire;
+        match usize::load(r)? {
+            0 => Ok(Self::Proto(Wire::load(r)?)),
+            1 => Ok(Self::Shell(Wire::load(r)?)),
+            2 => Ok(Self::Powershell(Wire::load(r)?)),
+            3 => Ok(Self::Csharp(Wire::load(r)?)),
+            4 => Ok(Self::CIncludes(Wire::load(r)?, Vec::new())),
+            5 => Ok(Self::CIncludes(Wire::load(r)?, Wire::load(r)?)),
+            _ => Err(crate::domain::code::cache::bad()),
+        }
+    }
+}

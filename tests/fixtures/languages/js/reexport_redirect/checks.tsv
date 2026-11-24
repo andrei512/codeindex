@@ -1,0 +1,4 @@
+symbol	save	left.js:1,right.js:1
+definition	app.js:2:25	left.js:1:17	resolved
+callers	left.js:1:17	app.js:2:25	resolved
+callers	right.js:1:17	-	resolved

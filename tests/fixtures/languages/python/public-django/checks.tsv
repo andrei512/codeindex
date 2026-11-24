@@ -1,0 +1,4 @@
+# The class at oracle/schema.py:13 directly inherits BaseDatabaseSchemaEditor.
+# The reverse check asserts membership only.
+definition	django/db/backends/oracle/schema.py:248:24	django/db/backends/base/schema.py:1185:9	resolved
+references	django/db/backends/base/schema.py:1185:9	django/db/backends/oracle/schema.py:248:24	resolved	contains

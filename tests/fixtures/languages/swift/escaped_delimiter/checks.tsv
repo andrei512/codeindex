@@ -1,0 +1,3 @@
+# swiftc -frontend -dump-parse sees the escaped quote inside the string and only real as a function.
+symbol	fake	-
+symbol	real	message.swift:4:6

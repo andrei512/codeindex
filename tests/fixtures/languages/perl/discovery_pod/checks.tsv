@@ -1,0 +1,5 @@
+# POD runs from =pod to =cut. The only live subroutine declaration is visible; package main calls it on line 7.
+symbol	phantom	-
+symbol	visible	app.pl:6:5
+definition	app.pl:7:1	app.pl:6:5	resolved
+references	app.pl:6:5	app.pl:7:1	resolved

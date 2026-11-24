@@ -1,0 +1,3 @@
+definition	scope.proto:5:4	scope.proto:2:9	resolved
+references	scope.proto:2:9	scope.proto:5:3	resolved
+references	scope.proto:4:11	-	resolved

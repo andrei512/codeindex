@@ -1,0 +1,3 @@
+symbol	endOfChunk	Sources/Algorithms/Chunked.swift:79,Sources/Algorithms/Chunked.swift:251
+definition	Sources/Algorithms/Chunked.swift:104:15	Sources/Algorithms/Chunked.swift:79:17	resolved
+definition	Sources/Algorithms/Chunked.swift:272:15	Sources/Algorithms/Chunked.swift:251:17	resolved

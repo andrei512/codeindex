@@ -5,6 +5,8 @@ page-type: reference
 
 A manifest selects the exact source and index extents a query will read. Publication is the consistency boundary.
 
+The segment-handle publication protocol below applies to the segment layout. The [keyed storage candidate](keyed-storage.md) pins one arena handle and immutable roots under a distinct format major.
+
 ```text
 ExtentRef        = { segment: SegmentId, byte_offset: u64, byte_length: u64 }
 ExtentEntry      = { id: ExtentId, product: Product, encoding_version: u32,

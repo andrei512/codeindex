@@ -135,7 +135,7 @@ impl Plan {
         Ok((None, hash))
     }
     pub(super) fn finish(
-        self,
+        &self,
         root: &Path,
         commit: Option<&str>,
         obs: &[ObservedPath],
@@ -146,7 +146,7 @@ impl Plan {
         let mut changed_paths = None;
         let old_commit = old.and_then(|p| p.indexed_commit.as_deref());
         let mut rows = Vec::with_capacity(obs.len());
-        for (i, (o, cell)) in obs.iter().zip(self.hashes).enumerate() {
+        for (i, (o, cell)) in obs.iter().zip(&self.hashes).enumerate() {
             let prev = old.and_then(|pin| {
                 let cp = pin.checkpoint.as_ref()?;
                 let id = if pin.files.get(i).is_some_and(|entry| entry.path() == o.path) {
@@ -156,7 +156,7 @@ impl Plan {
                 };
                 (self.sha256 == cp.sha256).then_some(cp.rows[id])
             });
-            let blob = match cell.into_inner() {
+            let blob = match cell.get().copied() {
                 Some(blob) => blob,
                 None => {
                     prev.ok_or_else(|| {

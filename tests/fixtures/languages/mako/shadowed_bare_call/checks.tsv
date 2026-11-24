@@ -1,0 +1,4 @@
+# Mako renders parameter, assigned lambda, and nested def independently of local.emit.
+references	page.mako:1:13	page.mako:2:48,page.mako:5:19,page.mako:7:19	resolved
+references	page.mako:6:35	page.mako:7:3	resolved
+definition	page.mako:7:3	page.mako:6:35	resolved

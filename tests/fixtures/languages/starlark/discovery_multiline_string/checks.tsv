@@ -1,0 +1,3 @@
+# The triple-quoted literal contains the entire apparent phantom declaration. actual is the only written function.
+symbol	phantom	-
+symbol	actual	rules.bzl:6:5

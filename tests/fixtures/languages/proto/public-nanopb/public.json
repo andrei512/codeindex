@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/nanopb/nanopb",
+  "commit": "2de40e37c89e5bef88f92639e309860f0239ac26",
+  "evidence": "The four fields in descriptor option extensions use NanoPBOptions as their type. All written occurrences of the type name in protobuf sources are in this file."
+}

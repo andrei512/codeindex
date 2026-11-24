@@ -1,0 +1,4 @@
+symbol	unlock	src/log.c:89
+definition	src/log.c:167:3	src/log.c:89:13	resolved
+references	src/log.c:89:13	src/log.c:167:3	resolved
+callers	src/log.c:89:13	src/log.c:167:3	resolved

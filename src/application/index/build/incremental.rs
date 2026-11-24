@@ -13,6 +13,7 @@ use std::{collections::BTreeMap, io};
 
 pub(super) enum Postings {
     Built(ContentBuilder),
+    Fresh(crate::domain::content::fresh::Product),
     Merged(MergedPostings),
     Delta(super::content_delta::Delta),
     Retained(usize),
@@ -26,6 +27,7 @@ impl Postings {
         kind: usize,
     ) -> io::Result<()> {
         match self {
+            Self::Fresh(p) => p.seal(out),
             Self::Built(b) => b.seal_layout(out, kind == CONTENT),
             Self::Merged(m) => m.seal_layout(out, kind == CONTENT),
             Self::Delta(d) => d.write(previous.unwrap(), out),
@@ -148,7 +150,7 @@ pub(super) fn trigrams(
 ) -> io::Result<(Postings, Postings)> {
     let Some(prior) = previous else {
         let (paths, bodies) = super::fresh_postings::build(units)?;
-        return Ok((Postings::Built(paths), Postings::Built(bodies)));
+        return Ok((Postings::Built(paths), bodies));
     };
     // Both inventories have the same path ordering. A merge walks them once.
     let mut old = prior.entries().iter().enumerate().peekable();
@@ -167,6 +169,7 @@ pub(super) fn trigrams(
 
 pub(super) enum Rank {
     Built(RankedIndex),
+    Bulk(ranked::FreshRank),
     Patch(ranked::patch::Patch),
     Retained(usize),
 }
@@ -179,6 +182,7 @@ impl Rank {
     ) -> io::Result<()> {
         match self {
             Self::Built(b) => b.write_to(out),
+            Self::Bulk(b) => b.write_to(out),
             Self::Patch(patch) => {
                 let prior = previous.unwrap();
                 let mut run = retained::Run::new(Some(prior), out);
@@ -209,12 +213,15 @@ pub(super) fn ranked(
     before: &Option<BTreeMap<usize, String>>,
 ) -> io::Result<Rank> {
     let previous = previous.filter(|p| p.compatible(RANK));
-    let add = |r: &mut RankedIndex, id: usize| {
+    let chunks_for = |id: usize| {
         let local = &locals[id];
         let headings = local.markdown.as_ref().map_or_else(Vec::new, |m| {
             m.sections.iter().skip(1).map(|s| s.line).collect()
         });
-        let chunks = ranked::chunks_from_line_ends(&local.lf, &headings);
+        ranked::chunks_from_line_ends(&local.lf, &headings)
+    };
+    let add = |r: &mut RankedIndex, id: usize| {
+        let chunks = chunks_for(id);
         r.add_file(units[id].path, units[id].text, &chunks);
     };
     if let Some(previous) = previous
@@ -261,11 +268,37 @@ pub(super) fn ranked(
         drop(bytes);
         return RankedIndex::refresh(prior, reuse, add).map(Rank::Built);
     }
-    let mut index = RankedIndex::default();
-    for id in 0..units.len() {
-        add(&mut index, id);
-    }
-    Ok(Rank::Built(index))
+    let batch = |start: usize, end: usize| {
+        let mut index = ranked::BulkRank::at(start);
+        for i in start..end {
+            index.add_file(units[i].path, units[i].text, &chunks_for(i));
+        }
+        index
+    };
+    let bytes: usize = units.iter().map(|u| u.text.len()).sum();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let index = if workers == 1 || bytes < 1024 * 1024 {
+        ranked::FreshRank::Single(batch(0, units.len()))
+    } else {
+        let goal = bytes.div_ceil(workers).max(512 * 1024);
+        std::thread::scope(|scope| -> io::Result<ranked::FreshRank> {
+            let (mut start, mut size) = (0,0);
+            let mut jobs = Vec::new();
+            for (i, unit) in units.iter().enumerate() {
+                size += unit.text.len();
+                if size >= goal || i + 1 == units.len() {
+                    let first = start;
+                    let f = &batch;
+                    jobs.push(scope.spawn(move || f(first, i + 1).into_shard()));
+                    start = i + 1;
+                    size = 0;
+                }
+            }
+            let shards = jobs.into_iter().map(|j| j.join().map_err(|_| io::Error::other("rank batch failed"))).collect::<io::Result<_>>()?;
+            ranked::ShardSet::new(shards).map(ranked::FreshRank::Parallel)
+        })?
+    };
+    Ok(Rank::Bulk(index))
 }
 
 pub(super) fn graph_unchanged(

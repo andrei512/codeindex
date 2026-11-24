@@ -7,7 +7,7 @@ use crate::adapters::{
         write_envelope,
     },
 };
-use crate::application::index::{Entry, binary, build::build, files, same_observation};
+use crate::application::index::{Entry, binary, build::{build, Output, Worker}, files, same_observation};
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -29,6 +29,8 @@ pub struct Pin {
     pub(super) checkpoint: Option<Checkpoint>,
     segment_id: u64,
     coverage: std::sync::OnceLock<(usize, usize)>,
+    sdk_catalog: Option<usize>,
+    sdk_receipts: std::sync::OnceLock<Vec<crate::domain::code::CReceipt>>,
     selector: File,
     pub generation: u64,
     pub indexed_commit: Option<String>,
@@ -56,20 +58,66 @@ fn private(path: &Path) -> io::Result<File> {
         .mode(0o600)
         .open(path)
 }
+#[cfg(target_os = "macos")]
+fn retry_sync(mut syscall: impl FnMut() -> i32) -> io::Result<()> {
+    loop {
+        if syscall() == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 fn durable(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
             fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         }
-        // F_FULLFSYNC commits cached drive data on the benchmark platform.
-        if unsafe { fcntl(file.as_raw_fd(), 51) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
+        const F_FULLFSYNC: i32 = 51;
+        retry_sync(|| unsafe { fcntl(file.as_raw_fd(), F_FULLFSYNC) })
     }
     #[cfg(not(target_os = "macos"))]
-    file.sync_all()?;
-    Ok(())
+    file.sync_all()
+}
+
+#[derive(Clone, Copy)]
+struct PublicationBarrier {
+    #[cfg(target_os = "macos")]
+    device: u64,
+}
+
+impl PublicationBarrier {
+    fn new(_directory: &File) -> io::Result<Self> {
+        Ok(Self {
+            #[cfg(target_os = "macos")]
+            device: _directory.metadata()?.dev(),
+        })
+    }
+
+    fn stage(self, file: &File) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" { fn fsync(fd: i32) -> i32; }
+            if file.metadata()?.dev() != self.device {
+                return Err(io::Error::other("snapshot part and cache directory occupy different devices"));
+            }
+            retry_sync(|| unsafe { fsync(file.as_raw_fd()) })
+        }
+        #[cfg(not(target_os = "macos"))]
+        durable(file)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn commit(self, directory: &File) -> io::Result<()> {
+        // fcntl(2): F_FULLFSYNC persists earlier fsync(2) calls on this
+        // device. Join all staged part and manifest writes before this call.
+        self.stage(directory)?;
+        durable(directory)
+    }
 }
 const PUBLISHING: &str = "publishing";
 
@@ -182,6 +230,8 @@ impl Pin {
         let mut p = Self {
             native_v2: m.root().end == 312,
             coverage: Default::default(),
+            sdk_catalog: None,
+            sdk_receipts: Default::default(),
             selector: file,
             generation: id,
             indexed_commit,
@@ -200,7 +250,11 @@ impl Pin {
         if m.root().end >= 264 {
             let checkpoint =
                 Checkpoint::decode_catalog(&encoded,p.files.iter().map(|f|(f.catalog_stamp(),f.blob)))?;
-            for (row, file) in checkpoint.rows.iter().zip(&mut p.files) {
+            for (id, (row, file)) in checkpoint.rows.iter().zip(&mut p.files).enumerate() {
+                if p.sdk_catalog.is_none() && (file.path() == "compile_commands.json"
+                    || file.path().ends_with("/compile_commands.json")) {
+                    p.sdk_catalog = Some(id);
+                }
                 if row.blob.is_some() != file.bytes.is_some() {
                     return Err(binary::bad());
                 }
@@ -275,8 +329,37 @@ impl Pin {
             .visit_cached(start + range.start..start + range.end, |s| b.write_all(s))?;
         String::from_utf8(b).map_err(io::Error::other)
     }
-    fn matches(&self, obs: &[ObservedPath]) -> bool {
-        self.native_v2
+    fn decode_evidence(&self, entry: &Entry) -> io::Result<crate::domain::code::Analysis> {
+        use crate::domain::code::Analysis;
+        if entry.evidence.is_empty() {
+            return Ok(Analysis::default());
+        }
+        let mut data = Vec::new();
+        self.segment.visit(entry.evidence.clone(), |bytes| data.write_all(bytes))?;
+        let mut input = data.as_slice();
+        let analysis = Analysis::decode(&mut input)?;
+        if !input.is_empty() { return Err(binary::bad()); }
+        Ok(analysis)
+    }
+
+    fn sdk_receipts(&self) -> io::Result<&[crate::domain::code::CReceipt]> {
+        if let Some(receipts) = self.sdk_receipts.get() {
+            return Ok(receipts);
+        }
+        let Some(id) = self.sdk_catalog else { return Ok(&[]) };
+        let analysis = self.decode_evidence(&self.files[id])?;
+        let receipts = crate::domain::code::CProject::take_dependencies(analysis)
+            .map(|(_, receipts)| receipts).unwrap_or_default();
+        let _ = self.sdk_receipts.set(receipts);
+        Ok(self.sdk_receipts.get().unwrap())
+    }
+
+    fn sdk_current(&self) -> io::Result<bool> {
+        Ok(self.sdk_receipts()?.iter().all(|receipt| receipt.valid()))
+    }
+
+    fn matches(&self, obs: &[ObservedPath]) -> io::Result<bool> {
+        Ok(self.native_v2
             && self.migration.reusable()
             && self.files.len() == obs.len()
             && self
@@ -284,6 +367,7 @@ impl Pin {
                 .iter()
                 .zip(obs)
                 .all(|(f, o)| f.path() == o.path && f.stamp() == o.stamp)
+            && self.sdk_current()?)
     }
     pub fn refresh(cwd: &Path) -> io::Result<Self> {
         Self::refresh_with_prior(cwd, None)
@@ -327,7 +411,7 @@ impl Pin {
         let mut observed_id = None;
         if !interrupted && let Some(pin) = &current {
             let obs = observe(&root)?;
-            if pin.matches(&obs) && pin.indexed_commit == repository::head_commit(&root)? {
+            if pin.matches(&obs)? && pin.indexed_commit == repository::head_commit(&root)? {
                 lock.lock_shared()?;
                 let mut generation = [0; 8];
                 File::open(cache.join("current"))?.read_exact_at(&mut generation, 16)?;
@@ -352,31 +436,42 @@ impl Pin {
         let mut old = Self::select(&cache, &root, current)?;
         recover(&cache, old.as_ref())?;
         let previous = old.as_ref().map_or(0, |p| p.generation);
-        let mut obs = if !waited && observed_id == Some(previous) {
+        let marker = cache.join(PUBLISHING);
+        let directory = File::open(&cache)?;
+        let mut parents = None;
+        let mut obs = if old.is_none() {
+            // Before selecting generation one, persist the whole cache path.
+            // Private files in any reachable cache are covered by its durable
+            // recovery marker, even if a parent link did not survive a crash.
+            let cache = cache.clone();
+            parents = Some(Worker::start(move || {
+                for ancestor in cache.ancestors().skip(1).take(3) {
+                    File::open(ancestor)?.sync_all()?;
+                }
+                Ok(())
+            })?);
+            std::thread::scope(|scope| {
+                let recovery = scope.spawn(|| -> io::Result<()> {
+                    private(&marker)?;
+                    directory.sync_all()
+                });
+                let obs = observe(&root);
+                recovery.join().map_err(|_| io::Error::other("cache preparation failed"))??;
+                obs
+            })?
+        } else if !waited && observed_id == Some(previous) {
             observation.unwrap()
         } else {
             observe(&root)?
         };
         let head = repository::head_commit(&root)?;
-        if old
-            .as_ref()
-            .is_some_and(|p| p.matches(&obs) && p.indexed_commit == head)
-        {
+        if let Some(pin) = old.as_ref() && pin.matches(&obs)? && pin.indexed_commit == head {
             return Ok(old.unwrap());
         }
-        if old.is_none() {
-            // create_dir_all can have installed any prefix (including in a writer
-            // that died before we acquired the lock). Persist the linking entries
-            // of HOME/.codeindex/repos/<key> before selecting the first generation.
-            for ancestor in cache.ancestors().skip(1).take(3) {
-                File::open(ancestor)?.sync_all()?;
-            }
+        if old.is_some() {
+            private(&marker)?;
+            directory.sync_all()?;
         }
-        let marker = cache.join(PUBLISHING);
-        private(&marker)?;
-        let directory = File::open(&cache)?;
-        // Persist the recovery obligation before leaving any private file behind.
-        directory.sync_all()?;
         for attempt in 0..2 {
             let commit = repository::head_commit(&root)?;
             // An old parser or input-classification contract can change the
@@ -387,7 +482,7 @@ impl Pin {
             });
             let mut plan = Plan::new(obs.len(), repository::uses_sha256(&root)?);
             let same = match prior.filter(|p| p.migration.reusable()) {
-                Some(pin) => match plan.verify_metadata_only(&root, &mut obs, pin) {
+                Some(pin) if pin.sdk_current()? => match plan.verify_metadata_only(&root, &mut obs, pin) {
                     Ok(same) => same,
                     Err(e) if attempt == 0 => {
                         let fresh = observe(&root)?;
@@ -399,17 +494,21 @@ impl Pin {
                     }
                     Err(e) => return Err(e),
                 },
-                None => false,
+                _ => false,
             };
             let mut generation = previous.checked_add(1).ok_or_else(binary::bad)?;
-            let (dir, segment_id, map, mut built_files, mut cleanup) = if same {
+            let barrier = PublicationBarrier::new(&directory)?;
+            let mut retirement = None;
+            let mut fresh_provenance = None;
+            let mut captured_receipts = None;
+            let (mut dir, segment_id, mut map, mut built_files, mut cleanup, mut rank_cleanup, primary_sync, pending_rank) = if same {
                 let pin = prior.unwrap();
                 (
                     pin.dir.clone(),
                     pin.segment_id,
                     pin.segment.map.clone(),
                     Vec::new(),
-                    Remove(None),
+                    Remove(None), Remove(None), None, None,
                 )
             } else {
                 let (path, file) = loop {
@@ -424,7 +523,29 @@ impl Pin {
                 };
                 let cleanup = Remove(Some(path));
                 let mut w = Writer::new(file, generation, prior.map(|p| &p.segment))?;
-                let capture = |root: &Path, path: &str, stamp: [u64; 7]| {
+                // The v2 Map already addresses two separate immutable segment-name namespaces.
+                // Reserve the second name only on fresh builds, under the existing publication marker.
+                let (rank_cleanup, rank_lane, rank_length) = if old.is_none() {
+                    let path = cache.join(pieces::name(pieces::LEGACY | generation));
+                    let output = private(&path)?;
+                    // The map only needs the length. Publication still joins the
+                    // writer's independent durability result before switching.
+                    let (send_length, rank_length) = std::sync::mpsc::channel();
+                    let rank_lane: crate::application::index::build::RankLane = Box::new(move |rank| Worker::start(move || {
+                        let mut writer = super::SegmentWriter::new(output)?;
+                        rank.write_to(&mut writer)?;
+                        let len = writer.offset();
+                        let output = writer.finish(generation)?;
+                        let _ = send_length.send(len);
+                        barrier.stage(&output)?;
+                        Ok(len)
+                    }));
+                    (Remove(Some(path)), Some(rank_lane), Some(rank_length))
+                } else {
+                    (Remove(None), None, None)
+                };
+                let capture_root = repository::CaptureRoot::new(&root)?;
+                let capture = |_: &Path, path: &str, stamp: [u64; 7]| {
                     if let Some(pin) = prior
                         && let Ok(id) = pin.files.binary_search_by(|f| f.path().cmp(path))
                         && (pin.files[id].stamp() == stamp || plan.verified(id))
@@ -435,9 +556,15 @@ impl Pin {
                             Ok(None)
                         };
                     }
-                    repository::capture_observed(root, path, stamp)
+                    capture_root.capture(path, stamp)
                 };
-                let (dir, catalog) = match build(
+                let provenance_lane: Option<crate::application::index::build::ProvenanceLane<'_>> = if old.is_none() {
+                    Some(Box::new(|observed| {
+                        fresh_provenance = Some(plan.finish(&root, commit.as_deref(), observed, None)?);
+                        Ok(())
+                    }))
+                } else { None };
+                let Output {dir, files: catalog, rank_write, retired, sdk_receipts} = match build(
                     &root,
                     &mut obs,
                     &capture,
@@ -445,6 +572,8 @@ impl Pin {
                     prior.is_some_and(|p| plan.can_forward(p)),
                     &|i, o, body, id| plan.identify(i, o, body, id, prior),
                     &mut w,
+                    rank_lane,
+                    provenance_lane,
                 ) {
                     Ok(d) => d,
                     Err(error) if attempt == 0 => {
@@ -459,23 +588,33 @@ impl Pin {
                     }
                     Err(error) => return Err(error),
                 };
-                let (file, map) = w.finish()?;
-                durable(&file)?;
-                directory.sync_all()?;
-                (dir, generation, map, catalog, cleanup)
-            };
-            let provenance = plan.finish(&root, commit.as_deref(), &obs, prior)?;
-            let after = observe(&root)?;
-            if !same_observation(&obs, &after) || repository::head_commit(&root)? != commit {
-                if attempt == 0 {
-                    obs = after;
-                    continue;
+                captured_receipts = Some(sdk_receipts);
+                if rank_write.is_some() && retired.len() >= 128 {
+                    retirement = Some(Worker::start(move || { drop(retired); Ok(()) })?);
+                } else {
+                    drop(retired);
                 }
-                return Err(io::Error::other(
-                    "checkout changed during both refresh attempts",
-                ));
-            }
-            checkpoint(Publication::SegmentDurable);
+                // The primary byte stream is closed as soon as its graph is written.
+                // The rank worker owns a different private FD and its own posting data.
+                let (file, map) = w.finish()?;
+                let pending_rank = rank_write.zip(rank_length);
+                let primary_sync = Some(Worker::start(move || barrier.stage(&file))?);
+                (dir, generation, map, catalog, cleanup, rank_cleanup, primary_sync, pending_rank)
+            };
+            let provenance = match fresh_provenance {
+                Some(checkpoint) => checkpoint,
+                None => plan.finish(&root, commit.as_deref(), &obs, prior)?,
+            };
+            let rank_sync = if let Some((worker, length)) = pending_rank {
+                let size = match length.recv() {
+                    Ok(size) => size,
+                    Err(_) => return Err(worker.finish().err().unwrap_or_else(binary::bad)),
+                };
+                let extent = &mut dir.0[manifest::RANK - 1];
+                extent.end = extent.start.checked_add(size).ok_or_else(binary::bad)?;
+                map.append_rank(generation, extent.clone())?;
+                Some(worker)
+            } else { None };
             let mut evidence = Vec::new();
             let base_catalog=if same {&prior.unwrap().files}else{&built_files};
             provenance.encode_catalog(&mut evidence,base_catalog)?;
@@ -498,11 +637,54 @@ impl Pin {
                 bytes.len() as u64,
                 &bytes[..],
             )?;
-            durable(&m)?;
+            // The temporary selector is private. Its sync may run during input
+            // verification and both segment barriers, but rename waits for all.
+            let separate = primary_sync.is_some();
+            let manifest_write = if separate {
+                Err(Worker::start(move || { barrier.stage(&m)?; Ok(m) })?)
+            } else {
+                Ok(m)
+            };
+            let after = observe(&root)?;
+            let sdk_current = match captured_receipts.as_deref() {
+                Some(receipts) => receipts.iter().all(|receipt| receipt.valid()),
+                None => prior.unwrap().sdk_current()?,
+            };
+            if !sdk_current || !same_observation(&obs, &after) || repository::head_commit(&root)? != commit {
+                if attempt == 0 {
+                    obs = after;
+                    continue;
+                }
+                return Err(io::Error::other(
+                    "checkout changed during both refresh attempts",
+                ));
+            }
+            if let Some(primary_sync) = primary_sync { primary_sync.finish()?; }
+            if let Some(rank_sync) = rank_sync { rank_sync.finish()?; }
+            #[cfg(not(target_os = "macos"))]
+            if separate { directory.sync_all()?; }
+            if let Some(parents) = parents.take() {
+                parents.finish()?;
+            }
+            let m = match manifest_write {
+                Err(worker) => {
+                    let manifest = worker.finish()?;
+                    #[cfg(target_os = "macos")]
+                    barrier.commit(&directory)?;
+                    checkpoint(Publication::SegmentDurable);
+                    manifest
+                }
+                Ok(manifest) => {
+                    checkpoint(Publication::SegmentDurable);
+                    durable(&manifest)?;
+                    manifest
+                }
+            };
             checkpoint(Publication::ManifestDurable);
             fs::rename(&temp, cache.join("current"))?;
             temp_cleanup.0 = None;
             cleanup.0 = None;
+            rank_cleanup.0 = None;
             checkpoint(Publication::Replaced);
             directory.sync_all()?;
             checkpoint(Publication::SelectorDurable);
@@ -516,6 +698,11 @@ impl Pin {
             }
             let p = Self {
                 coverage: Default::default(),
+                sdk_catalog: if same { old.as_ref().and_then(|p| p.sdk_catalog) } else { None },
+                sdk_receipts: match captured_receipts {
+                    Some(receipts) => std::sync::OnceLock::from(receipts),
+                    None => std::mem::take(&mut old.as_mut().unwrap().sdk_receipts),
+                },
                 selector: m,
                 native_v2: true,
                 generation,
@@ -529,18 +716,24 @@ impl Pin {
                 dir,
                 migration: super::registry::Migration::current(),
             };
+            let mut retired_any = false;
             if let Some(pin) = old.as_ref() {
                 for key in pin.segment.keys() {
                     if !p.segment.keys().any(|live| live == key) {
                         fs::remove_file(cache.join(pieces::name(key)))?;
+                        retired_any = true;
                     }
                 }
             }
-            // Remove retirement and recovery names in order. A crash before this
-            // directory barrier leaves a durable marker for another lease holder.
-            directory.sync_all()?;
+            // Retire names durably before clearing their recovery obligation.
+            // The selector barrier already persisted the directory otherwise.
+            if retired_any {
+                directory.sync_all()?;
+            }
             fs::remove_file(&marker)?;
-            directory.sync_all()?;
+            // The selector and retirements are already durable. A power loss
+            // can restore this marker; recovery safely repeats the cleanup.
+            if let Some(retirement) = retirement { retirement.finish()?; }
             return Ok(p);
         }
         unreachable!()
@@ -562,6 +755,19 @@ impl crate::application::index::build::Previous for Pin {
     fn copy_bytes(&self, range: std::ops::Range<u64>, out: &mut dyn Write) -> io::Result<()> {
         self.segment.visit(range, |bytes| out.write_all(bytes))
     }
+    fn markdown_record(&self, id: usize) -> io::Result<Option<std::ops::Range<u64>>> {
+        use crate::application::index::markdown_lookup::Lookup;
+        let lookup = Lookup::open(self.reader(manifest::MD)?)?;
+        let base = self.dir.0[manifest::MD - 1].start;
+        Ok(lookup.document_range(&mut self.reader(manifest::MD)?, id)?
+            .map(|range| base + range.start..base + range.end))
+    }
+    fn source_end_word(&self, file: usize, end: usize) -> io::Result<Option<u64>> {
+        use crate::application::index::symbol_lookup::SymbolLookup;
+        let mut symbols = SymbolLookup::open(self.reader(manifest::SYMBOLS)?, self.files.len())?;
+        let base = self.dir.0[manifest::SYMBOLS - 1].start;
+        Ok(symbols.source_end_word(file, end)?.map(|offset| base + offset))
+    }
     fn local(
         &self,
         id: usize,
@@ -579,19 +785,7 @@ impl crate::application::index::build::Previous for Pin {
         if partial_line {
             lf.push(size);
         }
-        let code = if !decode_code || f.evidence.is_empty() {
-            Analysis::default()
-        } else {
-            let mut data = Vec::new();
-            self.segment
-                .visit(f.evidence.clone(), |b| data.write_all(b))?;
-            let mut r = data.as_slice();
-            let a = Analysis::decode(&mut r)?;
-            if !r.is_empty() {
-                return Err(binary::bad());
-            }
-            a
-        };
+        let code = if decode_code { self.decode_evidence(f)? } else { Analysis::default() };
         let markdown = if decode_markdown && f.bytes.is_some() && is_markdown(f.path()) {
             Lookup::open(self.reader(manifest::MD)?)?.document(self.reader(manifest::MD)?, id)?
         } else {
@@ -752,6 +946,108 @@ mod publication_tests {
     }
 
     #[test]
+    fn an_external_include_change_refreshes_an_unchanged_checkout() {
+        use crate::application::index::symbol_lookup::SymbolLookup;
+        let repo = Fixture::new();
+        let sdk = repo.home.canonicalize().unwrap().join("sdk");
+        let first = sdk.join("first");
+        let last = sdk.join("last");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&last).unwrap();
+        let header = "profile.h";
+        fs::write(last.join(header), "/* no project switch */\n").unwrap();
+        fs::write(repo.root.join("main.c"),
+            "#include <profile.h>\n#ifndef PROJECT_OPTION\nint available(void) { return 1; }\n#endif\n").unwrap();
+        fs::write(repo.root.join("compile_commands.json"), format!(
+            r#"[{{"directory":".","file":"main.c","arguments":["clang","-isysroot","{}","-isystem","{}","-isystem","{}","-c","main.c"]}}]"#,
+            sdk.display(), first.display(), last.display())).unwrap();
+        let check = |generation, present| {
+            let output = repo.writer(None).env("CX_TEST_TRUSTED_SDK_ROOT", &sdk).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let pin = repo.pin().unwrap();
+            assert_eq!(pin.generation, generation);
+            let mut symbols = SymbolLookup::open(pin.reader(manifest::SYMBOLS).unwrap(), pin.files.len()).unwrap();
+            assert_eq!(!symbols.get("available", 1).unwrap().0.is_empty(), present, "generation {generation}");
+            assert!(pin.files.iter().all(|f| !f.path().ends_with(header)));
+        };
+        check(1, true);
+        check(1, true);
+        // A formerly missing earlier include wins without touching the checkout.
+        fs::write(first.join(header), "#define PROJECT_OPTION 1\n").unwrap();
+        check(2, false);
+        check(2, false);
+        fs::remove_file(first.join(header)).unwrap();
+        check(3, true);
+        fs::write(last.join(header), "#define PROJECT_OPTION 1\n").unwrap();
+        check(4, false);
+    }
+
+    #[test]
+    fn markdown_record_patch_matches_fresh_bytes_after_moving_and_retargeting_links() {
+        let repo = Fixture::new();
+        let bodies = [
+            "# Page\n\n[link](a.md#first)\n",
+            "# Page\n\n\n[link](a.md#first)\n",
+            "# Page\n\n\n[link](a.md#other)\n",
+            "# Page\n\n\n[link](a.md#other)\n\n## Details\n",
+        ];
+        for body in bodies {
+            let clean = Fixture::new();
+            for fixture in [&repo, &clean] {
+                fs::write(fixture.root.join("b.md"), body).unwrap();
+                assert!(fixture.writer(None).output().unwrap().status.success());
+            }
+            assert_eq!(repo.pin().unwrap().product(manifest::MD).unwrap(),
+                       clean.pin().unwrap().product(manifest::MD).unwrap());
+        }
+    }
+
+    #[test]
+    fn rust_location_patch_matches_a_clean_graph_across_reopen_and_revert() {
+        let repo = Fixture::new();
+        let path = repo.root.join("lib.rs");
+        let helpers: String = (0..160)
+            .map(|i| format!("fn helper{i}() {{ helper0(); }}\n"))
+            .collect();
+        fs::write(repo.root.join("other.rs"), &helpers).unwrap();
+        let original = "fn target() {}\nfn caller() { target(); }\n";
+        fs::write(&path, original).unwrap();
+        assert!(repo.writer(None).output().unwrap().status.success());
+        let first = repo.pin().unwrap();
+        let comment = format!("{original}// location only λ\n");
+        for (text, location_only) in [
+            (comment.as_str(), true),
+            (original, true),
+            ("fn target() {}\nfn caller() { target(); }\nfn added() {}\n", false),
+            ("fn target() {}\nfn caller() { absent(); }\nfn added() {}\n", false),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert!(repo.writer(None).output().unwrap().status.success());
+            let edited = repo.pin().unwrap();
+            let clean = Fixture::new();
+            fs::write(clean.root.join("other.rs"), &helpers).unwrap();
+            fs::write(clean.root.join("lib.rs"), text).unwrap();
+            assert!(clean.writer(None).output().unwrap().status.success());
+            let expected = clean.pin().unwrap();
+            for product in [manifest::SYMBOLS, manifest::REL] {
+                assert_eq!(edited.product(product).unwrap(), expected.product(product).unwrap());
+            }
+            if location_only {
+                let rel = &edited.dir.0[manifest::REL - 1];
+                let mut start = 0;
+                for row in edited.segment.map.encode().chunks_exact(24) {
+                    let end = u64::from_le_bytes(row[..8].try_into().unwrap());
+                    if start < rel.end && rel.start < end {
+                        assert_ne!(u64::from_le_bytes(row[8..16].try_into().unwrap()), edited.segment_id);
+                    }
+                    start = end;
+                }
+            }
+        }
+        assert_eq!(first.source(1).unwrap(), original);
+    }
+
+    #[test]
     fn script_graph_reuse_preserves_names_coordinates_and_targets() {
         let repo = Fixture::new();
         let declarations: String = (0..160)
@@ -805,7 +1101,7 @@ mod publication_tests {
         let id: u16 = env::var("CX_TEST_MIGRATION_RULE").unwrap().parse().unwrap();
         let cwd = Path::new(&root);
         let mut previous = Pin::refresh(cwd).unwrap();
-        let old_id = previous.segment_id;
+        let old_keys: Vec<_> = previous.segment.keys().collect();
         let products: Vec<_> = (1..=manifest::N)
             .map(|p| previous.product(p).unwrap())
             .collect();
@@ -834,7 +1130,7 @@ mod publication_tests {
             for row in spans.chunks_exact(24) {
                 let end = u64::from_le_bytes(row[..8].try_into().unwrap());
                 let key = u64::from_le_bytes(row[8..16].try_into().unwrap());
-                if start < range.end && range.start < end && key != old_id {
+                if start < range.end && range.start < end && !old_keys.contains(&key) {
                     seen_new = true
                 }
                 start = end;
@@ -890,6 +1186,22 @@ mod publication_tests {
     }
 
     #[test]
+    fn replaying_a_removed_marker_keeps_the_durable_edit() {
+        let repo = Fixture::new();
+        assert!(repo.writer(None).output().unwrap().status.success());
+        fs::write(repo.root.join("a.md"), "edited").unwrap();
+        assert!(repo.writer(None).output().unwrap().status.success());
+        let generation = repo.pin().unwrap().generation;
+        // A power loss may undo the final unlink after all data and retirements persisted.
+        private(&repo.cache.join(PUBLISHING)).unwrap();
+        assert!(repo.writer(None).output().unwrap().status.success());
+        let recovered = repo.pin().unwrap();
+        assert_eq!(recovered.generation, generation);
+        assert_eq!(recovered.source(0).unwrap(), "edited");
+        assert!(!repo.cache.join(PUBLISHING).exists());
+    }
+
+    #[test]
     fn recovery_preserves_all_referenced_parts_across_reader_generations() {
         let f = Fixture::new();
         let body = "retained source and evidence\n".repeat(1024);
@@ -915,6 +1227,54 @@ mod publication_tests {
         assert_eq!(latest.files.len(), 1);
         assert_eq!(first.source(0).unwrap(), "old");
         assert_eq!(second.source(1).unwrap(), body);
+    }
+
+    #[test]
+    fn checkpoint_promotes_identical_committed_bytes_without_a_product_write() {
+        let repo = Fixture::new();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&repo.root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        let write = |text| fs::write(repo.root.join("a.md"), text).unwrap();
+        let refresh = || {
+            assert!(repo.writer(None).status().unwrap().success());
+            repo.pin().unwrap()
+        };
+        write("version A");
+        git(&["add", "a.md"]);
+        git(&["commit", "-qm", "A"]);
+        assert_eq!(refresh().committed_files(), 1);
+        write("version B");
+        git(&["add", "a.md"]);
+        write("version C");
+        let dirty = refresh();
+        assert_eq!(dirty.source(0).unwrap(), "version C");
+        assert_eq!(dirty.committed_files(), 0);
+        git(&["add", "a.md"]);
+        git(&["commit", "-qm", "C"]);
+        let promoted = refresh();
+        assert_eq!(promoted.committed_files(), 1);
+        assert_eq!(promoted.product_generation(), dirty.product_generation());
+        write("version C");
+        assert_eq!(refresh().product_generation(), dirty.product_generation());
     }
 
     #[test]
@@ -1001,14 +1361,10 @@ mod publication_tests {
                     .map(|e| e.unwrap().file_name().into_string().unwrap())
                     .collect();
                 files.sort();
-                assert_eq!(
-                    files,
-                    [
-                        "current".into(),
-                        segment_name(new.generation),
-                        "refresh.lock".into()
-                    ]
-                );
+                let mut expected = vec!["current".to_owned(), "refresh.lock".to_owned()];
+                expected.extend(new.segment.keys().map(pieces::name));
+                expected.sort();
+                assert_eq!(files, expected);
                 if let Some(pin) = old {
                     assert_eq!(pin.source(0).unwrap(), "old");
                 }

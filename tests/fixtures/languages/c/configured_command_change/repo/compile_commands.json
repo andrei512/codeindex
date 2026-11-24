@@ -1,0 +1,12 @@
+[
+  {
+    "file": "source.c",
+    "directory": ".",
+    "arguments": [
+      "clang",
+      "-DENABLED=1",
+      "-c",
+      "source.c"
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+# The function defined inside run is its local binding. Calling run and then the module's send prints inner outer.
+symbol	send	main.py:1:5,main.py:4:9
+definition	main.py:6:12	main.py:4:9	resolved
+definition	main.py:7:14	main.py:1:5	resolved
+references	main.py:1:5	main.py:7:14	resolved
+references	main.py:4:9	main.py:6:12	resolved

@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/BurntSushi/byteorder",
+  "commit": "5a82625fae462e8ba64cec8146b24a372b4d75c6",
+  "evidence": "Private free function; whole-checkout word search finds only the declaration and the direct call in read_int."
+}

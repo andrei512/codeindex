@@ -32,7 +32,7 @@ The native reader recognizes shipping 1.0 and 1.1 layouts. When the old extracti
 
 For a same-path text edit, refresh verifies changed bytes, computes the changed trigram memberships, and updates affected BM25 terms and corpus statistics. New ranked records use file-relative positions. For Markdown it updates the changed document and compares outgoing link memberships before touching the reverse index. With unchanged path membership, edits outside binding inputs reuse symbol and relationship ranges. The writer retains adjacent immutable byte ranges by reference and stores only new or deliberately repacked data. Directory updates, small copied ranges, source capture and durability still cost work. Membership changes can require translating ordinals and rebuilding larger packed products.
 
-In `cx status`, `generation` identifies the checkpoint and `product_generation` identifies its logical product generation. An individual product generation can reference several physical parts. `committed_text_files` counts indexed sources whose captured bytes match HEAD.
+A checkpoint records which captured sources match HEAD. Several metadata-only checkpoints can share one product generation, which can reference multiple physical parts.
 
 [Storage design and performance gates](boxes/generations/incremental.md)
 

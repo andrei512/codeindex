@@ -40,9 +40,48 @@ The archived Markdown release gives the following results on these bytes.
 | `section guide.md#child --parent` | Handle `guide.md#setup`, bytes [8,45), parent `guide.md#guide`. The body includes the entire Child section through its final LF. |
 | `backlinks guide.md#setup` | One hit from `refs.md#`, line 1, byte offset 0, with the root breadcrumb of the referring document. |
 
-## What a language must establish
+## How to test one language
 
-A language registration pairs its extension and dialect selection with its declaration rules, dependency discovery, binding rules and capability-specific fixtures. Freeze each supported mode in the archived language registry, including the distinction between declaration-only and semantic operations. For adding a language, run the same generic capture, update, pin and query suites with the new registration. Exercise same spelling in two scopes, missing then introduced definitions, an unrelated edit, malformed input, and each supported form of import, dispatch or generated binding. Specify paths and byte ranges for all expected targets and the reason for every partial or unsupported result. A new extension using an existing grammar still needs a fixture if it selects a different syntax mode or project context.
+Apply these five steps to each language in the live registry.
+
+Keep each synthetic case in this repository under `tests/fixtures/languages/<language>/<case>/`, for example `tests/fixtures/languages/python/super_call/`. Put the project files in a `repo/` subdirectory and the expected answers beside it. The harness copies `repo/` into a temporary directory, runs `git init` there, and runs queries and edits in that copy. For public cases, commit the repository URL, pinned revision, configuration, queries and expected answers. Fetch the checkout separately.
+
+1. **Choose one query and one language feature.** Write the question in plain English. For example, “Which method does this inherited call refer to?” Repeat for symbol lookup, definitions, references and callers. Record the expected status for partial or unsupported operations. Give a dialect its own case when it changes the answer.
+2. **Make the smallest repo that distinguishes right from wrong.** Include the intended declaration, an unrelated declaration with the same name, and a use that can refer to only one of them. Adapt the names to the language, such as methods, shell functions or build stages. For a declaration-only feature, include a same-spelling occurrence in ordinary text.
+3. **Write the answer before running cx.** Save the exact query, expected paths and source ranges, expected coverage status, and the evidence. Use a pinned language tool that answers that question or two independent reviewers who agree on the source locations. For “find all references,” account for every use in the test scope. Keep unresolved disagreements visible as unverified.
+4. **Run the query, then change one fact.** Compare a fresh build and a reopened index with the answer key. Write down how the answer should change if the use moves to the other declaration. Apply that edit and compare both the updated index and a clean build with the new answer key. For declaration-only features, rename the declaration and check the old and new names.
+5. **Check the feature on real code.** Pick a public repo and pin its commit, project root, configuration and reference tool version. Select the use or declaration independently of cx. Apply the same answer-first comparison. A verified call site proves one reference. Only a complete independent list can verify an “all references” answer.
+
+Run all language checks from the repository root with Python 3.9+, Git, Node/npm, uv and a Clang installation with system headers:
+
+```sh
+cargo build --release --locked
+python3 tests/discover_languages.py --public
+```
+
+Omit `--public` for the offline synthetic suites. Read `target/discovery/suites.json` for suite outcomes and logs. Detailed reports live in `target/language-*.json`. To isolate one language, run `python3 tests/language_conformance.py --language python --public`. The full run continues through failing suites and exits nonzero if any suite fails or lacks a required tool.
+
+A case's `checks.tsv` contains one operation, subject and expected location list per line, separated by tabs. Positions use one-based UTF-16 columns. Use `-` for an empty list. Append `|name` to an expected caller site to check its owner, or `|kind` to a symbol site to check its declaration kind. Relationship rows can add an expected operation status such as `resolved` or `resolved/partial` to check context coverage as well. A fifth field of `contains` checks only independently witnessed members of a reverse set. Prefix an operation with `?` for a probe of behavior outside the documented capability. Its differences appear in the report separately from required failures.
+
+Keep replacement files in `edit/`, deleted paths in `delete.txt`, and post-edit answers in `edited.tsv`. The runner compares the edited checkout against both the existing store and an empty store. Public cases use `public.json` to pin the URL and commit.
+
+For another discovery pass, select one unanswered question for each registered profile. Write a case containing a real use and the nearest misleading use. Change only the condition that should affect the answer, such as ending a scope, entering a comment, escaping an interpolation or selecting a parent method. Run the pinned public cases alongside the new examples. Record the smallest reproducer and confirm the expectation independently before listing a defect. Count wrong answers separately from questions whose semantics still need agreement.
+
+The runner also deletes and restores the synthetic sources for names that passed their initial lookup. It checks that those names disappear and return at their original locations. For relationship hits it checks that every hit has evidence for the selected binding, operation and context. The per-profile verdict in the JSON applies to the sampled queries.
+
+Run `python3 tests/language_paths.py` to check filename and dialect routing. Run `python3 tests/language_named_references.py --public` to check the user-facing name lookup against labelled fixture declarations and reference sites.
+
+**When to stop expanding a test family.** Before running a batch, record the language feature, the wrong answer it could produce, the independent witness and the applicable profiles. Count distinct confirmed causes per batch. Keep repeated manifestations, unsupported features and errors in the answer key separate. Two batches without a new cause trigger a challenge on a different mechanism or on independently labelled public code. If that challenge finds a cause, follow it through adjacent constructs and edits. Stop that line of discovery once those checks also stop adding causes. Record exactly which inputs and operations the conclusion covers.
+
+The held-out repository-transition tests use the same written declarations across all profiles and vary the result cap, tracked membership, file identity and line endings. The Python public-code oracle compares symbol locations and kinds with CPython's AST and token stream. For statically named calls it checks bytecode global reads, straight imports and unambiguous written definitions in the pinned package. Function parameters, rebinding and ambiguous same-line loads can invalidate that inference. The oracle has an independent negative control for them.
+
+**Diagnosing C/C++ differences.** The public Clang suite records the exact compiler arguments, written source anchors, the sample selected before querying cx, and censored results. For direct calls it also checks the reverse edge, excludes callees independently bound to a different target and leaves unrelated references ungraded. After the public run, use `uv run tests/language_c_residual_controls.py` for isolated annotation and return-type edits, or `uv run tests/language_compiled_residuals.py` for ranked samples of unresolved sites. Credit a cause only when the source intervention preserves Clang's locations and restores the Codeindex answer. An unchanged compiler target and a still-wrong Codeindex answer leave that case open.
+
+**Verdict.** A wrong answer fails. Missing evidence or a missing run leaves the case unverified. A language passes when every required case passes. Removing a required case or narrowing its scope needs independent review.
+
+**Rollout.** List all live languages and their promised operations first. Keep existing frozen provider answers. Exercise the runner on three different behaviors: Python inheritance, an import redirected in another file, and a Procfile process declaration with unsupported callers. Deliberately drop a hit, return the wrong target, and claim a partial answer is complete. Each must fail. Then apply the procedure to every remaining language.
+
+**Execution.** Run the full pinned suite before release. The synthetic suite can also run offline. Shared tests also cover Unicode positions, two hits on one line, malformed source, unrelated edits and targets introduced, renamed or deleted. Use the Markdown witnesses above for sections, breadcrumbs and backlinks.
 
 ## Selecting physical designs
 

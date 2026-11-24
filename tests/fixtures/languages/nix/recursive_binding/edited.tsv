@@ -1,0 +1,3 @@
+definition	default.nix:5:15	default.nix:2:3	resolved
+references	default.nix:4:5	-	resolved
+references	default.nix:2:3	default.nix:5:15,default.nix:5:22,default.nix:7:4	resolved

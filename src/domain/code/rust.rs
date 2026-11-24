@@ -2,6 +2,7 @@
 //! crate/module names, and nominal receiver types constrain binding. Proc-macro
 //! expansion and compiler-derived trait obligations remain outside this profile.
 mod binding;
+mod bindings;
 mod cargo;
 mod config;
 mod extract;
@@ -15,14 +16,16 @@ mod identity;
 mod members;
 mod patterns;
 mod type_hints;
-use super::{Analysis, Call, Declaration, Kind, Names, Site, Token, Unit};
+#[cfg(test)]
+use super::Names;
+use super::{Analysis, Call, Declaration, Kind, ForwardNames, Site, Token, Unit};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 use type_hints::Projection;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Namespace {
     Value,
     Type,
@@ -42,7 +45,7 @@ struct Scope {
     associated: bool,
     literal: Vec<String>,
     module: usize,
-    names: HashMap<String, Vec<Binding>>,
+    names: HashMap<String, bindings::Bindings>,
     imports: HashMap<String, Vec<(usize, Vec<String>)>>,
     globs: Vec<(usize, Vec<String>)>,
     children: HashMap<String, Vec<(usize, Module)>>,
@@ -347,6 +350,6 @@ crate::domain::code::cache::record!(Binding { decl, visibility, local, ns });
 
 crate::domain::code::cache::record!(Lookup { scope, ns, path });
 
-impl crate::domain::code::cache::Wire for Namespace{fn save(&self,w:&mut Vec<u8>){match self{Self::Value=>{ w.push(0); },Self::Type=>{ w.push(1); },Self::Either=>{ w.push(2); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{match usize::load(r)?{0=>Ok(Self::Value),1=>Ok(Self::Type),2=>Ok(Self::Either),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Namespace{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Value=>{ w.push(0); },Self::Type=>{ w.push(1); },Self::Either=>{ w.push(2); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{match usize::load(r)?{0=>Ok(Self::Value),1=>Ok(Self::Type),2=>Ok(Self::Either),_=>Err(crate::domain::code::cache::bad())}}}
 
-impl crate::domain::code::cache::Wire for Module{fn save(&self,w:&mut Vec<u8>){match self{Self::Inline(a)=>{ w.push(0); a.save(w);},Self::File(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Inline(Wire::load(r)?)),1=>Ok(Self::File(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+impl crate::domain::code::cache::Wire for Module{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Inline(a)=>{ w.push(0); a.save(w);},Self::File(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Inline(Wire::load(r)?)),1=>Ok(Self::File(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}

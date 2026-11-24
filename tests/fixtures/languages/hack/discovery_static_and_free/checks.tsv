@@ -1,0 +1,5 @@
+# The free call names the global function. The class-qualified call cannot target the global function. Exact static class-method binding is tested as a probe.
+symbol	emit	main.hack:2:10,main.hack:4:26
+definition	main.hack:7:3	main.hack:2:10	resolved
+references	main.hack:2:10	main.hack:7:3	resolved
+?definition	main.hack:8:8	main.hack:4:26	resolved

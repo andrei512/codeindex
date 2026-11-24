@@ -314,3 +314,60 @@ fn grouped_rank_patch_preserves_exact_wire_after_repeated_edits() {
         bytes = actual;
     }
 }
+
+#[test]
+fn fused_rank_words_and_packed_groups_match_reference() {
+    let mut rank = RankedIndex::default();
+    let mut bulk = super::BulkRank::default();
+    let mut large = String::new();
+    let alphabet = [' ', 'a', 'B', 'C', 'd', '4', '_', '.', '\n', '\0', 'Ł', 'ñ', 'Σ', '\u{301}', '🙂', '\u{ffff}', '\u{fffe}', '中'];
+    let mut seed = 13u32;
+    for _ in 0..20000 {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        large.push(alphabet[((seed >> 8) as usize) % alphabet.len()]);
+    }
+    let long_key = format!("abc{}_{}{}", "Z".repeat(40000), "α".repeat(30000), "XYZ");
+    for (i,text) in ["", "_hHTTPServer abcNew\n\n___TTT_", &large, &long_key].into_iter().enumerate() {
+        let mut words=vec![];
+        let mut parts=vec![];
+        super::token::tokenize(text, |k,s| words.push((k.to_vec(),s)));
+        super::token::identifier_parts(text, |base,p| super::token::tokenize(p, |k,s| parts.push((k.to_vec(),base+s.start..base+s.end))));
+        let mut got_words=vec![];
+        let mut got_parts=vec![];
+        super::token::ranked_words(text, |part,k,s| if part {got_parts.push((k.to_vec(),s))} else {got_words.push((k.to_vec(),s))});
+        assert_eq!(words,got_words);
+        assert_eq!(parts,got_parts);
+        let path=format!("src/HTTP_File_{i}.rs");
+        let chunks=chunk_ranges(text,&[]);
+        rank.add_file(&path,text,&chunks);
+        bulk.add_file(&path,text,&chunks);
+    }
+    let mut a=Vec::new(); let mut b=Vec::new();
+    rank.write_to(&mut a).unwrap(); bulk.write_to(&mut b).unwrap();
+    assert_eq!(a,b);
+}
+
+#[test]
+fn joined_packed_groups_keep_global_file_order_and_rank_bytes() {
+    let mut rank = RankedIndex::default();
+    let mut pieces = Vec::new();
+    for batch in 0..6 {
+        let mut bulk = super::BulkRank::at(batch * 44);
+        for file in batch * 44..(batch+1)*44 {
+            let path = format!("src/f_{file}.txt");
+            let body = if file % 7 == 0 { String::new() } else {
+                format!("id_{file} foo_bar FooBar with 🧩token_42\nunrelated line{}\n", file%4).repeat(file%83)
+            };
+            let chunks = chunk_ranges(&body,&[]);
+            rank.add_file(&path,&body,&chunks);
+            bulk.add_file(&path,&body,&chunks);
+        }
+        pieces.push(bulk.into_shard());
+    }
+    let merged = super::ShardSet::new(pieces).unwrap();
+    let mut expected = vec![];let mut got = vec![];
+    rank.write_to(&mut expected).unwrap();
+    merged.write_to(&mut got).unwrap();
+    assert_eq!(expected.len(),got.len());
+    assert!(expected==got);
+}

@@ -1,0 +1,3 @@
+definition	man/Makefile:17:4	man/Makefile:5:1	resolved
+definition	man/Makefile:20:4	man/Makefile:5:1	resolved
+references	man/Makefile:5:1	man/Makefile:17:4,man/Makefile:20:4	resolved

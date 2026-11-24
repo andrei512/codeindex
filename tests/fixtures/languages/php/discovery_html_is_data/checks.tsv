@@ -1,0 +1,4 @@
+# Only text between PHP opening and closing tags is parsed as PHP source. The unmarked apparent function and line 3 are HTML output.
+symbol	phantom	-
+symbol	real_work	page.phtml:2:16
+references	page.phtml:2:16	page.phtml:4:7	resolved

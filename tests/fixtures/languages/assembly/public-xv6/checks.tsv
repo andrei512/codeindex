@@ -1,0 +1,3 @@
+symbol	_entry	kernel/entry.S:7:1
+symbol	spin	kernel/entry.S:20:1
+definition	kernel/entry.S:7:1	kernel/entry.S:7:1	resolved

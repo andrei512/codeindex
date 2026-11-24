@@ -1,0 +1,7 @@
+symbol	build	Dockerfile:1:17
+symbol	deliver	Dockerfile:3:17
+symbol	artifact	-
+definition	Dockerfile:4:13	Dockerfile:1:17	resolved
+references	Dockerfile:1:17	Dockerfile:4:13	resolved
+references	Dockerfile:3:17	-	resolved
+callers	Dockerfile:1:17	-	resolved

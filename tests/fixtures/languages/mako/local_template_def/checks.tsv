@@ -1,0 +1,6 @@
+symbol	render	page.mako:1:13
+symbol	wrapper	page.mako:2:13
+definition	page.mako:3:9	page.mako:1:13	resolved
+references	page.mako:1:13	page.mako:3:9	resolved
+callers	page.mako:1:13	page.mako:3:9	resolved
+references	page.mako:2:13	-	resolved

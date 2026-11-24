@@ -1,0 +1,2 @@
+symbol	FromRoman	src/Humanizer/RomanNumeralExtensions.cs:83,src/Humanizer/RomanNumeralExtensions.cs:111,tests/Humanizer.Tests/RomanNumeralTests.cs:46
+definition	src/Humanizer/RomanNumeralExtensions.cs:87:16	src/Humanizer/RomanNumeralExtensions.cs:111:23	resolved

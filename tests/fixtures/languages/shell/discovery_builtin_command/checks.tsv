@@ -1,0 +1,4 @@
+# Bash command bypasses shell function lookup. Only line 2 calls the user-defined printf. The third line reaches the builtin.
+symbol	printf	demo.sh:1:1
+definition	demo.sh:2:1	demo.sh:1:1	resolved
+references	demo.sh:1:1	demo.sh:2:1	resolved

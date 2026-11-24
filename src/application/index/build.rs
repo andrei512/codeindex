@@ -1,18 +1,18 @@
-use super::{
-    Entry, Observation, ObservedPath,
-    binary::{put, string},
-    graph,
-};
+use super::{Entry, Observation, ObservedPath, graph};
 use crate::{
     application::index::layout::*,
     domain::{
-        code::{self, Analysis, Language, Names, Unit},
+        code::{self, Analysis, ForwardNames, Language, Unit},
         markdown::{self, Parsed},
     },
 };
-use std::{collections::BTreeMap, io, path::Path};
+use std::{io, path::Path};
 
+mod c_project;
+mod capture;
+mod catalog;
 mod content_delta;
+mod evidence_batches;
 mod fresh_postings;
 mod incremental;
 #[cfg(test)]
@@ -29,10 +29,16 @@ pub(crate) struct Local {
     pub(crate) partial_line: bool,
 }
 fn analyze(path: &str, body: Option<&str>) -> Local {
+    analyze_with_project(path, body, None)
+}
+fn analyze_with_project(path: &str, body: Option<&str>, project: Option<&code::CProject>) -> Local {
     let text = body.unwrap_or("");
     let code = Language::for_path(path)
         .filter(|_| body.is_some())
-        .map_or_else(Analysis::default, |l| code::analyze(l, text));
+        .map_or_else(Analysis::default, |l| match project {
+            Some(p) if matches!(l, Language::C | Language::Cpp) => p.analyze(l, path, text),
+            _ => code::analyze(l, text),
+        });
     let markdown =
         (body.is_some() && markdown::is_markdown(path)).then(|| Parsed::parse(path, text));
     let mut lf: Vec<_> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
@@ -63,26 +69,6 @@ type Identify<'a> = dyn Fn(
     ) -> io::Result<(Option<usize>, Option<crate::domain::BlobId>)>
     + Sync
     + 'a;
-type Job<'a> = (usize, &'a mut ObservedPath, &'a mut Slot, Option<usize>);
-
-struct Queue<'a> {
-    jobs: BTreeMap<usize, Vec<Job<'a>>>,
-    available: usize,
-}
-impl<'a> Queue<'a> {
-    fn take(&mut self) -> Option<(Job<'a>, usize)> {
-        // Select the heaviest job that fits. An oversized job's charge is the
-        // entire capture allowance and can only be admitted by itself.
-        let cost = *self.jobs.range(..=self.available).next_back()?.0;
-        let bucket = self.jobs.get_mut(&cost).unwrap();
-        let job = bucket.pop().unwrap();
-        if bucket.is_empty() {
-            self.jobs.remove(&cost);
-        }
-        self.available -= cost;
-        Some((job, cost))
-    }
-}
 pub(crate) trait Previous: Sync {
     fn compatible(&self, _kind: usize) -> bool {
         true
@@ -91,7 +77,23 @@ pub(crate) trait Previous: Sync {
     fn extent(&self, product: usize) -> std::ops::Range<u64>;
     fn copy_bytes(&self, range: std::ops::Range<u64>, out: &mut dyn io::Write) -> io::Result<()>;
     fn local(&self, id: usize, decode_code: bool, decode_markdown: bool) -> io::Result<Local>;
+    fn markdown_record(&self, _id: usize) -> io::Result<Option<std::ops::Range<u64>>> { Ok(None) }
+    fn source_end_word(&self, _file: usize, _end: usize) -> io::Result<Option<u64>> { Ok(None) }
     fn product(&self, kind: usize) -> io::Result<Vec<u8>>;
+}
+mod worker;
+pub(crate) use worker::Worker;
+pub(crate) type RankLane =
+    Box<dyn FnOnce(crate::domain::ranked::FreshRank) -> io::Result<Worker<u64>> + Send>;
+
+pub(crate) type ProvenanceLane<'a> = Box<dyn FnOnce(&[ObservedPath]) -> io::Result<()> + Send + 'a>;
+
+pub(crate) struct Output {
+    pub(crate) dir: Directory,
+    pub(crate) files: Vec<Entry>,
+    pub(crate) rank_write: Option<Worker<u64>>,
+    pub(crate) retired: Vec<Local>,
+    pub(crate) sdk_receipts: Vec<code::CReceipt>,
 }
 pub(crate) fn build(
     root: &Path,
@@ -101,7 +103,9 @@ pub(crate) fn build(
     forward_known: bool,
     identify: &Identify,
     w: &mut impl ExtentSink,
-) -> io::Result<(Directory, Vec<Entry>)> {
+    rank_lane: Option<RankLane>,
+    provenance_lane: Option<ProvenanceLane<'_>>,
+) -> io::Result<Output> {
     build_with_allowance(
         root,
         obs,
@@ -111,6 +115,8 @@ pub(crate) fn build(
         identify,
         w,
         source::source_allowance(),
+        rank_lane,
+        provenance_lane,
     )
 }
 fn build_with_allowance(
@@ -122,7 +128,9 @@ fn build_with_allowance(
     identify: &Identify,
     w: &mut impl ExtentSink,
     allowance: usize,
-) -> io::Result<(Directory, Vec<Entry>)> {
+    rank_lane: Option<RankLane>,
+    provenance_lane: Option<ProvenanceLane<'_>>,
+) -> io::Result<Output> {
     let reuse: Vec<Option<usize>> = obs
         .iter()
         .enumerate()
@@ -150,7 +158,9 @@ fn build_with_allowance(
     let rewrite_rank = previous.is_some_and(|p| !p.compatible(RANK));
     let read_all_text = rewrite_rank || previous.is_some_and(|p| !p.compatible(CONTENT));
     let share_markdown = stable_paths && reuse_markdown;
-    let keep_graph = incremental::graph_unchanged(previous, obs, &reuse);
+    let mut config = c_project::Refresh::plan(previous, obs, &reuse)?;
+    let keep_graph =
+        !config.invalidates_graph() && incremental::graph_unchanged(previous, obs, &reuse);
     let width = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(obs.len().max(1));
@@ -158,25 +168,27 @@ fn build_with_allowance(
     let capture_credit = allowance.saturating_sub(retained).max(1);
     let pool = Pool::new(retained);
     let mut slots: Vec<Slot> = (0..obs.len()).map(|_| None).collect();
-    let prepared =
-        if let Some(previous) = previous.filter(|_| stable_paths && forward_known && !keep_graph) {
-            script_edit::prepare(previous, obs, &reuse, &pool, capture_credit, identify)?
-        } else {
-            None
-        };
+    let prepared = if let Some(previous) = previous
+        .filter(|_| stable_paths && forward_known && !keep_graph && !config.invalidates_graph())
+    {
+        script_edit::prepare(previous, obs, &reuse, &pool, capture_credit, identify)?
+    } else {
+        None
+    };
     let mut old_body = None;
     let mut verified_graph = None;
+    let mut end_patch = None;
     if let Some(edit) = prepared {
         verified_graph = Some((edit.id, edit.same_graph));
+        end_patch = edit.end_patch;
         slots[edit.id] = Some(edit.capture);
         old_body = Some((edit.id, edit.old_text));
     }
     let keep_graph = keep_graph || verified_graph.is_some_and(|(_, equal)| equal);
     {
-        let mut jobs = BTreeMap::<usize, Vec<Job>>::new();
+        let mut jobs = capture::Jobs::new(capture_credit);
         let direct =
             previous.filter(|_| forward_known && keep_graph && share_markdown && !read_all_text);
-        let mut scheduled = 0;
         for (index, ((o, slot), &prior)) in obs.iter_mut().zip(&mut slots).zip(&reuse).enumerate() {
             if slot.is_some() {
                 continue;
@@ -191,113 +203,66 @@ fn build_with_allowance(
                 });
                 continue;
             }
-            scheduled += 1;
-            let cost = usize::try_from(o.stamp[2])
-                .unwrap_or(usize::MAX)
-                .clamp(1, capture_credit);
-            jobs.entry(cost).or_default().push((index, o, slot, prior));
+            jobs.push(o.stamp[2], (index, o, slot, prior));
         }
-        let state = std::sync::Mutex::new(Queue {
-            jobs,
-            available: capture_credit,
-        });
-        let ready = std::sync::Condvar::new();
-        std::thread::scope(|scope| -> io::Result<()> {
-            let workers: Vec<_> = (0..width.min(scheduled))
-                .map(|_| {
-                    scope.spawn(|| -> io::Result<()> {
-                        loop {
-                            let ((index, o, slot, prior), cost) = {
-                                let mut q = state.lock().unwrap();
-                                loop {
-                                    if q.jobs.is_empty() {
-                                        return Ok(());
-                                    }
-                                    if let Some(job) = q.take() {
-                                        break job;
-                                    }
-                                    q = ready.wait(q).unwrap();
-                                }
-                            };
-                            // Return credit on unwinding too. Waiting workers must be
-                            // able to drain the queue even when a parser panics.
-                            struct Return<'a, 'b>(
-                                &'a std::sync::Mutex<Queue<'b>>,
-                                &'a std::sync::Condvar,
-                                usize,
-                            );
-                            impl Drop for Return<'_, '_> {
-                                fn drop(&mut self) {
-                                    self.0.lock().unwrap().available += self.2;
-                                    self.1.notify_all()
-                                }
-                            }
-                            let _credit = Return(&state, &ready, cost);
-                            // A graph-preserving edit has no consumer for the retained
-                            // source bodies until their bytes reach the new segment.
-                            let refresh_markdown =
-                                !reuse_markdown && markdown::is_markdown(&o.path);
-                            let forwarded = forward_known
-                                && keep_graph
-                                && prior.is_some()
-                                && !read_all_text
-                                && !refresh_markdown;
-                            let captured = o.captured.take();
-                            let body = if forwarded {
-                                None
-                            } else {
-                                match captured {
-                                    Some(text) => text,
-                                    None => read(root, &o.path, o.stamp)?,
-                                }
-                            };
-                            let (prior, blob) = identify(index, o, body.as_deref(), prior)?;
-                            let regenerated_md = if prior.is_some() && refresh_markdown {
-                                body.as_deref().map(|text| Parsed::parse(&o.path, text))
-                            } else {
-                                None
-                            };
-                            let source = body.map(|text| pool.retain(text)).transpose()?;
-                            let facts = if let Some(id) = prior {
-                                let p = previous.unwrap();
-                                let mut local = p.local(
-                                    id,
-                                    !keep_graph,
-                                    reuse_markdown && (!share_markdown || rewrite_rank),
-                                )?;
-                                if refresh_markdown {
-                                    local.markdown = regenerated_md;
-                                }
-                                if p.entries()[id].path() != o.path
-                                    && let Some(doc) = &mut local.markdown
-                                {
-                                    doc.relocate(&o.path);
-                                }
-                                Some(local)
-                            } else {
-                                match &source {
-                                    Some(Source::Scratch(_)) => None,
-                                    source => Some(analyze(
-                                        &o.path,
-                                        source.as_ref().map(|s| s.text(None)),
-                                    )),
-                                }
-                            };
-                            *slot = Some(Captured {
-                                blob,
-                                source,
-                                local: facts,
-                                prior,
-                            });
-                        }
-                    })
-                })
-                .collect();
-            for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| io::Error::other("capture worker failed"))??;
-            }
+        jobs.run(width, |(index, o, slot, prior)| {
+            // A graph-preserving edit has no consumer for the retained
+            // source bodies until their bytes reach the new segment.
+            let refresh_markdown = !reuse_markdown && markdown::is_markdown(&o.path);
+            let forwarded = forward_known
+                && keep_graph
+                && prior.is_some()
+                && !read_all_text
+                && !refresh_markdown;
+            let captured = o.captured.take();
+            let body = if forwarded {
+                None
+            } else {
+                match captured {
+                    Some(text) => text,
+                    None => read(root, &o.path, o.stamp)?,
+                }
+            };
+            let (prior, blob) = identify(index, o, body.as_deref(), prior)?;
+            let regenerated_md = if prior.is_some() && refresh_markdown {
+                body.as_deref().map(|text| Parsed::parse(&o.path, text))
+            } else {
+                None
+            };
+            let source = body.map(|text| pool.retain(text)).transpose()?;
+            let same_path = prior.filter(|&id| previous.unwrap().entries()[id].path() == o.path);
+            let defer =
+                !forwarded && c_project::is_c(&o.path) && config.reparse(&o.path, same_path);
+            let facts = if defer {
+                None
+            } else if let Some(id) = prior {
+                let p = previous.unwrap();
+                let mut local = p.local(
+                    id,
+                    !keep_graph,
+                    reuse_markdown && (!share_markdown || rewrite_rank),
+                )?;
+                if refresh_markdown {
+                    local.markdown = regenerated_md;
+                }
+                if p.entries()[id].path() != o.path
+                    && let Some(doc) = &mut local.markdown
+                {
+                    doc.relocate(&o.path);
+                }
+                Some(local)
+            } else {
+                match &source {
+                    Some(Source::Scratch(_)) => None,
+                    source => Some(analyze(&o.path, source.as_ref().map(|s| s.text(None)))),
+                }
+            };
+            *slot = Some(Captured {
+                blob,
+                source,
+                local: facts,
+                prior,
+            });
             Ok(())
         })?;
     }
@@ -319,13 +284,39 @@ fn build_with_allowance(
         .map(|(&id, o)| id.filter(|&id| previous.unwrap().entries()[id].path() == o.path))
         .collect();
     let share_graph = verified_graph.is_some_and(|(_, equal)| equal)
-        || incremental::graph_unchanged(previous, obs, &reuse);
+        || !config.invalidates_graph() && incremental::graph_unchanged(previous, obs, &reuse);
     if keep_graph && !share_graph {
         return Err(io::Error::other(
             "a verified binding input changed during capture",
         ));
     }
-    if backing.is_some() {
+    let mut evidence_reuse = std::borrow::Cow::Borrowed(reused_local.as_slice());
+    if config.invalidates_graph() || config.catalog.is_some() {
+        for (i, local) in parsed.iter().enumerate() {
+            if local.is_none() && reused_local[i].is_some() && c_project::is_c(&obs[i].path) {
+                evidence_reuse.to_mut()[i] = None;
+            }
+        }
+    }
+    if parsed.iter().any(Option::is_none) || config.rewrite_catalog() {
+        let project = config.catalog.is_some().then(|| {
+            code::CProject::new(
+                root,
+                obs.iter()
+                    .zip(&sources)
+                    .filter(|(o, _)| c_project::database(&o.path))
+                    .filter_map(|(o, s)| {
+                        Some((o.path.as_str(), s.as_ref()?.text(backing.as_ref())))
+                    }),
+                |path| {
+                    let i = obs.binary_search_by(|o| o.path.as_str().cmp(path)).ok()?;
+                    Some((
+                        obs[i].path.as_str(),
+                        sources[i].as_ref()?.text(backing.as_ref()),
+                    ))
+                },
+            )
+        });
         let jobs = std::sync::Mutex::new(
             parsed
                 .iter_mut()
@@ -334,15 +325,17 @@ fn build_with_allowance(
                 .collect::<Vec<_>>(),
         );
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..width)
+            let count = width.min(jobs.lock().unwrap().len());
+            let workers: Vec<_> = (0..count)
                 .map(|_| {
                     scope.spawn(|| {
                         loop {
                             let job = jobs.lock().unwrap().pop();
                             let Some((i, facts)) = job else { break };
-                            *facts = Some(analyze(
+                            *facts = Some(analyze_with_project(
                                 &obs[i].path,
                                 sources[i].as_ref().map(|s| s.text(backing.as_ref())),
+                                project.as_ref(),
                             ));
                         }
                     })
@@ -355,6 +348,15 @@ fn build_with_allowance(
             }
             Ok::<_, io::Error>(())
         })?;
+        if let Some((id, project)) = config.catalog.zip(project) {
+            let dependencies = config.merge(project.consulted(), obs);
+            code::CProject::put_dependencies(
+                &mut parsed[id].as_mut().unwrap().code,
+                dependencies,
+                config.receipts.clone(),
+            );
+            evidence_reuse.to_mut()[id] = None;
+        }
     }
     let locals: Vec<_> = parsed.into_iter().map(Option::unwrap).collect();
     let units: Vec<_> = obs
@@ -369,191 +371,189 @@ fn build_with_allowance(
         .collect();
     let mut dir = Directory::default();
     let start = w.offset();
-    // Transpose lexical and ranked postings independently. The writers share
-    // immutable file bodies. Only the publication thread owns the segment.
+    // Workers borrow the immutable capture until their product is ready. The
+    // primary writer emits independent products before joining those workers.
     let before = incremental::edited_sources(previous, &units, &reuse, capture_credit, old_body)?;
     // Facts can survive a changed source. Reuse graph extents only after proving
     // both parser evidence and the source slices consumed by binding are equal.
-    let mut evidence_reuse = std::borrow::Cow::Borrowed(reused_local.as_slice());
-    if let Some((id, true)) = verified_graph {
+    if end_patch.is_none() && let Some((id, true)) = verified_graph {
         evidence_reuse.to_mut()[id] = Some(id);
     }
     let share_graph = share_graph
-        || verified_graph.is_none()
+        || !config.invalidates_graph()
+            && verified_graph.is_none()
             && incremental::same_binding_inputs(previous, &units, &before, &mut evidence_reuse)?;
-    let (mut files, paths, content, ranked, names) =
-        std::thread::scope(|scope| -> io::Result<_> {
-            let bind = (!share_graph).then(|| scope.spawn(|| Names::build(&units)));
-            let trigrams = scope.spawn(|| incremental::trigrams(previous, &units, &reuse, &before));
-            let rank =
-                scope.spawn(|| incremental::ranked(previous, &units, &locals, &reuse, &before));
-            let mut files = Vec::with_capacity(obs.len());
-            let mut writer = retained::Run::new(previous, w);
-            for (id, ((o, unit), source)) in obs.iter().zip(&units).zip(&sources).enumerate() {
-                let off = writer.offset() - start;
-                let bytes = if let Some(old_id) = reused_local[id] {
-                    let p = previous.unwrap();
-                    let old = &p.entries()[old_id];
-                    if let Some(range) = &old.bytes {
-                        let base = p.extent(SOURCE).start;
-                        writer.borrow(base + range.start..base + range.end)?;
-                        Some(off..writer.offset() - start)
-                    } else {
-                        None
-                    }
-                } else if source.is_some() {
-                    writer.bytes(unit.text.as_bytes())?;
+    let (mut files, rank_write) = std::thread::scope(|scope| -> io::Result<_> {
+        let batches = if previous.is_none() && backing.is_none() {
+            evidence_batches::plan(&units, width, capture_credit).map(|(ranges, cap)| {
+                ranges
+                    .into_iter()
+                    .map(|range| {
+                        let slice = &units[range.clone()];
+                        let bodies = &sources[range.clone()];
+                        (
+                            range,
+                            scope.spawn(move || evidence_batches::encode(slice, bodies, cap)),
+                        )
+                    })
+                    .collect()
+            })
+        } else {
+            None
+        };
+        let bind = (!share_graph).then(|| {
+            scope.spawn(|| -> io::Result<_> {
+                let names = ForwardNames::forward(&units);
+                let bases = graph::declaration_bases(&units);
+                std::thread::scope(|scope| {
+                    let symbols = scope.spawn(|| {
+                        let mut bytes = Vec::new();
+                        graph::encode_symbols(&units, &names, &bases, &mut bytes)?;
+                        Ok::<_, io::Error>(bytes)
+                    });
+                    let mut relations = Vec::new();
+                    graph::encode_relations(&units, &names, &bases, &mut relations)?;
+                    let symbols = symbols
+                        .join()
+                        .map_err(|_| io::Error::other("symbol worker failed"))??;
+                    Ok((symbols, relations))
+                })
+            })
+        });
+        let trigrams = scope.spawn(|| incremental::trigrams(previous, &units, &reuse, &before));
+        let rank = scope.spawn(|| -> io::Result<_> {
+            let rank = incremental::ranked(previous, &units, &locals, &reuse, &before)?;
+            match (rank_lane, rank) {
+                (None, rank) => Ok((Some(rank), None)),
+                (Some(emit), incremental::Rank::Bulk(rank)) => Ok((None, Some(emit(rank)?))),
+                _ => Err(io::Error::other("rank lane requires a fresh build")),
+            }
+        });
+        let mut files = Vec::with_capacity(obs.len());
+        let mut writer = retained::Run::new(previous, w);
+        for (id, ((o, unit), source)) in obs.iter().zip(&units).zip(&sources).enumerate() {
+            let off = writer.offset() - start;
+            let bytes = if let Some(old_id) = reused_local[id] {
+                let p = previous.unwrap();
+                let old = &p.entries()[old_id];
+                if let Some(range) = &old.bytes {
+                    let base = p.extent(SOURCE).start;
+                    writer.borrow(base + range.start..base + range.end)?;
                     Some(off..writer.offset() - start)
                 } else {
                     None
-                };
-                files.push(Entry {
-                    blob: blobs[id],
-                    catalog_row: 0..0,
-                    original_stamp: None,
-                    observation: Observation {
-                        path: o.path.clone(),
-                        stamp: o.stamp,
-                    },
-                    bytes,
-                    line_ends: Vec::new(),
-                    evidence: 0..0,
-                });
-            }
-            writer.flush()?;
-            let (paths, content) = trigrams
-                .join()
-                .map_err(|_| io::Error::other("posting worker failed"))??;
-            Ok((
-                files,
-                paths,
-                content,
-                rank.join()
-                    .map_err(|_| io::Error::other("ranking worker failed"))??,
-                bind.map(|job| {
-                    job.join()
-                        .map_err(|_| io::Error::other("binding worker failed"))
-                })
-                .transpose()?,
-            ))
-        })?;
-    dir.0[SOURCE - 1] = start..w.offset();
-    if let Some(names) = names {
-        // Encode small graph fields together before the segment writer computes
-        // block checksums. Logical offsets include bytes in the pending buffer.
-        use std::io::Write;
-        let mut graph_out = io::BufWriter::with_capacity(64 * 1024, &mut *w);
-        let start = graph_out.offset();
-        let base = graph::encode_symbols(&units, &names, &mut graph_out)?;
-        dir.0[SYMBOLS - 1] = start..graph_out.offset();
-        let start = graph_out.offset();
-        graph::encode_relations(&units, &names, &base, &mut graph_out)?;
-        dir.0[REL - 1] = start..graph_out.offset();
-        graph_out.flush()?;
-    } else {
-        let p = previous.unwrap();
-        for kind in [SYMBOLS, REL] {
-            let start = w.offset();
-            retained::range(p, w, p.extent(kind))?;
-            dir.0[kind - 1] = start..w.offset();
+                }
+            } else if source.is_some() {
+                writer.bytes(unit.text.as_bytes())?;
+                Some(off..writer.offset() - start)
+            } else {
+                None
+            };
+            files.push(Entry {
+                blob: blobs[id],
+                catalog_row: 0..0,
+                original_stamp: None,
+                observation: Observation {
+                    path: o.path.clone(),
+                    stamp: o.stamp,
+                },
+                bytes,
+                line_ends: Vec::new(),
+                evidence: 0..0,
+            });
         }
-    }
+        writer.flush()?;
+        dir.0[SOURCE - 1] = start..w.offset();
+        let start = w.offset();
+        if share_markdown {
+            markdown_delta::write(w, previous.unwrap(), &files, &locals, &reuse)?;
+        } else {
+            catalog::write_markdown(w, &locals)?;
+        }
+        dir.0[MD - 1] = start..w.offset();
+        let offsets = if let Some(batches) = batches {
+            evidence_batches::write(w, batches, &locals, &files, &evidence_reuse)?
+        } else {
+            retained::evidence(w, previous, &evidence_reuse, &locals, &files)?
+        };
+        let start = w.offset();
+        catalog::write(w, previous, &mut files, &locals, &reuse, &offsets)?;
+        dir.0[FILES - 1] = start..w.offset();
+        // Identity rows are complete after capture. Verify their pinned commit
+        // while the remaining immutable products reach their private segments.
+        let observed = &*obs;
+        let provenance = provenance_lane.map(|finish| scope.spawn(move || finish(observed)));
+        let (paths, content) = trigrams
+            .join()
+            .map_err(|_| io::Error::other("posting worker failed"))??;
+        let start = w.offset();
+        paths.seal(&mut *w, previous, PATHGRAM)?;
+        dir.0[PATHGRAM - 1] = start..w.offset();
+        let start = w.offset();
+        content.seal(&mut *w, previous, CONTENT)?;
+        dir.0[CONTENT - 1] = start..w.offset();
+        let names = bind
+            .map(|job| {
+                job.join()
+                    .map_err(|_| io::Error::other("binding worker failed"))
+            })
+            .transpose()?;
+        if let Some(graph) = names {
+            let (symbols, relations) = graph?;
+            let start = w.offset();
+            w.write_all(&symbols)?;
+            dir.0[SYMBOLS - 1] = start..w.offset();
+            let start = w.offset();
+            w.write_all(&relations)?;
+            dir.0[REL - 1] = start..w.offset();
+        } else {
+            let p = previous.unwrap();
+            for kind in [SYMBOLS, REL] {
+                let start = w.offset();
+                let extent = p.extent(kind);
+                if kind == SYMBOLS && let Some((at, end)) = end_patch {
+                    retained::range(p, w, extent.start..at)?;
+                    w.write_all(&end.to_le_bytes())?;
+                    retained::range(p, w, at + 8..extent.end)?;
+                } else {
+                    retained::range(p, w, extent)?;
+                }
+                dir.0[kind - 1] = start..w.offset();
+            }
+        }
+        let ranked = rank
+            .join()
+            .map_err(|_| io::Error::other("ranking worker failed"))??;
+        let start = w.offset();
+        let (ranked, separate) = ranked;
+        if let Some(ranked) = ranked {
+            ranked.write_to(&mut *w, previous)?;
+        }
+        dir.0[RANK - 1] = start..w.offset();
+        if let Some(provenance) = provenance {
+            provenance
+                .join()
+                .map_err(|_| io::Error::other("provenance worker failed"))??;
+        }
+        Ok((files, separate))
+    })?;
     drop(units);
     drop(sources);
     drop(backing);
-    let start = w.offset();
-    if share_markdown {
-        markdown_delta::write(w, previous.unwrap(), &files, &locals, &reuse)?;
-    } else {
-        let mut docs = Vec::new();
-        let mut destinations = Vec::new();
-        let mut backlinks = BTreeMap::<(&str, &str), Vec<(usize, usize)>>::new();
-        put(w, locals.iter().filter(|l| l.markdown.is_some()).count())?;
-        for (i, l) in locals.iter().enumerate() {
-            if let Some(m) = &l.markdown {
-                docs.push(w.offset() - start);
-                put(w, i)?;
-                m.write_to(&mut *w)?;
-                for (n, link) in m.links.iter().enumerate() {
-                    backlinks
-                        .entry((&link.target, &link.anchor))
-                        .or_default()
-                        .push((i, n));
-                }
-            }
+    let mut retired = locals;
+    for (f, local) in files.iter_mut().zip(&mut retired) {
+        if local.partial_line {
+            local.lf.pop();
         }
-        docs.push(w.offset() - start);
-        put(w, backlinks.len())?;
-        for ((path, anchor), links) in backlinks {
-            destinations.push(w.offset() - start);
-            string(w, path)?;
-            string(w, anchor)?;
-            put(w, links.len())?;
-            for (file, link) in links {
-                put(w, file)?;
-                put(w, link)?;
-            }
-        }
-        destinations.push(w.offset() - start);
-        super::offsets::finish(w, start, [docs, destinations])?;
+        f.line_ends = std::mem::take(&mut local.lf);
     }
-    dir.0[MD - 1] = start..w.offset();
-    let offsets = retained::evidence(w, previous, &evidence_reuse, &locals, &files)?;
-    let start = w.offset();
-    w.write_all(super::CATALOG_MAGIC)?;
-    put(w, files.len())?;
-    let mut writer = retained::Run::new(previous, w);
-    for (i, ((f, mut l), prior)) in files
-        .iter_mut()
-        .zip(locals)
-        .zip(reuse.iter().copied())
-        .enumerate()
-    {
-        let row_start = writer.offset() - start;
-        f.evidence = offsets[i]..offsets[i + 1];
-        if l.partial_line {
-            l.lf.pop();
-        }
-        f.line_ends = l.lf;
-        if let Some((p, old)) = previous.zip(prior)
-            && let old = &p.entries()[old]
-            && !old.catalog_row.is_empty()
-            && old.blob == f.blob
-            && old.catalog_stamp() == f.stamp()
-        {
-            let base = p.extent(FILES).start;
-            writer.borrow(base + old.catalog_row.start..base + old.catalog_row.end)?;
-        } else {
-            f.write(&mut writer)?;
-        }
-        f.catalog_row = row_start..writer.offset() - start;
-    }
-    writer.bytes(&offsets[0].to_le_bytes())?;
-    for (pair, prior) in offsets.windows(2).zip(reuse) {
-        let len = pair[1] - pair[0];
-        if let Some((p, id)) = previous.zip(prior)
-            && let old = &p.entries()[id]
-            && !old.catalog_row.is_empty()
-            && old.evidence.end - old.evidence.start == len
-        {
-            let word = p.extent(FILES).end - 8 * (p.entries().len() - id) as u64;
-            writer.borrow(word..word + 8)?;
-        } else {
-            writer.bytes(&len.to_le_bytes())?;
-        }
-    }
-    writer.flush()?;
-    dir.0[FILES - 1] = start..w.offset();
-    let start = w.offset();
-    paths.seal(&mut *w, previous, PATHGRAM)?;
-    dir.0[PATHGRAM - 1] = start..w.offset();
-    let start = w.offset();
-    content.seal(&mut *w, previous, CONTENT)?;
-    dir.0[CONTENT - 1] = start..w.offset();
-    let start = w.offset();
-    ranked.write_to(&mut *w, previous)?;
-    dir.0[RANK - 1] = start..w.offset();
-    Ok((dir, files))
+    Ok(Output {
+        dir,
+        files,
+        rank_write,
+        retired,
+        sdk_receipts: config.receipts,
+    })
 }
 
 #[cfg(test)]
@@ -612,7 +612,7 @@ mod tests {
                 Ok(fixture[i].1.map(String::from))
             };
             let mut sink = MemorySink::default();
-            let (dir, _) = build_with_allowance(
+            let Output { dir, .. } = build_with_allowance(
                 Path::new("."),
                 &mut obs,
                 &read,
@@ -626,6 +626,8 @@ mod tests {
                 },
                 &mut sink,
                 allowance,
+                None,
+                None,
             )
             .unwrap();
             assert_eq!(counts.map(AtomicUsize::into_inner), [0, 1, 1, 1, 1, 1, 1]);

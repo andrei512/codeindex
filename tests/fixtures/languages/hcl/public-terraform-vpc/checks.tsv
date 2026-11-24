@@ -1,0 +1,2 @@
+definition	main.tf:12:11	main.tf:2:3	resolved
+references	main.tf:2:3	main.tf:12:11,main.tf:140:53,main.tf:142:77,main.tf:146:80,main.tf:146:127,main.tf:196:47	resolved

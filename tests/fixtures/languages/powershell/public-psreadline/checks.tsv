@@ -1,0 +1,4 @@
+symbol	ReadOneKey	test/Get-KeyInfoData.ps1:24
+definition	test/Get-KeyInfoData.ps1:162:15	test/Get-KeyInfoData.ps1:24:10	resolved
+references	test/Get-KeyInfoData.ps1:24:10	test/Get-KeyInfoData.ps1:162:15	resolved
+callers	test/Get-KeyInfoData.ps1:24:10	test/Get-KeyInfoData.ps1:162:15	resolved

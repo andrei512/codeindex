@@ -1,0 +1,13 @@
+[
+  {
+    "file": "source.c",
+    "directory": ".",
+    "arguments": [
+      "clang",
+      "-Iearly",
+      "-Ilate",
+      "-c",
+      "source.c"
+    ]
+  }
+]

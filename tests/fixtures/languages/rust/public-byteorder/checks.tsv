@@ -1,0 +1,4 @@
+symbol	extend_sign	src/lib.rs:88
+definition	src/lib.rs:632:9	src/lib.rs:88:4	resolved
+references	src/lib.rs:88:4	src/lib.rs:632:9	resolved
+callers	src/lib.rs:88:4	src/lib.rs:632:9	resolved

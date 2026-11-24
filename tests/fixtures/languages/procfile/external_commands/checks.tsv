@@ -1,0 +1,6 @@
+symbol	web	Procfile:1:1
+symbol	worker	Procfile:2:1
+symbol	ghost	-
+definition	Procfile:1:6	-	unresolved
+references	Procfile:2:1	-	resolved
+callers	Procfile:2:1	-	unsupported

@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/jOOQ/sakila",
+  "commit": "e089a5b1ec9af0df7a9c6a5d47d49fa1736a4e84",
+  "evidence": "Checked the eight independent CREATE TABLE actor statements in the repository SQL files. INSERT, DROP, FOREIGN KEY and index mentions are uses. Plain SQL does not support indexed callers."
+}

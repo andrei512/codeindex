@@ -1,0 +1,5 @@
+# ES modules are strict. The const inside the block shadows the outer declaration only on line 4; executing prints inner then outer.
+definition	main.mjs:4:15	main.mjs:3:9	resolved
+definition	main.mjs:6:13	main.mjs:1:10	resolved
+references	main.mjs:1:10	main.mjs:6:13	resolved
+references	main.mjs:3:9	main.mjs:4:15	resolved

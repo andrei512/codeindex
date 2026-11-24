@@ -1,0 +1,4 @@
+symbol	worker	-
+symbol	jobs	Procfile:2:1
+symbol	web	Procfile:1:1
+references	Procfile:2:1	-	resolved

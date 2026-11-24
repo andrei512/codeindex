@@ -25,6 +25,7 @@ impl Bits<'_> {
     }
 }
 struct Huffman {
+    fast: [u16; 256],
     counts: [usize; 16],
     symbols: Vec<usize>,
 }
@@ -43,16 +44,44 @@ impl Huffman {
                 .checked_sub(count)
                 .ok_or_else(|| invalid("oversubscribed Huffman tree"))?
         }
-        let symbols = (1..=15)
-            .flat_map(|len| {
-                lens.iter()
-                    .enumerate()
-                    .filter_map(move |(i, &v)| (v == len).then_some(i))
-            })
-            .collect();
-        Ok(Self { counts, symbols })
+        let mut starts = [0usize; 16];
+        let mut first = [0usize; 16];
+        for n in 2..=15 {
+            starts[n] = starts[n - 1] + counts[n - 1];
+            first[n] = (first[n - 1] + counts[n - 1]) << 1;
+        }
+        let mut symbols = vec![0; lens.len() - counts[0]];
+        let mut fast = [0; 256];
+        for (symbol, &n) in lens.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            symbols[starts[n]] = symbol;
+            starts[n] += 1;
+            if n <= 8 {
+                let code = (first[n] as u8).reverse_bits() >> (8 - n);
+                for p in (usize::from(code)..fast.len()).step_by(1 << n) {
+                    fast[p] = ((symbol as u16) << 4) | n as u16;
+                }
+            }
+            first[n] += 1;
+        }
+        Ok(Self {
+            fast,
+            counts,
+            symbols,
+        })
     }
     fn read(&self, b: &mut Bits) -> io::Result<usize> {
+        let byte = b.pos >> 3;
+        if let Some(window) = b.data.get(byte..byte + 2) {
+            let key = (u16::from_le_bytes([window[0], window[1]]) >> (b.pos % 8)) as u8;
+            let entry = self.fast[key as usize];
+            if entry != 0 {
+                b.pos += usize::from(entry & 15);
+                return Ok(usize::from(entry >> 4));
+            }
+        }
         let (mut code, mut first, mut start) = (0, 0, 0);
         for n in 1..=15 {
             code = 2 * code + b.read(1)?;
@@ -106,8 +135,8 @@ fn dynamic(bits: &mut Bits) -> io::Result<(Huffman, Huffman)> {
 fn block(
     bits: &mut Bits,
     out: &mut Vec<u8>,
-    codes: Huffman,
-    dist: Huffman,
+    codes: &Huffman,
+    dist: &Huffman,
     limit: usize,
 ) -> io::Result<()> {
     const BASE: [usize; 29] = [
@@ -183,20 +212,21 @@ pub(super) fn zlib(data: &[u8], size: Option<usize>) -> io::Result<Vec<u8>> {
                 }
             }
             1 => {
-                let mut lens = [8; 288];
-                lens[144..256].fill(9);
-                lens[256..280].fill(7);
-                block(
-                    &mut bits,
-                    &mut out,
-                    Huffman::new(&lens)?,
-                    Huffman::new(&[5; 32])?,
-                    limit,
-                )?
+                static FIXED: std::sync::OnceLock<(Huffman, Huffman)> = std::sync::OnceLock::new();
+                let (codes, dist) = FIXED.get_or_init(|| {
+                    let mut lens = [8; 288];
+                    lens[144..256].fill(9);
+                    lens[256..280].fill(7);
+                    (
+                        Huffman::new(&lens).unwrap(),
+                        Huffman::new(&[5; 32]).unwrap(),
+                    )
+                });
+                block(&mut bits, &mut out, codes, dist, limit)?
             }
             2 => {
                 let (code, dist) = dynamic(&mut bits)?;
-                block(&mut bits, &mut out, code, dist, limit)?
+                block(&mut bits, &mut out, &code, &dist, limit)?
             }
             _ => return Err(invalid("reserved deflate block")),
         }
@@ -221,4 +251,35 @@ pub(super) fn zlib(data: &[u8], size: Option<usize>) -> io::Result<Vec<u8>> {
         return Err(invalid("Git tree checksum or size mismatch"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_table_entries_and_long_fallback_agree_at_every_bit_offset() {
+        let lengths = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15];
+        let encoder = Huffman::new(&lengths).unwrap();
+        for (symbol, &length) in lengths.iter().enumerate() {
+            let code = if symbol + 1 == lengths.len() {
+                (1usize << length) - 1
+            } else {
+                (1usize << length) - 2
+            };
+            for skip in 0..8 {
+                let mut buf = [0u8; 4];
+                for i in 0..length {
+                    buf[(skip + i) / 8] |=
+                        (((code >> (length - 1 - i)) & 1) as u8) << ((skip + i) % 8);
+                }
+                let mut bits = Bits {
+                    data: &buf,
+                    pos: skip,
+                };
+                assert_eq!(encoder.read(&mut bits).unwrap(), symbol);
+                assert_eq!(bits.pos, skip + length);
+            }
+        }
+    }
 }

@@ -1,0 +1,5 @@
+symbol	inventory	schema.sql:1
+symbol	phantom	-
+callers	schema.sql:1:14	-	unsupported
+definition	schema.sql:1:14	-	unindexed
+references	schema.sql:1:14	-	unindexed

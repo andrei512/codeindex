@@ -1,0 +1,4 @@
+# verify is directly declared and invoked in the same script. Other benchmark scripts are separate PHP programs.
+definition	brainfuck/bf.php:136:1	brainfuck/bf.php:121:10	resolved
+references	brainfuck/bf.php:121:10	brainfuck/bf.php:136:1	resolved
+callers	brainfuck/bf.php:121:10	brainfuck/bf.php:136:1	resolved

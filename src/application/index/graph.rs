@@ -1,6 +1,8 @@
 use super::binary::{Decoder, bad, put, string};
-use crate::domain::code::{Names, Site, Unit};
-use std::{collections::BTreeMap, io, ops::Range};
+use super::layout::ExtentSink;
+use crate::domain::code::{ForwardNames, Site, Unit};
+use std::io::Write;
+use std::{io, ops::Range};
 
 pub struct Decl {
     pub file: usize,
@@ -16,17 +18,25 @@ pub struct Use {
     pub owner: Option<usize>,
     pub targets: Vec<usize>,
 }
+pub fn declaration_bases(units: &[Unit<'_>]) -> Vec<usize> {
+    let mut next = 0;
+    units
+        .iter()
+        .map(|unit| {
+            let start = next;
+            next += unit.analysis.declarations.len();
+            start
+        })
+        .collect()
+}
+
 pub fn encode_symbols(
     units: &[Unit<'_>],
-    names: &Names,
+    names: &ForwardNames,
+    base: &[usize],
     symbols: &mut impl super::layout::ExtentSink,
-) -> io::Result<Vec<usize>> {
-    let mut base = Vec::new();
-    let mut n = 0;
-    for u in units {
-        base.push(n);
-        n += u.analysis.declarations.len();
-    }
+) -> io::Result<()> {
+    let n: usize = units.iter().map(|u| u.analysis.declarations.len()).sum();
     let start = symbols.offset();
     let mut decl_offsets = Vec::with_capacity(n + 1);
     put(symbols, n)?;
@@ -49,7 +59,8 @@ pub fn encode_symbols(
     }
     // Reopened name lookup directories select declaration ordinals.
     decl_offsets.push(symbols.offset() - start);
-    let ordered: BTreeMap<_, _> = names.by_name.iter().collect();
+    let mut ordered: Vec<_> = names.by_name.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut name_offsets = Vec::with_capacity(ordered.len() + 1);
     put(symbols, ordered.len())?;
     for (name, sites) in ordered {
@@ -61,57 +72,72 @@ pub fn encode_symbols(
         }
     }
     name_offsets.push(symbols.offset() - start);
-    super::public_labels::write(symbols, start, &base, &names.public_labels)?;
+    super::public_labels::write(symbols, start, base, &names.public_labels)?;
     super::offsets::finish(symbols, start, [decl_offsets, name_offsets])?;
-    Ok(base)
+    Ok(())
 }
 pub fn encode_relations(
     units: &[Unit<'_>],
-    names: &Names,
+    names: &ForwardNames,
     base: &[usize],
-    rel: &mut impl super::layout::ExtentSink,
+    rel: &mut Vec<u8>,
 ) -> io::Result<()> {
     let start = rel.offset();
-    let mut uses = Vec::new();
-    let mut incoming = Vec::new();
-    let n = units.iter().map(|u| u.analysis.declarations.len()).sum();
-    put(rel, units.iter().map(|u| u.analysis.calls.len()).sum())?;
-    let mut call_base = Vec::with_capacity(units.len());
-    let mut call_index = 0;
+    let n: usize = units.iter().map(|u| u.analysis.declarations.len()).sum();
+    let calls: usize = units.iter().map(|u| u.analysis.calls.len()).sum();
+    let mut uses = Vec::with_capacity(calls + 1);
+    let mut incoming = Vec::with_capacity(n + 1);
+    // Count dense reverse rows once, then scatter in canonical call order.
+    let mut cursor = vec![0usize; n];
+    for targets in names.all_rows() {
+        for t in targets {
+            cursor[base[t.file] + t.local] += 1;
+        }
+    }
+    let mut next = 0;
+    for count in &mut cursor {
+        let len = *count;
+        *count = next;
+        next += len;
+    }
+    // Each use contributes 41 record bytes and one 8-byte offset. Each
+    // declaration owns a reverse-list length and offset. Each edge appears
+    // in both directions. The seven remaining words are counts and sentinels.
+    let size = calls
+        .saturating_mul(49)
+        .saturating_add(n.saturating_mul(16))
+        .saturating_add(next.saturating_mul(16))
+        .saturating_add(56);
+    rel.try_reserve_exact(size).map_err(io::Error::other)?;
+    let mut reverse = vec![0u64; next];
+    put(rel, calls)?;
     for (file, u) in units.iter().enumerate() {
-        call_base.push(call_index);
         for (local, c) in u.analysis.calls.iter().enumerate() {
+            let call_index = uses.len() as u64;
             uses.push(rel.offset() - start);
-            call_index += 1;
             put(rel, file)?;
             put(rel, c.span.start)?;
             put(rel, c.span.end)?;
             rel.write_all(&[u8::from(c.is_call)])?;
             put(rel, c.owner.map_or(0, |i| base[file] + i + 1))?;
-            let targets = names
-                .targets
-                .get(&Site { file, local })
-                .map_or(&[][..], Vec::as_slice);
+            let targets = names.row(Site { file, local });
             put(rel, targets.len())?;
             for t in targets {
-                put(rel, base[t.file] + t.local)?;
+                let id = base[t.file] + t.local;
+                put(rel, id)?;
+                reverse[cursor[id]] = call_index;
+                cursor[id] += 1;
             }
         }
     }
     uses.push(rel.offset() - start);
     put(rel, n)?;
-    for (file, u) in units.iter().enumerate() {
-        for local in 0..u.analysis.declarations.len() {
-            incoming.push(rel.offset() - start);
-            let calls = names
-                .incoming
-                .get(&Site { file, local })
-                .map_or(&[][..], Vec::as_slice);
-            put(rel, calls.len())?;
-            for c in calls {
-                put(rel, call_base[c.file] + c.local)?;
-            }
-        }
+    let mut begin = 0;
+    for stop in cursor {
+        incoming.push(rel.offset() - start);
+        put(rel, stop - begin)?;
+        super::offsets::write_words(rel, &reverse[begin..stop])?;
+        begin = stop;
     }
     incoming.push(rel.offset() - start);
     super::offsets::finish(rel, start, [uses, incoming])?;

@@ -217,7 +217,7 @@ pub(super) fn method_body(t: &[Token], end: &[usize], close: usize) -> Option<us
         while p < t.len() {
             match tok(t, p) {
                 "{" => break,
-                ";" | "}" | "," | ")" => return None,
+                ";" | "}" | "," | ")" | "export" | "declare" | "function" => return None,
                 "=" if tok(t, p + 1) != ">" => return None,
                 "(" | "[" => p = end[p],
                 "<" => p = angle_end(t, p)?,

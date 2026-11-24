@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/mit-pdos/xv6-riscv.git",
+  "commit": "fa2ddcb7ca87a77af579380a6eafd5aff163b44f",
+  "evidence": "The RISC-V assembly entry point and the terminal spin loop each have exactly one written label in this tree. Linker script references and cross-language bindings are outside this case."
+}

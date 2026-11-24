@@ -1,0 +1,3 @@
+# Clang accepts both programs. The call has one written same-file target.
+definition	sample.cpp:2:25	sample.cpp:1:13	resolved
+references	sample.cpp:1:13	sample.cpp:2:25	resolved

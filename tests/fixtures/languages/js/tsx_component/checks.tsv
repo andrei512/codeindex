@@ -1,0 +1,3 @@
+symbol	Chip	view.tsx:2
+definition	view.tsx:3:29	view.tsx:2:10	resolved
+references	view.tsx:2:10	view.tsx:3:29	resolved

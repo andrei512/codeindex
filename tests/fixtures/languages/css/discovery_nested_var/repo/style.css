@@ -1,0 +1,6 @@
+:root { --paint: red; }
+.card {
+  color: var(--absent, var(--paint));
+  content: "var(--paint)";
+}
+/* .phantom { color: var(--paint) } */

@@ -73,7 +73,7 @@ impl Entry {
             n => self.line_ends.get(n - 2).copied(),
         }
     }
-    fn write(&self, w: &mut impl Write) -> io::Result<()> {
+    fn write_with_lines(&self, w: &mut impl Write, ends: &[usize]) -> io::Result<()> {
         string(w, self.path())?;
         for s in self.observation.stamp {
             w.write_all(&s.to_le_bytes())?;
@@ -89,8 +89,8 @@ impl Entry {
             w.write_all(&[blob.len])?;
             w.write_all(blob.as_bytes())?;
         }
-        put(w, self.line_ends.len())?;
-        for &end in &self.line_ends {
+        put(w, ends.len())?;
+        for &end in ends {
             put(w, end)?;
         }
         Ok(())

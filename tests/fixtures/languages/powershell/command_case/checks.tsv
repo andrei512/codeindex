@@ -1,0 +1,4 @@
+symbol	Save-Item	app.ps1:1
+definition	app.ps1:2:27	app.ps1:1:10	resolved
+references	app.ps1:1:10	app.ps1:2:27	resolved
+callers	app.ps1:1:10	app.ps1:2:27	resolved

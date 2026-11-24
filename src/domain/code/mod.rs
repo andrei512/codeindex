@@ -3,7 +3,9 @@
 //! are never added to the target set of a call.
 mod cache;
 mod cfamily;
+pub(crate) use cfamily::{project::CProject, sdk::Receipt as CReceipt};
 mod direct;
+mod extended;
 mod lexer;
 mod markup;
 mod rust;
@@ -27,11 +29,39 @@ pub enum Language {
     Css,
     Html,
     Sql,
+    Go,
+    Java,
+    Kotlin,
+    ObjectiveC,
+    Dart,
+    Php,
+    Hack,
+    Dockerfile,
+    Makefile,
+    Batchfile,
+    CMake,
+    Procfile,
+    Hcl,
+    Nix,
+    Ruby,
+    Lua,
+    Perl,
+    Assembly,
+    Mako,
+    PlPgSql,
 }
 
 impl Language {
     pub fn for_path(path: &str) -> Option<Self> {
         let p = Path::new(path);
+        let name = p.file_name()?.to_str()?;
+        match name.split('.').next()? {
+            "Dockerfile" | "Containerfile" => return Some(Self::Dockerfile),
+            "Makefile" | "makefile" | "GNUmakefile" => return Some(Self::Makefile),
+            "Procfile" => return Some(Self::Procfile),
+            _ => {}
+        }
+        if name == "CMakeLists.txt" { return Some(Self::CMake); }
         Some(match p.extension().or_else(|| p.file_name())?.to_str()? {
             "rs" => Self::Rust,
             "ts" | "tsx" | "cts" | "mts" | "js" | "jsx" | "mjs" | "cjs" => Self::Js,
@@ -47,13 +77,34 @@ impl Language {
             "css" => Self::Css,
             "html" | "htm" => Self::Html,
             "sql" => Self::Sql,
+            "java" => Self::Java,
+            "kt" | "kts" => Self::Kotlin,
+            "go" => Self::Go,
+            "dart" => Self::Dart,
+            "m" => Self::ObjectiveC,
+            "php" | "phtml" => Self::Php,
+            "hack" | "hhi" => Self::Hack,
+            "rb" | "rake" | "gemspec" | "Gemfile" | "Rakefile" => Self::Ruby,
+            "lua" => Self::Lua,
+            "pl" | "pm" => Self::Perl,
+            "asm" | "s" | "S" => Self::Assembly,
+            "mako" | "mao" => Self::Mako,
+            "plpgsql" | "pgsql" => Self::PlPgSql,
+            "mk" | "mak" => Self::Makefile,
+            "dockerfile" => Self::Dockerfile,
+            "cmd" | "bat" => Self::Batchfile,
+            "cmake" => Self::CMake,
+            "hcl" | "tf" | "tfvars" => Self::Hcl,
+            "nix" => Self::Nix,
+
             _ => return None,
         })
     }
     fn line_comment(self, t: &str) -> bool {
         match self {
-            Self::Python | Self::Starlark | Self::Shell | Self::Powershell => t.starts_with('#'),
-            Self::Sql => t.starts_with("--"),
+            Self::Python | Self::Starlark | Self::Shell | Self::Powershell | Self::Ruby | Self::Perl | Self::Nix | Self::Dockerfile | Self::Makefile | Self::CMake => t.starts_with('#'),
+            Self::Sql | Self::PlPgSql | Self::Lua => t.starts_with("--"),
+            Self::Php | Self::Hack | Self::Hcl => t.starts_with("//") || t.starts_with('#'),
             Self::Css | Self::Html => false,
             _ => t.starts_with("//"),
         }
@@ -69,7 +120,8 @@ impl Language {
                 | Self::Cpp
                 | Self::Proto
                 | Self::Css
-                | Self::Sql
+                | Self::Sql | Self::Java | Self::Kotlin | Self::Dart | Self::Php | Self::Hack
+                | Self::ObjectiveC | Self::Go | Self::Hcl | Self::PlPgSql | Self::Nix
         )
     }
 
@@ -141,6 +193,7 @@ fn indentation(text: &str, start: usize) -> usize {
 }
 
 pub fn analyze(lang: Language, text: &str) -> Analysis {
+    if let Some(facts) = extended::analyze(lang, text) { return facts; }
     if lang == Language::Html {
         return markup::html(text);
     }
@@ -148,6 +201,7 @@ pub fn analyze(lang: Language, text: &str) -> Analysis {
         return direct::analyze_shell(text);
     }
     let t = lexer::tokens(text, lang);
+    if lang == Language::Powershell { return direct::powershell::analyze(text, &t); }
     if lang == Language::Proto {
         return direct::analyze_proto(&t);
     }
@@ -161,7 +215,13 @@ pub fn analyze(lang: Language, text: &str) -> Analysis {
         return markup::css(&t);
     }
     if lang == Language::Sql {
-        return markup::sql(&t);
+        let mut facts = markup::sql(&t);
+        if t.windows(2).any(|pair| pair[0].text.eq_ignore_ascii_case("language")
+            && pair[1].text.trim_matches(['\'', '"']).eq_ignore_ascii_case("plpgsql"))
+        {
+            extended::sql_routines(text, &mut facts);
+        }
+        return facts;
     }
     if lang == Language::Rust {
         return rust::analyze(&t, text.len());
@@ -271,12 +331,28 @@ pub struct Site {
     pub file: usize,
     pub local: usize,
 }
+/// Resolved names and relationships, keyed by source sites.
+///
+/// ```
+/// use codeindex::domain::code::Names;
+///
+/// let names = Names { targets: Default::default(), ..Default::default() };
+/// assert!(names.targets.is_empty());
+/// ```
 #[derive(Default)]
 pub struct Names {
     pub public_labels: HashMap<Site, String>,
     pub by_name: HashMap<String, Vec<Site>>,
     pub incoming: HashMap<Site, Vec<Site>>,
     pub targets: HashMap<Site, Vec<Site>>,
+}
+
+#[derive(Default)]
+pub(crate) struct ForwardNames {
+    pub(crate) public_labels: HashMap<Site, String>,
+    pub(crate) by_name: HashMap<String, Vec<Site>>,
+    targets: HashMap<Site, Vec<Site>>,
+    rows: Vec<Vec<Site>>,
 }
 
 pub struct Unit<'a> {
@@ -310,18 +386,73 @@ impl Names {
     /// affect binding or exported labels. All other units contribute only paths.
     pub(crate) fn consumes_text(path: &str) -> bool {
         let p = Path::new(path);
-        Language::for_path(path).is_some() || path == "pyproject.toml" ||
+        Language::for_path(path).is_some() || path.ends_with(".csproj") || path == "pyproject.toml" ||
             match p.file_name().and_then(|name| name.to_str()) {
-                Some("Cargo.toml" | "package.json" | "tsconfig.json") => true,
+                Some("compile_commands.json" | "Cargo.toml" | "package.json" | "tsconfig.json" | "Directory.Build.props" | "Directory.Build.targets") => true,
                 Some("config" | "config.toml") => p.parent().and_then(Path::file_name)
                     .is_some_and(|name| name == ".cargo"),
                 _ => false,
             }
     }
+}
+
+impl ForwardNames {
+    const EMPTY: Site = Site { file: usize::MAX, local: 0 };
+    const MANY: Site = Site { file: usize::MAX, local: 1 };
+
+    pub(crate) fn row(&self, site: Site) -> &[Site] {
+        if self.rows.is_empty() {
+            return self.targets.get(&site).map_or(&[], Vec::as_slice);
+        }
+        let slot = &self.rows[site.file][site.local];
+        match *slot {
+            Self::EMPTY => &[],
+            Self::MANY => &self.targets[&site],
+            _ => std::slice::from_ref(slot),
+        }
+    }
+
+    pub(crate) fn all_rows(&self) -> impl Iterator<Item = &[Site]> {
+        self.rows.iter().enumerate().flat_map(move |(file, rows)| {
+            rows.iter().enumerate().map(move |(local, _)| self.row(Site {file,local}))
+        })
+    }
+
+    fn bind_one(&mut self, source: Site, target: Site) {
+        if let Some(file) = self.rows.get_mut(source.file) {
+            let slot = &mut file[source.local];
+            if *slot == Self::EMPTY || *slot == target {
+                *slot = target;
+                return;
+            }
+        }
+        self.bind(source, vec![target]);
+    }
 
     fn bind(&mut self, site: Site, mut targets: Vec<Site>) {
         if targets.is_empty() {
             return;
+        }
+        if !self.rows.is_empty() {
+            let slot = &mut self.rows[site.file][site.local];
+            if *slot == Self::EMPTY && targets.len() == 1 {
+                *slot = targets[0];
+                return;
+            }
+            if *slot != Self::MANY {
+                if *slot != Self::EMPTY {
+                    targets.push(*slot);
+                }
+                targets.sort_unstable();
+                targets.dedup();
+                if targets.len() == 1 {
+                    *slot = targets[0];
+                    return;
+                }
+                *slot = Self::MANY;
+                self.targets.insert(site, targets);
+                return;
+            }
         }
         targets.sort_unstable();
         targets.dedup();
@@ -338,8 +469,12 @@ impl Names {
         }
     }
 
-    pub fn build(units: &[Unit<'_>]) -> Self {
-        let mut names = Self::default();
+    pub(crate) fn forward(units: &[Unit<'_>]) -> Self {
+        let rows = units.iter().map(|u| vec![Self::EMPTY; u.analysis.calls.len()]).collect();
+        Self::resolve(units, Self { rows, ..Self::default() })
+    }
+
+    fn resolve(units: &[Unit<'_>], mut names: Self) -> Self {
         let paths: HashMap<_, _> = units.iter().enumerate().map(|(i, u)| (u.path, i)).collect();
         for (file, u) in units.iter().enumerate() {
             for (local, d) in u.analysis.declarations.iter().enumerate() {
@@ -356,6 +491,7 @@ impl Names {
             }
         }
         direct::resolve(units, &paths, &mut names);
+        cfamily::csharp::resolve(units, &paths, &mut names);
         rust::resolve(units, &paths, &mut names);
         script::resolve(units, &paths, &mut names);
         script::public_labels(units, &mut names.public_labels);
@@ -372,7 +508,11 @@ impl Names {
                     targets.iter().map(|&local| Site { file, local }).collect(),
                 );
             }
-            if matches!(
+            if lang == Language::Powershell {
+                direct::powershell::resolve(file, units, &paths, &mut names);
+                continue;
+            }
+            if lang == Language::Sql || lang.extended_name().is_some() || matches!(
                 lang,
                 Language::Rust
                     | Language::Python
@@ -402,6 +542,21 @@ impl Names {
                 names.bind(call, targets);
             }
         }
+        names
+    }
+}
+
+impl Names {
+    pub fn build(units: &[Unit<'_>]) -> Self {
+        // Public callers may edit the call list after parsing. Sparse targets
+        // can retain embedded bindings whose source index is outside that list.
+        let forward = ForwardNames::resolve(units, ForwardNames::default());
+        let mut names = Self {
+            public_labels: forward.public_labels,
+            by_name: forward.by_name,
+            targets: forward.targets,
+            incoming: HashMap::new(),
+        };
         // Derive the reverse directory from the complete forward relation.
         // Site order is canonical across worker orders and randomized hash seeds.
         for (file, u) in units.iter().enumerate() {
@@ -430,5 +585,29 @@ impl Analysis{
     }
 
 pub(crate) fn encode(&self,w:&mut Vec<u8>){ use cache::Wire;self.save(w); }
+pub(crate) fn encode_bounded(&self, w: &mut cache::BoundedOutput) {
+    use cache::Wire;
+    self.save(w);
+}
 pub(crate) fn decode(r:&mut &[u8])->std::io::Result<Self>{use cache::Wire; Self::load(r)}
+}
+
+pub(crate) use cache::BoundedOutput;
+
+#[cfg(test)]
+mod public_bindings_tests {
+    use super::*;
+
+    #[test]
+    fn filtered_public_calls_preserve_embedded_targets() {
+        let text = ":root { --x: red; } a { color: var(--x); }";
+        let mut analysis = analyze(Language::Css, text);
+        let build = |analysis: &Analysis| Names::build(&[Unit { path: "style.css", text, analysis }]);
+        let original = build(&analysis);
+        assert!(!original.targets.is_empty());
+        analysis.calls.clear();
+        let filtered = build(&analysis);
+        assert_eq!(filtered.targets, original.targets);
+        assert!(filtered.incoming.is_empty());
+    }
 }

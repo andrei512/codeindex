@@ -1,0 +1,7 @@
+# protoc descriptor type_name fields identify .alpha.Parcel and .beta.Parcel. The archived projection emits one full-path site and another at its trailing identifier; both rows below must point to the same imported declaration.
+# protoc -I. --include_source_info --descriptor_set_out=out.pb envelope.proto produces type_name .alpha.Parcel for first and .beta.Parcel for second.
+symbol	Parcel	alpha.proto:3:9,beta.proto:3:9
+definition	envelope.proto:6:3	alpha.proto:3:9	resolved
+definition	envelope.proto:7:3	beta.proto:3:9	resolved
+references	alpha.proto:3:9	envelope.proto:6:3,envelope.proto:6:9	resolved
+references	beta.proto:3:9	envelope.proto:7:3,envelope.proto:7:8	resolved

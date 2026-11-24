@@ -1,0 +1,4 @@
+definition	work.plpgsql:6:10	work.plpgsql:4:5	resolved
+references	work.plpgsql:2:3	-	resolved
+references	work.plpgsql:4:5	work.plpgsql:6:10	resolved
+references	work.plpgsql:11:3	work.plpgsql:13:8	resolved

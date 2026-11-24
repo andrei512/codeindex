@@ -1,0 +1,5 @@
+# IF conditions affect whether execution reaches CALL. Its written literal target is still render. REM's operand is comment text.
+symbol	render	run.cmd:6:2
+definition	run.cmd:3:22	run.cmd:6:2	resolved
+references	run.cmd:6:2	run.cmd:3:22	resolved
+callers	run.cmd:6:2	run.cmd:3:22	resolved

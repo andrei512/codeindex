@@ -3,6 +3,13 @@
 //! its lexical parents or an explicit receiver. Unproved dispatch remains unresolved.
 use super::{Analysis, Call, Declaration, Kind, Language, Token};
 use std::collections::HashMap;
+mod directives;
+mod owner_macro;
+mod condition;
+mod standard;
+pub(crate) mod sdk;
+pub(crate) mod project;
+pub(super) mod csharp;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
@@ -17,6 +24,8 @@ struct Binding<'a> {
     visible: usize,
     body: Option<usize>,
     ty: Option<&'a str>,
+    is_const: bool,
+    definition: bool,
     signature: Option<Vec<(&'a str, Option<&'a str>)>>,
     usable: bool,
 }
@@ -24,8 +33,10 @@ struct Binding<'a> {
 struct Scope<'a> {
     parent: Option<usize>,
     owner: Option<usize>,
+    const_receiver: bool,
     container: Option<usize>,
     bindings: HashMap<&'a str, Vec<Binding<'a>>>,
+    external_owners: HashMap<std::borrow::Cow<'a, str>, usize>,
 }
 struct Analyzer<'a, 't> {
     lang: Language,
@@ -37,6 +48,7 @@ struct Analyzer<'a, 't> {
     body: HashMap<usize, usize>,
     skip: Vec<bool>,
     declared: Vec<bool>,
+    macro_owners: HashMap<usize, String>,
 }
 fn ident(t: &Token) -> bool {
     t.kind == Kind::Word && t.text.starts_with(|c: char| c == '_' || c.is_alphabetic())
@@ -152,6 +164,9 @@ fn primitive(s: &str) -> bool {
     )
 }
 impl<'a, 't> Analyzer<'a, 't> {
+    fn is_keyword(&self, name: &str) -> bool {
+        keyword(name) && !(self.lang == Language::Cpp && matches!(name, "get" | "set"))
+    }
     fn word(&self, i: usize) -> &'a str {
         self.t.get(i).map_or("", |t| t.text)
     }
@@ -187,6 +202,7 @@ impl<'a, 't> Analyzer<'a, 't> {
             body: HashMap::new(),
             skip: vec![false; n],
             declared: vec![false; n],
+            macro_owners: HashMap::new(),
         }
     }
     fn scope(&mut self, parent: usize, owner: Option<usize>) -> usize {
@@ -195,6 +211,7 @@ impl<'a, 't> Analyzer<'a, 't> {
             parent: Some(parent),
             owner: owner.or(self.scopes[parent].owner),
             container: self.scopes[parent].container,
+            const_receiver: self.scopes[parent].const_receiver,
             ..Scope::default()
         });
         id
@@ -248,6 +265,8 @@ impl<'a, 't> Analyzer<'a, 't> {
                 role,
                 visible,
                 ty: None,
+                is_const: false,
+                definition: false,
                 body: None,
                 signature: None,
                 usable: true,
@@ -306,6 +325,20 @@ impl<'a, 't> Analyzer<'a, 't> {
             }
             j = j.checked_sub(1)?
         }
+        if self.word(j) == ">" && matches!(self.lang, Language::Cpp | Language::Csharp) {
+            let mut depth = 1;
+            while depth > 0 {
+                j = j.checked_sub(1)?;
+                match self.word(j) {
+                    ">" => depth += 1,
+                    "<" => depth -= 1,
+                    ";" | "{" | "}" => return None,
+                    _ => {}
+                }
+            }
+            j = j.checked_sub(1)?;
+            return ident(&self.t[j]).then(|| (self.word(j), true));
+        }
         let ty = self.word(j);
         if self.t.get(j)?.kind != Kind::Word {
             return None;
@@ -328,67 +361,6 @@ impl<'a, 't> Analyzer<'a, 't> {
             return Some((ty, true));
         }
         None
-    }
-    fn directives(&mut self) {
-        let mut i = 0;
-        let mut active = true;
-        let mut stack = vec![];
-        while i < self.t.len() {
-            let line = self.t[i].line;
-            let mut end = i + 1;
-            while end < self.t.len() && self.t[end].line == line {
-                end += 1
-            }
-            if self.word(i) == "#" {
-                self.skip[i..end].fill(true);
-                let command = self.word(i + 1);
-                match command {
-                    "if" | "ifdef" | "ifndef" => {
-                        let lit = if command == "if" {
-                            match self.word(i + 2) {
-                                "1" if i + 3 == end => Some(true),
-                                "0" if i + 3 == end => Some(false),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        stack.push((active, lit));
-                        active = active && lit == Some(true)
-                    }
-                    "else" => {
-                        if let Some(&(parent, lit)) = stack.last() {
-                            active = parent && lit == Some(false)
-                        }
-                    }
-                    "elif" => {
-                        if let Some((parent, taken)) = stack.last_mut() {
-                            let next = match self.word(i + 2) {
-                                "1" if i + 3 == end => Some(true),
-                                "0" if i + 3 == end => Some(false),
-                                _ => None,
-                            };
-                            active = *parent && *taken == Some(false) && next == Some(true);
-                            if *taken == Some(false) {
-                                *taken = next
-                            }
-                        }
-                    }
-                    "endif" => {
-                        if let Some((parent, _)) = stack.pop() {
-                            active = parent
-                        }
-                    }
-                    "define" if active && self.t.get(i + 2).is_some_and(ident) => {
-                        self.add(i + 2, 0, "local_binding", Role::Value);
-                    }
-                    _ => {}
-                }
-            } else if !active {
-                self.skip[i..end].fill(true)
-            }
-            i = end;
-        }
     }
     fn container(&mut self, i: usize, scope: usize, prev: &str) -> bool {
         let (kind, role) = match (self.lang, prev) {
@@ -477,11 +449,61 @@ impl<'a, 't> Analyzer<'a, 't> {
         }
         true
     }
-    fn function(&mut self, i: usize, scope: usize) -> bool {
+    fn has_written_return(&self, name: usize) -> bool {
+        let mut start = name;
+        while start > 0 && matches!(self.prev(start), "*" | "&" | "const" | "volatile") {
+            start -= 1;
+        }
+        let Some(mut j) = start.checked_sub(1) else {
+            return false;
+        };
+        if self.word(j) == ")" {
+            // Function-like annotations often wrap the return type.
+            let Some(annotation) = self.pairs[j].checked_sub(1) else {
+                return false;
+            };
+            if annotation >= j {
+                return false;
+            }
+            j = annotation;
+        }
+        ident(&self.t[j]) && !keyword(self.word(j))
+    }
+    fn external_owner(&self, mut scope: usize, name: &str) -> Option<usize> {
+        loop {
+            if let Some(owner) = self.scopes[scope].external_owners.get(name) {
+                return Some(*owner);
+            }
+            scope = self.scopes[scope].parent?;
+        }
+    }
+    fn function(&mut self, i: usize, enclosing: usize) -> bool {
+        let destructor = self.lang == Language::Cpp && self.prev(i) == "~";
+        let qualified_end = if destructor { i - 1 } else { i };
+        let mut declarator = qualified_end;
+        if self.lang == Language::Cpp {
+            while declarator >= 3
+                && self.prev(declarator) == ":"
+                && self.word(declarator - 2) == ":"
+            {
+                declarator -= 3;
+            }
+        }
         let prev = self.prev(i);
         let open = i + 1;
         if self.word(open) != "(" || self.pairs[open] >= self.t.len() {
             return false;
+        }
+        let macro_owner = if self.lang == Language::Cpp
+            && declarator == qualified_end
+            && declarator > 0
+        {
+            self.macro_owners.remove(&(declarator - 1))
+        } else {
+            None
+        };
+        if macro_owner.is_some() {
+            declarator -= 1;
         }
         let close = self.pairs[open];
         let mut body = close + 1;
@@ -493,13 +515,42 @@ impl<'a, 't> Analyzer<'a, 't> {
                 body = self.delimit(body, &["{", "}", ";", "func"])
             }
         } else {
-            let constructor = self.scopes[scope].container == Some(scope)
-                && self.scopes[scope].parent.is_some_and(|p| {
-                    self.lookup(p, self.word(i), Some(Role::Type), i)
-                        .iter()
-                        .any(|b| b.body == Some(scope))
-                });
-            if self.declared_type(i, scope).is_none() && !constructor {
+            let scope = enclosing;
+            let constructor = macro_owner.as_deref() == Some(self.word(i))
+                || (macro_owner.is_none() && declarator < qualified_end
+                    && self.word(qualified_end - 3) == self.word(i))
+                || self.scopes[scope].container == Some(scope)
+                    && self.scopes[scope].parent.is_some_and(|p| {
+                        self.lookup(p, self.word(i), Some(Role::Type), i)
+                            .iter()
+                            .any(|b| b.body == Some(scope))
+                    });
+            if constructor && self.word(body) == ":" {
+                let mut j = body + 1;
+                loop {
+                    j = self.delimit(j, &["(", "{", ";", "}"]);
+                    if !matches!(self.word(j), "(" | "{") || self.pairs[j] >= self.t.len() {
+                        return false;
+                    }
+                    j = self.pairs[j] + 1;
+                    if self.word(j) == "{" {
+                        body = j;
+                        break;
+                    }
+                    if self.word(j) != "," {
+                        return false;
+                    }
+                    j += 1;
+                }
+            }
+            let typed = self.declared_type(declarator, enclosing).is_some();
+            // At namespace/file scope a body after a parameter list establishes a
+            // function even when the return typedef or annotation comes from a header.
+            let written_return = matches!(self.lang, Language::C | Language::Cpp)
+                && self.scopes[enclosing].owner.is_none()
+                && matches!(self.word(body), "{" | "const" | "noexcept")
+                && self.has_written_return(declarator);
+            if !typed && !written_return && !constructor {
                 return false;
             }
             if matches!(
@@ -514,6 +565,55 @@ impl<'a, 't> Analyzer<'a, 't> {
             self.lang == Language::Csharp && self.word(body) == "=" && self.word(body + 1) == ">";
         if !has_body && !arrow && self.word(body) != ";" && self.lang != Language::Swift {
             return false;
+        }
+        let scope = if let Some(name) = macro_owner {
+            if !has_body || self.scopes[enclosing].owner.is_some() {
+                return false;
+            }
+            let Some(owner) = self.macro_owner_scope(enclosing, name, i) else {
+                return false;
+            };
+            owner
+        } else if declarator == qualified_end {
+            enclosing
+        } else if let Some(Some(scope)) = self.receiver(qualified_end, enclosing) {
+            scope
+        } else if has_body && self.scopes[enclosing].owner.is_none() {
+            // Out-of-class definitions can introduce an owner known only in a
+            // header. Keep the scope without manufacturing a type declaration.
+            let mut scope = enclosing;
+            for part in (declarator..qualified_end).step_by(3) {
+                let name = self.word(part);
+                if !ident(&self.t[part]) {
+                    return false;
+                }
+                if let Some(body) = self.scopes[scope]
+                    .bindings
+                    .get(name)
+                    .and_then(|bs| bs.iter().find_map(|b| b.body))
+                    .or_else(|| self.scopes[scope].external_owners.get(name).copied())
+                {
+                    scope = body;
+                } else {
+                    let body = self.scope(scope, None);
+                    self.scopes[body].container = Some(body);
+                    self.scopes[scope].external_owners.insert(name.into(), body);
+                    scope = body;
+                }
+            }
+            scope
+        } else {
+            return false;
+        };
+        if self.lang == Language::Cpp
+            && !has_body
+            && self.scopes[scope].owner.is_some()
+            && self.parameters(open).iter().any(|&(lo, hi)| {
+                self.arg_type(scope, lo, hi).is_some()
+                    || (lo..hi).any(|j| matches!(self.word(j), "!" | "+" | "." | "/"))
+            })
+        {
+            return false; // A value initialized with constructor arguments.
         }
         let kind = match self.lang {
             Language::C | Language::Cpp if !has_body => "local_binding",
@@ -543,19 +643,47 @@ impl<'a, 't> Analyzer<'a, 't> {
                 let param = (lo..end)
                     .rev()
                     .find(|&j| ident(&self.t[j]) && !keyword(self.word(j)) && j > lo);
-                (param, "", Some(self.word(lo)))
+                let type_name = (lo..end)
+                    .find(|&j| {
+                        ident(&self.t[j])
+                            && !matches!(
+                                self.word(j),
+                                "const"
+                                    | "volatile"
+                                    | "ref"
+                                    | "out"
+                                    | "in"
+                                    | "this"
+                                    | "struct"
+                                    | "class"
+                            )
+                    })
+                    .map(|j| self.word(j));
+                let ty = if type_name == Some("char") && (lo..end).any(|j| self.word(j) == "*") {
+                    Some("char*")
+                } else {
+                    type_name
+                };
+                (param, "", ty)
             };
             labels.push((label, ty));
             if let Some(param) = param {
                 self.add(param, local, "parameter", Role::Value);
                 self.binding(param, local).ty = ty;
+                self.binding(param, local).is_const = (lo..end).any(|j| self.word(j) == "const");
             }
         }
-        self.binding(i, scope).signature = Some(labels);
+        let result_type = self.declared_type(declarator, enclosing).map(|(ty, _)| ty);
+        self.scopes[local].const_receiver = self.word(close + 1) == "const";
+        let is_const = self.scopes[local].const_receiver;
+        let binding = self.binding(i, scope);
+        binding.ty = result_type;
+        binding.signature = Some(labels);
+        binding.is_const = is_const;
+        binding.definition = has_body || arrow;
         true
     }
     fn declarations(&mut self) {
-        self.directives();
         let mut scope = 0;
         let mut resume = vec![];
         for i in 0..self.t.len() {
@@ -568,6 +696,12 @@ impl<'a, 't> Analyzer<'a, 't> {
             let w = self.word(i);
             let prev = self.prev(i);
             match w {
+                "{" if self.lang == Language::Cpp && prev == "namespace" => {
+                    // The implicit using-directive makes unnamed namespace members
+                    // available in their enclosing namespace within this file.
+                    resume.push(scope);
+                    continue;
+                }
                 "{" => {
                     resume.push(scope);
                     scope = self
@@ -589,13 +723,19 @@ impl<'a, 't> Analyzer<'a, 't> {
                 }
                 _ => {}
             }
-            if !ident(&self.t[i]) || self.declared[i] || matches!(prev, "." | ">") {
+            if !ident(&self.t[i])
+                || self.declared[i]
+                || (prev == "." || (prev == ">" && (i < 2 || self.word(i - 2) == "-")))
+            {
                 continue;
             }
             if self.container(i, scope, prev) {
                 continue;
             }
-            if keyword(w) && w != "init" && !(self.lang == Language::Swift && prev == "func") {
+            if self.is_keyword(w)
+                && w != "init"
+                && !(self.lang == Language::Swift && prev == "func")
+            {
                 continue;
             }
             if self.function(i, scope) {
@@ -612,7 +752,19 @@ impl<'a, 't> Analyzer<'a, 't> {
                 };
                 ("property_declaration", ty, true)
             } else {
-                if !matches!(self.word(i + 1), "=" | ";" | "," | "[" | "{" | ")") {
+                if self.lang == Language::C && self.word(i + 1) == ";" {
+                    let start = (0..i)
+                        .rev()
+                        .take_while(|&j| !matches!(self.word(j), ";" | "{" | "}"))
+                        .any(|j| self.word(j) == "typedef");
+                    if start {
+                        self.add(i, scope, "local_binding", Role::Type);
+                        continue;
+                    }
+                }
+                if !(matches!(self.word(i + 1), "=" | ";" | "," | "[" | "{" | ")")
+                    || self.lang == Language::Cpp && self.word(i + 1) == "(")
+                {
                     continue;
                 }
                 let Some((ty, complete)) = self.declared_type(i, scope) else {
@@ -632,9 +784,18 @@ impl<'a, 't> Analyzer<'a, 't> {
                     complete,
                 )
             };
+            let ty = if self.lang == Language::Cpp && ty == Some("auto") && self.word(i + 1) == "="
+            {
+                self.initializer_type(i + 2, scope).or(ty)
+            } else {
+                ty
+            };
+            let is_const = self.lang == Language::Cpp
+                && (i.saturating_sub(2)..i).any(|j| self.word(j) == "const");
             self.add(i, scope, kind, Role::Value);
             let b = self.binding(i, scope);
             b.ty = ty;
+            b.is_const = is_const;
             b.usable = usable;
         }
     }
@@ -649,6 +810,14 @@ impl<'a, 't> Analyzer<'a, 't> {
     }
     fn receiver(&self, i: usize, scope: usize) -> Option<Option<usize>> {
         let mut first = self.qualifier(i)?;
+        if self.lang == Language::Cpp && self.word(first) == ")" {
+            let constructor = self.pairs[first].checked_sub(1)?;
+            let choices = self.lookup(scope, self.word(constructor), Some(Role::Type), i);
+            return Some(match choices.as_slice() {
+                [ty] => ty.body,
+                _ => None,
+            });
+        }
         let mut parts = vec![first];
         while let Some(prev) = self.qualifier(first) {
             first = prev;
@@ -673,6 +842,16 @@ impl<'a, 't> Analyzer<'a, 't> {
             } else {
                 self.lookup(scope, name, None, i)
             };
+            if choices.is_empty() {
+                current = if let Some(owner) = current {
+                    self.scopes[owner].external_owners.get(name).copied()
+                } else {
+                    self.external_owner(scope, name)
+                };
+                if current.is_some() {
+                    continue;
+                }
+            }
             if choices.len() != 1 {
                 return Some(None);
             }
@@ -682,6 +861,7 @@ impl<'a, 't> Analyzer<'a, 't> {
                     self.lookup(scope, ty, Some(Role::Type), i)
                         .first()
                         .and_then(|t| t.body)
+                        .or_else(|| self.external_owner(scope, ty))
                 })
             });
             if current.is_none() {
@@ -689,6 +869,29 @@ impl<'a, 't> Analyzer<'a, 't> {
             }
         }
         Some(current)
+    }
+    fn initializer_type(&self, i: usize, scope: usize) -> Option<&'a str> {
+        if self.word(i + 1) != "(" {
+            return None;
+        }
+        let close = self.pairs[i + 1];
+        if self.word(close + 1) == "." && self.word(close + 3) == "(" {
+            let end = self.pairs[close + 3];
+            if self.word(end + 1) != ";" {
+                return None;
+            }
+            let owner = self.receiver(close + 2, scope)??;
+            let bindings = self.scopes[owner].bindings.get(self.word(close + 2))?;
+            let [method] = bindings.as_slice() else {
+                return None;
+            };
+            method.ty
+        } else if self.word(close + 1) == ";" {
+            let bindings = self.lookup(scope, self.word(i), Some(Role::Type), i);
+            (!bindings.is_empty()).then(|| self.word(i))
+        } else {
+            None
+        }
     }
     fn arg_type(&self, scope: usize, lo: usize, hi: usize) -> Option<&'a str> {
         let i = if self.lang == Language::Swift && self.word(lo + 1) == ":" {
@@ -712,6 +915,7 @@ impl<'a, 't> Analyzer<'a, 't> {
                 return match self.lang {
                     Language::Csharp => Some("string"),
                     Language::Swift => Some("String"),
+                    Language::Cpp => Some("char*"),
                     _ => None,
                 };
             }
@@ -735,7 +939,7 @@ impl<'a, 't> Analyzer<'a, 't> {
             if self.skip[i]
                 || self.declared[i]
                 || !ident(&self.t[i])
-                || (keyword(self.word(i))
+                || (self.is_keyword(self.word(i))
                     && !(self.lang == Language::Swift && matches!(self.word(i), "set" | "get")))
             {
                 continue;
@@ -752,7 +956,11 @@ impl<'a, 't> Analyzer<'a, 't> {
                 Some(None) => vec![],
                 None => self.lookup(s, name, None, i),
             };
-            if call {
+            // A call through a parameter names that binding. Its runtime callee
+            // is unknown, so only a lexical reference may enter the index.
+            let parameter_call = call && self.qualifier(i).is_none()
+                && matches!(candidates.as_slice(), [b] if self.out.declarations[b.id].kind == "parameter");
+            if call && !parameter_call {
                 let args = self.parameters(i + 1);
                 candidates.retain(|b| {
                     b.role == Role::Function
@@ -771,6 +979,45 @@ impl<'a, 't> Analyzer<'a, 't> {
                                 })
                         })
                 });
+                if matches!(self.lang, Language::C | Language::Cpp) && candidates.len() > 1 {
+                    // A written prototype and its definition denote the same function.
+                    let definitions: Vec<_> = candidates
+                        .iter()
+                        .filter(|b| b.definition)
+                        .map(|b| (&b.signature, b.is_const))
+                        .collect();
+                    candidates.retain(|b| {
+                        b.definition || !definitions.contains(&(&b.signature, b.is_const))
+                    });
+                }
+                if self.lang == Language::Cpp && candidates.len() > 1 {
+                    let receiver_const = match self.qualifier(i) {
+                        Some(q) if self.word(q) == "this" => Some(self.scopes[s].const_receiver),
+                        Some(q) => match self
+                            .lookup(s, self.word(q), Some(Role::Value), i)
+                            .as_slice()
+                        {
+                            [binding] => Some(binding.is_const),
+                            _ => None,
+                        },
+                        None if self.scopes[s].container.is_some() => {
+                            Some(self.scopes[s].const_receiver)
+                        }
+                        None => None,
+                    };
+                    match receiver_const {
+                        Some(true) => candidates.retain(|b| b.is_const),
+                        Some(false) => {
+                            let mutable: Vec<_> = candidates
+                                .iter()
+                                .filter(|b| !b.is_const)
+                                .map(|b| &b.signature)
+                                .collect();
+                            candidates.retain(|b| !b.is_const || !mutable.contains(&&b.signature));
+                        }
+                        None => {}
+                    }
+                }
                 if candidates.len() > 1 {
                     let types = args
                         .iter()
@@ -801,12 +1048,18 @@ impl<'a, 't> Analyzer<'a, 't> {
             } else {
                 vec![]
             };
+            if self.lang == Language::Csharp && call && candidates.len() > 1 {
+                let call_id = self.out.calls.len();
+                if let Some(site) = self.csharp_deferred(i, s, call_id, &candidates) {
+                    csharp::record(&mut self.out, site);
+                }
+            }
             if targets.is_empty() && !call {
                 continue;
             }
             let id = self.out.calls.len();
             self.out.calls.push(Call {
-                is_call: call,
+                is_call: call && !parameter_call,
                 span: self.t[i].span.clone(),
                 owner: self.scopes[s].owner,
             });
@@ -818,6 +1071,7 @@ impl<'a, 't> Analyzer<'a, 't> {
 }
 pub(super) fn analyze(lang: Language, t: &[Token]) -> Analysis {
     let mut a = Analyzer::new(lang, t);
+    a.directives();
     a.declarations();
     a.uses();
     a.out
@@ -858,6 +1112,29 @@ mod tests {
             [text.find("x=2").unwrap()]
         );
     }
+    #[test]
+    fn undeclared_owner_does_not_merge_with_another_class() {
+        let src = "void A::f() {} void B::f() {} A::~A() { f(); }";
+        assert_eq!(
+            targets(Language::Cpp, src, "{ f();", "f()"),
+            [src.find("f()").unwrap()]
+        );
+    }
+
+    #[test]
+    fn unresolved_condition_does_not_activate_either_branch() {
+        let src = "#if UNKNOWN\nvoid a() {}\n#else\nvoid b() {}\n#endif\nvoid c() {}";
+        let tokens = super::super::lexer::tokens(src, Language::C);
+        let analysis = analyze(Language::C, &tokens);
+        let functions: Vec<_> = analysis
+            .declarations
+            .iter()
+            .filter(|d| d.kind == "function_definition")
+            .map(|d| &src[d.span.clone()])
+            .collect();
+        assert_eq!(functions, ["c"]);
+    }
+
     #[test]
     fn swift_labels_and_extension_methods() {
         let t = "struct Box { func set(_ x: Int) {} } extension Box { func set(label x: Int) {} func run() { self.set(label: 1); self.set(2) } }";

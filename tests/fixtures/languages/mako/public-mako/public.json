@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/sqlalchemy/mako.git",
+  "commit": "14889bc0feacd12102ee61f0769677be2fddbc1b",
+  "evidence": "In this template both makerow expressions call the same local def. The only other spelling in the Mako source is its declaration. README.rst contains a separate prose example. Independently compiled this template with Mako 1.4.4 at the pinned commit and MarkupSafe 3.0.3. Generated Python lines 33–34 bind the lexical makerow wrapper to render_makerow. Lines 58 and 61 call that wrapper."
+}

@@ -1,4 +1,7 @@
+mod display;
 mod json;
+use display::Display;
+mod lines;
 mod navigation;
 mod relationships;
 use crate::{
@@ -16,7 +19,7 @@ use navigation::Markdown;
 use std::{collections::BTreeSet, io, path::Path};
 
 pub enum Request<'a> {
-    Status,
+    Lines(lines::Lines<'a>),
     Search(&'a str),
     Symbol(&'a str),
     Content(&'a str),
@@ -27,11 +30,19 @@ pub enum Request<'a> {
     Glob(Glob),
     Section(&'a str, bool),
     Backlinks(&'a str),
+    NamedRelationship(&'a str, &'a str),
     Relationship(&'a str, &'a str, usize, usize),
 }
 impl<'a> Request<'a> {
     pub fn parse(args: &'a [String]) -> Result<Self, String> {
-        let v: Vec<_> = args.iter().map(String::as_str).collect();
+        let mut v: Vec<_> = args.iter().map(String::as_str).collect();
+        if let Some(verb) = v.first_mut() {
+            *verb = match *verb {
+                "--refs" | "--reference" => "references",
+                "--symbol" => "symbol",
+                original => original,
+            };
+        }
         let pos = |s: &str| {
             s.parse::<usize>()
                 .ok()
@@ -39,8 +50,7 @@ impl<'a> Request<'a> {
                 .ok_or_else(|| "expected a positive position".to_string())
         };
         Ok(match v.as_slice() {
-            ["status"] => Self::Status,
-            ["search", q] if !q.trim().is_empty() => Self::Search(q),
+            ["-k" | "--keywords" | "rank", q] if !q.trim().is_empty() => Self::Search(q),
             ["content", q] if !q.is_empty() => Self::Content(q),
             ["regex", q] if !q.is_empty() => Self::Regex(Regex::new(q)?),
             ["path", q] if !q.is_empty() => Self::Path(q),
@@ -51,6 +61,9 @@ impl<'a> Request<'a> {
             ["section", q] => Self::Section(q, false),
             ["section", q, "--parent"] => Self::Section(q, true),
             ["backlinks", q] => Self::Backlinks(q),
+            [op @ ("callers" | "references"), name] if !name.is_empty() => {
+                Self::NamedRelationship(op, name)
+            }
             [
                 op @ ("definition" | "references" | "callers"),
                 path,
@@ -85,61 +98,101 @@ fn add_crumbs(
     }
     Ok(())
 }
-pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Result<String> {
+#[derive(Default)]
+pub struct Outcome {
+    pub code: u8,
+    pub diagnostics: String,
+}
+pub struct Invocation<'a> {
+    pub request: Request<'a>,
+    pub mode: &'a str,
+    display: Display,
+}
+impl<'a> Invocation<'a> {
+    pub fn parse(args: &'a [String]) -> Result<Self, String> {
+        let mode = args.first().ok_or("missing pattern")?.as_str();
+        if mode == "--cx" {
+            let tail = &args[1..];
+            let mode = tail.first().ok_or("missing indexed command")?.as_str();
+            if !super::cli::is_command(mode) && mode != "rank" {
+                return Err("unknown indexed command".into());
+            }
+            return Ok(Self {
+                request: Request::parse(tail)?,
+                mode,
+                display: Display::default(),
+            });
+        }
+        if matches!(
+            mode,
+            "--reference" | "--refs" | "--symbol" | "-k" | "--keywords"
+        ) {
+            let count = if matches!(mode, "--reference" | "--refs")
+                && args.get(2).is_some_and(|s| !s.starts_with('-'))
+            {
+                4
+            } else {
+                2
+            };
+            if args.len() < count {
+                return Err("missing indexed query operand".into());
+            }
+            return Ok(Self {
+                request: Request::parse(&args[..count])?,
+                mode,
+                display: Display::parse(&args[count..])?,
+            });
+        }
+        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+        Ok(Self {
+            request: Request::Lines(lines::Lines::parse(&argv)?),
+            mode,
+            display: Display::default(),
+        })
+    }
+}
+pub fn evaluate(
+    pin: &Pin,
+    invocation: Invocation<'_>,
+    cwd: &Path,
+    outcome: &mut Outcome,
+) -> io::Result<String> {
+    let Invocation {
+        request: req,
+        mut mode,
+        display,
+    } = invocation;
+    let compact = display.public && !display.json;
+    let mut sites = Vec::new();
     let mut hits = Vec::new();
     let mut truncated = false;
     let mut md = None;
     match req {
-        Request::Status => {
-            let mut products = Vec::new();
-            for (name, id) in [
-                ("paths", PATHGRAM),
-                ("content", CONTENT),
-                ("ranked", RANK),
-                ("symbols", SYMBOLS),
-                ("relationships", REL),
-                ("markdown", MD),
-            ] {
-                products.push((
-                    name,
-                    object(&[
-                        ("state", quote("published")),
-                        ("bytes", pin.reader(id)?.length().to_string()),
-                    ]),
-                ));
-            }
-            return Ok(object(&[
-                ("products", object(&products)),
-                ("product_generation",pin.product_generation().to_string()),
-                ("committed_text_files",pin.committed_files().to_string()),
-                ("indexed_commit",pin.indexed_commit.as_deref().map_or_else(||"null".into(),quote)),
-                ("source_bytes", pin.reader(SOURCE)?.length().to_string()),
-                ("root", quote(&pin.root.to_string_lossy())),
-                ("generation", pin.generation.to_string()),
-                ("reused", pin.reused.to_string()),
-                ("indexed_paths", pin.files.len().to_string()),
-                (
-                    "text_files",
-                    pin.coverage_counts().0
-                        .to_string(),
-                ),
-                (
-                    "relationships",
-                    object(&[
-                        ("status", quote("partial")),
-                        ("generation", pin.generation.to_string()),
-                        ("reused", pin.reused.to_string()),
-                        ("reason", quote("native language coverage incomplete")),
-                    ]),
-                ),
-            ]));
+        Request::Lines(lines) => return lines.run(pin, cwd, outcome),
+        Request::NamedRelationship(op, name) => {
+            return relationships::query(
+                pin,
+                cwd,
+                op,
+                relationships::Subject::Name(name),
+                &display,
+                outcome,
+            );
         }
         Request::Relationship(op, path, line, col) => {
-            return relationships::query(pin, cwd, op, path, line, col);
+            return relationships::query(
+                pin,
+                cwd,
+                op,
+                relationships::Subject::Position(path, line, col),
+                &display,
+                outcome,
+            );
         }
         Request::Section(s, parent) => return Markdown::read(pin)?.section(pin, s, parent),
         Request::Backlinks(s) => return Markdown::read(pin)?.backlinks(pin, s),
         Request::Search(q) => {
+            mode = "search";
             let mut reader = pin.reader(RANK)?;
             let (rows, extra) = RankedIndex::search_extent(
                 reader.length(),
@@ -152,6 +205,10 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
             truncated = extra;
             for h in rows {
                 let entry = &pin.files[h.file];
+                if compact {
+                    sites.push((h.file, h.anchor));
+                    continue;
+                }
                 let mut fields = vec![
                     ("path", quote(entry.path())),
                     ("line", h.line.to_string()),
@@ -172,6 +229,7 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
             }
         }
         Request::Symbol(q) => {
+            mode = "symbol";
             let mut lookup = crate::application::index::symbol_lookup::SymbolLookup::open(
                 pin.reader(SYMBOLS)?,
                 pin.files.len(),
@@ -179,12 +237,26 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
             let (rows, extra) = lookup.get(q, 50)?;
             truncated = extra;
             for s in rows {
+                if compact {
+                    sites.push((s.file, s.span.start));
+                    continue;
+                }
                 let f = &pin.files[s.file];
                 let (l, c) = f.line_column(s.span.start);
+                let start = s.span.start + 1 - c;
+                let col = if start == s.span.start {
+                    1
+                } else {
+                    1 + pin
+                        .source_slice(s.file, start as u64..s.span.start as u64)?
+                        .encode_utf16()
+                        .count()
+                };
                 hits.push(object(&[
                     ("path", quote(f.path())),
                     ("line", l.to_string()),
                     ("byte_column", c.to_string()),
+                    ("col", col.to_string()),
                     ("name", quote(&s.name)),
                     ("kind", quote(&s.kind)),
                 ]));
@@ -196,14 +268,19 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
                 Request::Regex(re) => candidates(pin, CONTENT, re.required_literal())?,
                 _ => unreachable!(),
             };
-            let mut scan=(ids.len()==pin.files.len()).then(||pin.source_window());
+            let mut scan = (ids.len() == pin.files.len()).then(|| pin.source_window());
             'files: for id in ids {
                 let f = &pin.files[id];
                 if f.bytes.is_none() {
                     continue;
                 }
                 let owned;
-                let text=if let Some(window)=&mut scan{window.get(id)?}else{owned=pin.source(id)?;&owned};
+                let text = if let Some(window) = &mut scan {
+                    window.get(id)?
+                } else {
+                    owned = pin.source(id)?;
+                    &owned
+                };
                 let found: Box<dyn Iterator<Item = usize> + '_> = match &req {
                     Request::Content(q) => Box::new(text.match_indices(q).map(|(i, _)| i)),
                     Request::Regex(re) => Box::new(re.matches(text).map(|r| r.start)),
@@ -255,6 +332,15 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
             }
         }
     }
+    if display.public {
+        outcome.code = u8::from(hits.is_empty() && sites.is_empty());
+        if compact {
+            if truncated {
+                outcome.diagnostics.push_str("cx: results truncated\n");
+            }
+            return display::render(pin, cwd, sites, &display, mode == "search");
+        }
+    }
     Ok(object(&[
         ("root", quote(&pin.root.to_string_lossy())),
         ("mode", quote(mode)),
@@ -264,16 +350,8 @@ pub fn evaluate(pin: &Pin, req: Request<'_>, mode: &str, cwd: &Path) -> io::Resu
             "coverage",
             object(&[
                 ("paths", pin.files.len().to_string()),
-                (
-                    "text_files",
-                    pin.coverage_counts().0
-                        .to_string(),
-                ),
-                (
-                    "parsed_files",
-                    pin.coverage_counts().1
-                        .to_string(),
-                ),
+                ("text_files", pin.coverage_counts().0.to_string()),
+                ("parsed_files", pin.coverage_counts().1.to_string()),
                 ("files_with_parse_errors", "null".into()),
                 ("skipped_paths", "null".into()),
                 ("symbols", quote("partial")),

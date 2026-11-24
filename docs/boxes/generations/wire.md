@@ -5,6 +5,8 @@ page-type: reference
 
 The proposed baseline has one selected file named `current` and immutable segment files beside it. This page fixes how a reader identifies those files, locates a product and rejects a damaged range. Each product owns the contents of its extents. The same envelope can measure multiple posting layouts without changing the publication protocol.
 
+This envelope addresses immutable segment files. The [keyed storage candidate](keyed-storage.md) uses a separate format major, independently checked blocks and a sealed arena length.
+
 ## Common file layout
 
 Every integer is unsigned little-endian. Byte offsets inside a payload are relative to its first byte. The 64-byte header is followed by the payload and then one four-byte CRC32C for each consecutive 4,096-byte payload block. The final block can be short. An empty payload has no block checksums. Files have no trailing padding.

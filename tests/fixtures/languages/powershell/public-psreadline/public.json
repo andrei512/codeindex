@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/PowerShell/PSReadLine",
+  "commit": "a2d143f78904f8a954f8d4b055e55ceca6939bfc",
+  "evidence": "Get-KeyInfoData declares ReadOneKey once and invokes it once as a command. Searched all PowerShell files case-insensitively for other references."
+}

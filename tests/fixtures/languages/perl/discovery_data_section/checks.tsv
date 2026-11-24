@@ -1,0 +1,4 @@
+# Perl ends source at __DATA__. The DATA handle contains the entire last line. No declaration or call on that line executes or compiles.
+symbol	phantom	-
+symbol	visible	demo.pl:2:5
+references	demo.pl:2:5	demo.pl:3:1	resolved

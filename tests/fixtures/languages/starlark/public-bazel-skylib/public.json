@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/bazelbuild/bazel-skylib",
+  "commit": "a920cdfe02154b916b493b4ffdd08087f0498fc7",
+  "evidence": "Source declares this private function exactly once. Starlark callers are explicitly unsupported by the Codeindex contract."
+}

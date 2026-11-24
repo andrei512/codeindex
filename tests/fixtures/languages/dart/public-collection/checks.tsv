@@ -1,0 +1,6 @@
+# The private top-level _compareDigitCount has three calls in comparators.dart. The checkout contains no other use.
+definition	lib/src/comparators.dart:288:18	lib/src/comparators.dart:360:5	resolved
+definition	lib/src/comparators.dart:314:18	lib/src/comparators.dart:360:5	resolved
+definition	lib/src/comparators.dart:351:16	lib/src/comparators.dart:360:5	resolved
+references	lib/src/comparators.dart:360:5	lib/src/comparators.dart:288:18,lib/src/comparators.dart:314:18,lib/src/comparators.dart:351:16	resolved
+callers	lib/src/comparators.dart:360:5	lib/src/comparators.dart:288:18,lib/src/comparators.dart:314:18,lib/src/comparators.dart:351:16	resolved

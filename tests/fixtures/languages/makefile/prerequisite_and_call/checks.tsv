@@ -1,0 +1,6 @@
+symbol	stamp	Makefile:4:1
+symbol	default	Makefile:1:1
+definition	Makefile:1:10	Makefile:4:1	resolved
+definition	Makefile:2:11	Makefile:4:1	resolved
+references	Makefile:4:1	Makefile:1:10,Makefile:2:11	resolved
+callers	Makefile:4:1	Makefile:2:11	resolved

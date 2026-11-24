@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/bats-core/bats-core.git",
+  "commit": "3a45b53d71cd488dcfc095593ff60398b3894653",
+  "evidence": "Read the full Dockerfile. The test and prod stages both use the earlier base stage in FROM. There are no other uses of that stage alias."
+}

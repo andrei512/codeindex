@@ -1,0 +1,2 @@
+symbol	actor	cockroachdb-sakila-db/cockroachdb-sakila-schema.sql:31,db2-sakila-db/db2-sakila-schema.sql:14,mysql-sakila-db/mysql-sakila-schema.sql:29,oracle-sakila-db/oracle-sakila-schema.sql:19,postgres-sakila-db/postgres-sakila-schema.sql:50,sql-server-sakila-db/sql-server-sakila-schema.sql:21,sqlite-sakila-db/sqlite-sakila-schema.sql:18,yugabytedb-sakila-db/yugabytedb-sakila-schema.sql:46
+callers	mysql-sakila-db/mysql-sakila-schema.sql:29:14	-	unsupported

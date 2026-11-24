@@ -1,0 +1,14 @@
+[
+  {
+    "directory": ".",
+    "file": "source.cpp",
+    "arguments": [
+      "clang++",
+      "-std=c++17",
+      "-DOWNER=Right::",
+      "-DOTHER=Left::",
+      "-c",
+      "source.cpp"
+    ]
+  }
+]

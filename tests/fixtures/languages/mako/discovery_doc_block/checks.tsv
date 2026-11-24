@@ -1,0 +1,5 @@
+# Mako doc blocks are comments. Only the def and expression below the block generate code.
+symbol	phantom	-
+symbol	render	text.mako:5:13
+definition	text.mako:6:9	text.mako:5:13
+references	text.mako:5:13	text.mako:6:9

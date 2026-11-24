@@ -37,8 +37,6 @@ impl BlobId {
         }
         Ok(id)
     }
-
-
 }
 
 pub fn uses_sha256(root: &Path) -> io::Result<bool> {
@@ -64,6 +62,7 @@ enum Entry {
 }
 
 pub struct CommitTree {
+    last_directory: Option<(String, Option<BlobId>)>,
     objects: Objects,
     root: BlobId,
     directories: HashMap<BlobId, HashMap<Box<[u8]>, Entry>>,
@@ -93,6 +92,7 @@ impl CommitTree {
         let objects = Objects::new(&common, commit.len as usize)?;
         let root = commit_root(&objects, commit)?;
         Ok(Self {
+            last_directory: None,
             objects,
             root,
             directories: HashMap::new(),
@@ -176,17 +176,37 @@ impl CommitTree {
     }
 
     pub fn blob(&mut self, path: &str) -> io::Result<Option<BlobId>> {
-        let mut tree = self.root;
-        let mut segments = path.as_bytes().split(|&b| b == b'/').peekable();
-        while let Some(segment) = segments.next() {
-            self.load(tree)?;
-            match self.directories[&tree].get(segment) {
-                Some(Entry::Directory(next)) if segments.peek().is_some() => tree = *next,
-                Some(Entry::Regular(id)) if segments.peek().is_none() => return Ok(Some(*id)),
-                _ => return Ok(None),
-            }
+        if path.starts_with('/') {
+            return Ok(None);
         }
-        Ok(None)
+        let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        let cached = self.last_directory.as_ref().filter(|(p, _)| p == parent);
+        let tree = if let Some((_, tree)) = cached {
+            *tree
+        } else {
+            let mut tree = Some(self.root);
+            if !parent.is_empty() {
+                for component in parent.split('/') {
+                    let Some(id) = tree else { break };
+                    self.load(id)?;
+                    tree = match self.directories[&id].get(component.as_bytes()) {
+                        Some(Entry::Directory(child)) => Some(*child),
+                        _ => None,
+                    };
+                }
+            }
+            let (last, id) = self.last_directory.get_or_insert_with(Default::default);
+            last.clear();
+            last.push_str(parent);
+            *id = tree;
+            tree
+        };
+        let Some(tree) = tree else { return Ok(None) };
+        self.load(tree)?;
+        Ok(match self.directories[&tree].get(leaf.as_bytes()) {
+            Some(Entry::Regular(id)) => Some(*id),
+            _ => None,
+        })
     }
 }
 

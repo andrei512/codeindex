@@ -1,0 +1,5 @@
+symbol	bad_unsigned	-
+symbol	promoted_unsigned	source.c:6:5
+symbol	native_limits	source.c:9:5
+symbol	small_promotions	source.c:12:5
+symbol	unsigned_char	-

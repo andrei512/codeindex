@@ -27,25 +27,27 @@ impl Lookup {
         })
     }
     pub fn document(&self, mut r: impl ExtentRead, id: usize) -> io::Result<Option<Parsed>> {
+        let Some(record) = self.document_range(&mut r, id)? else { return Ok(None) };
+        let bytes = read_bytes(&mut r, record.start + 8..record.end)?;
+        let mut data = bytes.as_slice();
+        let doc = Parsed::read_from(&mut data)?;
+        if !data.is_empty() {
+            return Err(bad());
+        }
+        Ok(Some(doc))
+    }
+    pub(crate) fn document_range(&self, r: &mut impl ExtentRead, id: usize) -> io::Result<Option<Range<u64>>> {
         let (mut lo, mut hi) = (0, (self.docs.end - self.docs.start) / 8 - 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let record = row(&mut r, &self.docs, mid, self.end)?;
+            let record = row(r, &self.docs, mid, self.end)?;
             if record.end - record.start < 8 {
                 return Err(bad());
             }
-            match word(&mut r, record.start)?.cmp(&(id as u64)) {
+            match word(r, record.start)?.cmp(&(id as u64)) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let bytes = read_bytes(&mut r, record.start + 8..record.end)?;
-                    let mut data = bytes.as_slice();
-                    let doc = Parsed::read_from(&mut data)?;
-                    if !data.is_empty() {
-                        return Err(bad());
-                    }
-                    return Ok(Some(doc));
-                }
+                std::cmp::Ordering::Equal => return Ok(Some(record)),
             }
         }
         Ok(None)

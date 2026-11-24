@@ -1,0 +1,14 @@
+{
+  "name": "codeindex-workspace",
+  "private": true,
+  "devDependencies": {
+    "nx": "24.0.6"
+  },
+  "nx": {
+    "targets": {
+      "build-cx": {
+        "command": "cargo build --release --locked"
+      }
+    }
+  }
+}

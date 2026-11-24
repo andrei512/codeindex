@@ -1,0 +1,4 @@
+definition	app.ts:3:38	app.ts:1:35	resolved
+references	app.ts:1:35	app.ts:3:38	resolved
+callers	app.ts:1:35	app.ts:3:38	resolved
+references	app.ts:2:10	-	resolved

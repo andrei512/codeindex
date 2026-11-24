@@ -1,0 +1,2 @@
+symbol	compile_target	-
+symbol	build_target	rules.bzl:1

@@ -1,0 +1,11 @@
+# The unqualified call resolves to the package function. The method on other needs a receiver.
+symbol	emit	work.go:4,work.go:9
+symbol	flush	work.go:5
+symbol	Run	work.go:6
+definition	work.go:6:14	work.go:4:6	resolved
+references	work.go:4:6	work.go:6:14	resolved
+callers	work.go:4:6	work.go:6:14|Run	resolved
+references	work.go:5:6	-	resolved
+callers	work.go:5:6	-	resolved
+references	work.go:9:14	-	resolved
+callers	work.go:9:14	-	resolved

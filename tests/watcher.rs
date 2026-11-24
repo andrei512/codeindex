@@ -41,7 +41,7 @@ fn scheduled_publication_and_strict_nested_queries() {
     fs::create_dir_all(root.join(".git")).unwrap();
     let path = root.join("x.txt");
     fs::write(&path, "first").unwrap();
-    assert!(cx(&home.0, &root, &["status"]).contains("\"generation\":1"));
+    assert!(cx(&home.0, &root, &["--cx", "path-exact", "a.md"]).contains("\"generation\":1"));
 
     let store = fs::read_dir(home.0.join(".codeindex/repos"))
         .unwrap()
@@ -68,12 +68,12 @@ fn scheduled_publication_and_strict_nested_queries() {
     }
 
     fs::write(&path, "third").unwrap();
-    assert!(cx(&home.0, &root, &["content", "third"]).contains("x.txt"));
+    assert!(cx(&home.0, &root, &["--cx", "content", "third"]).contains("x.txt"));
     let nested = root.join("inner");
     fs::create_dir_all(nested.join(".git")).unwrap();
     fs::write(nested.join("y.txt"), "inner only").unwrap();
-    assert!(cx(&home.0, &nested, &["content", "inner only"]).contains("y.txt"));
-    assert!(cx(&home.0, &root, &["content", "inner only"]).contains("\"hits\":[]"));
+    assert!(cx(&home.0, &nested, &["--cx", "content", "inner only"]).contains("y.txt"));
+    assert!(cx(&home.0, &root, &["--cx", "content", "inner only"]).contains("\"hits\":[]"));
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn different_executable_retires_owner_before_reelection() {
     .join(cache_key(&cache));
     let run = |bin: &Path, cfg: &str| {
         let out = Command::new(bin)
-            .arg("status")
+            .args(["--cx", "path-exact", "a.md"])
             .env("HOME", &home_dir)
             .env("GIT_CONFIG_GLOBAL", home_dir.join(cfg))
             .current_dir(&root)

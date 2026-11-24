@@ -1,0 +1,6 @@
+symbol	render	run.cmd:6:2
+symbol	entry	run.cmd:2:2
+definition	run.cmd:3:7	run.cmd:6:2	resolved
+definition	run.cmd:4:7	run.cmd:6:2	resolved
+references	run.cmd:6:2	run.cmd:3:7,run.cmd:4:7	resolved
+callers	run.cmd:6:2	run.cmd:3:7	resolved

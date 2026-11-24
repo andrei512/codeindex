@@ -8,13 +8,16 @@ mod inflate;
 mod key;
 mod provenance;
 mod sparse;
+mod walk_pool;
 pub use capture::{capture, capture_observed};
+pub(crate) use capture::CaptureRoot;
 pub use key::cache_key;
 pub use provenance::{BlobId, CommitTree, raw_blob_id, uses_sha256};
 use std::{
     env,
     ffi::CString,
     fs, io,
+    sync::Arc,
     path::{Path, PathBuf},
 };
 
@@ -61,27 +64,61 @@ fn add_rules(bytes: &[u8], base: usize, fold: bool, rules: &mut Vec<ignore::Rule
 }
 pub use crate::domain::ObservedPath;
 
-struct Walk<'a> {
+struct Tree<'a> {
     root: &'a Path,
     cache: Option<PathBuf>,
     tracked: index::Tracked,
     fold: bool,
-    rules: Vec<ignore::Rule>,
+}
+struct Rules {
+    parent: Option<Arc<Rules>>,
+    local: Vec<ignore::Rule>,
+}
+
+impl Rules {
+    fn excludes(&self, names: &[CString], is_directory: bool) -> bool {
+        let mut frame = Some(self);
+        while let Some(rules) = frame {
+            if let Some(excluded) = rules.local.iter().rev()
+                .find_map(|r| r.decision(names, is_directory))
+            {
+                return excluded;
+            }
+            frame = rules.parent.as_deref();
+        }
+        false
+    }
+}
+
+struct Directory {
+    rel: String,
+    ignored: bool,
+    rules: Arc<Rules>,
+    names: Vec<CString>,
+}
+struct Walk<'a> {
+    tree: &'a Tree<'a>,
+    rules: Arc<Rules>,
     names: Vec<CString>,
     found: Vec<ObservedPath>,
 }
 impl Walk<'_> {
-    fn visit(&mut self, rel: &str, ignored: bool) -> io::Result<()> {
-        let dir = self.root.join(rel);
-        let saved = self.rules.len();
+    fn visit(&mut self, rel: &str, ignored: bool, mut ready: Option<&mut Vec<Directory>>) -> io::Result<()> {
+        let dir = self.tree.root.join(rel);
+        let mut old_rules = None;
         let mut control = None;
         if !ignored {
             let ignore = dir.join(".gitignore");
             match fs::symlink_metadata(&ignore) {
                 Ok(m) if m.is_file() => {
                     let bytes =
-                        capture::read_control(self.root, &Path::new(rel).join(".gitignore"), &m)?;
-                    add_rules(&bytes, self.names.len(), self.fold, &mut self.rules);
+                        capture::read_control(self.tree.root, &Path::new(rel).join(".gitignore"), &m)?;
+                    let mut nested = Vec::new();
+                    add_rules(&bytes, self.names.len(), self.tree.fold, &mut nested);
+                    if !nested.is_empty() {
+                        old_rules = Some(self.rules.clone());
+                        self.rules = Arc::new(Rules { parent: old_rules.clone(), local: nested });
+                    }
                     let text = if bytes.contains(&0) {
                         None
                     } else {
@@ -99,7 +136,7 @@ impl Walk<'_> {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if name == ".git" || self.fold && name.eq_ignore_ascii_case(".git") {
+            if name == ".git" || self.tree.fold && name.eq_ignore_ascii_case(".git") {
                 continue;
             }
             let path = if rel.is_empty() {
@@ -107,15 +144,15 @@ impl Walk<'_> {
             } else {
                 format!("{rel}/{name}")
             };
-            if self.tracked.gitlinks.contains(&path) {
+            if self.tree.tracked.gitlinks.contains(&path) {
                 continue;
             }
             let ty = entry.file_type()?;
-            let tracked = self.tracked.paths.contains(&path);
-            if self.cache.as_deref() == Some(Path::new(&path)) {
+            let tracked = self.tree.tracked.paths.contains(&path);
+            if self.tree.cache.as_deref() == Some(Path::new(&path)) {
                 let prefix = format!("{path}/");
                 if tracked
-                    || self
+                    || self.tree
                         .tracked
                         .paths
                         .range(prefix.clone()..)
@@ -131,16 +168,15 @@ impl Walk<'_> {
             // need a component on the stack while visiting their children.
             let match_rules = ty.is_dir() || !tracked;
             let excluded = if match_rules {
-                self.names.push(CString::new(if self.fold { name.to_ascii_lowercase() } else { name }).map_err(invalid)?);
-                ignored || self.rules.iter().rev()
-                    .find_map(|r| r.decision(&self.names, ty.is_dir())).unwrap_or(false)
+                self.names.push(CString::new(if self.tree.fold { name.to_ascii_lowercase() } else { name }).map_err(invalid)?);
+                ignored || self.rules.excludes(&self.names, ty.is_dir())
             } else {
                 false
             };
             if ty.is_dir() {
                 let prefix = format!("{path}/");
                 let tracked_child = || {
-                    self.tracked
+                    self.tree.tracked
                         .paths
                         .range(prefix.clone()..)
                         .next()
@@ -149,7 +185,11 @@ impl Walk<'_> {
                 if (!excluded || tracked_child())
                     && (!entry.path().join(".git").try_exists()? || tracked_child())
                 {
-                    self.visit(&path, excluded)?;
+                    if let Some(jobs) = ready.as_deref_mut() {
+                        jobs.push(Directory { rel: path, ignored: excluded, rules: self.rules.clone(), names: self.names.clone() });
+                    } else {
+                        self.visit(&path, excluded, None)?;
+                    }
                 }
             } else if (tracked || !excluded) && (ty.is_file() || ty.is_symlink()) {
                 let metadata = entry.metadata()?;
@@ -170,7 +210,7 @@ impl Walk<'_> {
             }
             if match_rules { self.names.pop(); }
         }
-        self.rules.truncate(saved);
+        if let Some(saved) = old_rules { self.rules = saved; }
         Ok(())
     }
 }
@@ -218,16 +258,20 @@ pub fn observe(root: &Path) -> io::Result<Vec<ObservedPath>> {
             add_rules(&bytes, 0, conf.ignore_case, &mut rules)
         }
     }
-    let mut walk = Walk {
-        root,
-        cache,
-        tracked,
-        fold: conf.ignore_case,
-        rules,
-        names: vec![],
-        found: vec![],
-    };
-    walk.visit("", false)?;
+    let tree = Tree { root, cache, tracked, fold: conf.ignore_case };
+    let mut walk = Walk { tree: &tree, rules: Arc::new(Rules { parent: None, local: rules }), names: Vec::new(), found: Vec::new() };
+    let workers = if tree.tracked.paths.len() >= 256 {
+        std::thread::available_parallelism().map_or(1, |n| n.get()).min(6)
+    } else { 1 };
+    if workers == 1 {
+        walk.visit("", false, None)?;
+    } else {
+        let mut ready = Vec::new();
+        walk.visit("", false, Some(&mut ready))?;
+        if !ready.is_empty() {
+            walk.found.extend(walk_pool::collect(&tree, ready, workers)?);
+        }
+    }
     walk.found.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     Ok(walk.found)
 }

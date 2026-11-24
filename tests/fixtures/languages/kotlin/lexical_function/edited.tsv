@@ -1,0 +1,11 @@
+# runWork is a top-level function. An unqualified call here cannot select a member of Other.
+symbol	emit	Work.kt:1,Work.kt:7
+symbol	flush	Work.kt:2
+symbol	runWork	Work.kt:3
+definition	Work.kt:4:5	Work.kt:2:13	resolved
+references	Work.kt:2:13	Work.kt:4:5	resolved
+callers	Work.kt:2:13	Work.kt:4:5	resolved
+references	Work.kt:1:13	-	resolved
+callers	Work.kt:1:13	-	resolved
+references	Work.kt:7:9	-	resolved
+callers	Work.kt:7:9	-	resolved

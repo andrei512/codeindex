@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Using Include="System.ReadOnlySpan&lt;System.Char&gt;" Alias="First" />
+    <Using Include="System.Int32" Alias="Second" />
+  </ItemGroup>
+</Project>

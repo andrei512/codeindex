@@ -1,0 +1,3 @@
+definition	app.mjs:2:25	right.mjs:1:17	resolved
+callers	right.mjs:1:17	app.mjs:2:25	resolved
+callers	left.mjs:1:17	-	resolved

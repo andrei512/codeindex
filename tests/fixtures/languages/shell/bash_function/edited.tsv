@@ -1,0 +1,4 @@
+definition	run.bash:3:9	run.bash:2:1	resolved
+references	run.bash:2:1	run.bash:3:9	resolved
+callers	run.bash:2:1	run.bash:3:9	resolved
+symbol	save	-

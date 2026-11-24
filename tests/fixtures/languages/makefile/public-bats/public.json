@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/bats-core/bats-core.git",
+  "commit": "3a45b53d71cd488dcfc095593ff60398b3894653",
+  "evidence": "The standalone man/Makefile defines RONN at line 5, uses it in two recipes, and includes no other makefile."
+}

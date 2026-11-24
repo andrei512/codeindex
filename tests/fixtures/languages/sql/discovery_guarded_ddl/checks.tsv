@@ -1,0 +1,5 @@
+# SQLite temp schema contains table sample; its ordinary schema contains view summary. The block comment creates nothing.
+symbol	sample	tables.sql:1:33
+symbol	summary	tables.sql:4:13
+symbol	ghost	-
+symbol	IF	-

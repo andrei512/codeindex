@@ -1,0 +1,14 @@
+[
+  {
+    "directory": "build",
+    "file": "../src/source.c",
+    "arguments": [
+      "clang",
+      "-include",
+      "options.h",
+      "-I../inc",
+      "-c",
+      "../src/source.c"
+    ]
+  }
+]

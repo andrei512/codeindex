@@ -1,0 +1,5 @@
+# Ruby treats the column-one =begin/=end block as embedded documentation; Sample.visible is a literal singleton method call.
+symbol	phantom	-
+symbol	visible	app.rb:6:12
+definition	app.rb:10:8	app.rb:6:12	resolved
+references	app.rb:6:12	app.rb:10:8	resolved

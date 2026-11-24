@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/Humanizr/Humanizer",
+  "commit": "4574b93883bf48e3f0f3bca73297054537317ab2",
+  "evidence": "Roslyn 4.9 CSharpSemanticModel on the pinned RomanNumeralExtensions.cs, with the project's CharSpan alias and implicit System import, binds FromRoman(input.AsSpan()) at 87:16 to FromRoman(System.ReadOnlySpan<char>) at 111:23."
+}

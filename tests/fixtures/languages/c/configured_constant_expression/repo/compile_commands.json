@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "file": "source.c",
+    "arguments": [
+      "clang",
+      "-funsigned-char",
+      "-c",
+      "source.c"
+    ]
+  }
+]

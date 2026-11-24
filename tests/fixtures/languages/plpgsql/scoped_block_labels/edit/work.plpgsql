@@ -1,0 +1,15 @@
+CREATE FUNCTION run_a() RETURNS void LANGUAGE plpgsql AS $$
+<<done>>
+BEGIN
+  <<skip>>
+  BEGIN
+    EXIT skip;
+  END;
+END;
+$$;
+CREATE FUNCTION run_b() RETURNS void LANGUAGE plpgsql AS $$
+<<done>>
+BEGIN
+  EXIT done;
+END;
+$$;

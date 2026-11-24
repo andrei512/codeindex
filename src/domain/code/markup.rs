@@ -80,7 +80,7 @@ pub(super) fn html(text: &str) -> Analysis {
             }
             i += usize::from(quote.is_some() && i < b.len());
         }
-        if ["script", "style", "textarea", "title"]
+        if ["script", "style", "textarea", "title", "iframe"]
             .iter()
             .any(|k| tag.eq_ignore_ascii_case(k))
         {
@@ -138,7 +138,7 @@ fn embedded(host: &mut Analysis, body: &str, offset: usize, script: bool) {
             text: body,
             analysis: &region,
         };
-        let mut names = super::Names::default();
+        let mut names = super::ForwardNames::default();
         super::script::resolve(
             &[unit],
             &std::collections::HashMap::from([("embedded.ts", 0)]),

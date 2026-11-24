@@ -4,7 +4,7 @@
 mod native;
 mod wire;
 use super::{
-    query::{Request, evaluate},
+    query::{Invocation, Outcome, Request, evaluate},
     repository,
     snapshot::Pin,
 };
@@ -32,7 +32,7 @@ pub(crate) const INTERNAL_ARG: &str = "--internal-watch";
 const IDLE: Duration = Duration::from_secs(5 * 60);
 const FALLBACK: u8 = 3;
 const REELECT: u8 = 4;
-const PROTOCOL: &[u8] = b"CXW1";
+const PROTOCOL: &[u8] = b"CXW2";
 
 struct IdleDeadline(Instant);
 impl IdleDeadline {
@@ -211,26 +211,31 @@ pub(crate) fn query(
         Ok((_, REELECT, 0)) => exchange(),
         other => other,
     };
-    let Ok((socket, code @ 0..=2, len)) = answer else {
+    let Ok((mut socket, code, len)) = answer else {
         return Ok(None);
     };
-    let mut reader = socket.take(len);
-    let count = if code == 0 {
-        let count = io::copy(&mut reader, out)?;
-        out.flush()?;
-        count
-    } else {
-        let count = io::copy(&mut reader, err)?;
-        err.flush()?;
-        count
-    };
-    if count != len {
+    if code <= 2 {
+        copy_frame(&mut socket, len, err)?;
+        return Ok(Some(ExitCode::from(code)));
+    }
+    if !(5..=7).contains(&code) {
+        return Ok(None);
+    }
+    copy_frame(&mut socket, len, out)?;
+    let mut length = [0; 8];
+    socket.read_exact(&mut length)?;
+    copy_frame(&mut socket, u64::from_le_bytes(length), err)?;
+    Ok(Some(ExitCode::from(code - 5)))
+}
+
+fn copy_frame(input: &mut UnixStream, len: u64, out: &mut impl Write) -> io::Result<()> {
+    if io::copy(&mut input.take(len), out)? != len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "incomplete cx watcher response",
         ));
     }
-    Ok(Some(ExitCode::from(code)))
+    out.flush()
 }
 
 enum Event {
@@ -274,13 +279,13 @@ fn process(
             let _ = wire::reply(&mut socket, FALLBACK, &[]);
             continue;
         }
-        let request = match Request::parse(&query.args) {
+        let request = match Invocation::parse(&query.args) {
             Ok(req) => req,
             Err(e) => {
                 let _ = wire::reply(
                     &mut socket,
                     2,
-                    format!("{e}. Run 'cx help' for usage.\n").as_bytes(),
+                    format!("{}\n", super::cli::argument_error(query.args.first(), &e)).as_bytes(),
                 );
                 continue;
             }
@@ -289,9 +294,11 @@ fn process(
         // All these clients were admitted before this observation. Any later
         // admission remains queued for a subsequent observation.
         let pin = pin.get_or_insert_with(|| Pin::refresh_with_prior(root, current.take()));
+        let mut outcome = Outcome::default();
+        let is_lines = matches!(request.request, Request::Lines(_));
         let result = match pin {
             Ok(pin) => {
-                let answer = evaluate(pin, request, &query.args[0], &query.cwd);
+                let answer = evaluate(pin, request, &query.cwd, &mut outcome);
                 pin.reused = true;
                 answer
             }
@@ -299,11 +306,17 @@ fn process(
         };
         match result {
             Ok(mut text) => {
-                text.push('\n');
-                let _ = wire::reply(&mut socket, 0, text.as_bytes());
+                if !text.is_empty() && !is_lines {
+                    text.push('\n');
+                }
+                let _ = wire::reply(&mut socket, 5 + outcome.code, text.as_bytes())
+                    .and_then(|_| {
+                        socket.write_all(&(outcome.diagnostics.len() as u64).to_le_bytes())
+                    })
+                    .and_then(|_| socket.write_all(outcome.diagnostics.as_bytes()));
             }
             Err(e) => {
-                let _ = wire::reply(&mut socket, 1, format!("cx: {e}\n").as_bytes());
+                let _ = wire::reply(&mut socket, 2, format!("cx: {e}\n").as_bytes());
             }
         }
     }
