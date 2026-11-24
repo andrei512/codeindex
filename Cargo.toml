@@ -10,7 +10,7 @@ documentation = "https://docs.rs/codeindex"
 rust-version = "1.95"
 keywords = ["code-search", "indexing", "cli", "bm25", "markdown"]
 categories = ["command-line-utilities", "development-tools"]
-include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/tests/**", "/benches/content.rs", "/README.md", "/LICENSE"]
+include = ["/Cargo.toml", "/Cargo.lock", "/build.rs", "/src/**", "/tests/**", "!**/__pycache__/**", "!**/*.pyc", "/benches/content.rs", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "cx"
