@@ -1,3 +1,4 @@
+mod plain;
 mod events;
 use super::{CONTENT, Pin, Regex, candidates};
 use std::{collections::BTreeSet, fmt::Write, io, path::Path};
@@ -402,6 +403,16 @@ impl<'a> Lines<'a> {
         }
         hits > 0
     }
+    fn includes(&self, name: &str) -> bool {
+        let basename = name.rsplit('/').next().unwrap_or(name);
+        let mut include = !self.globs.iter().any(|g| g.0);
+        for (value, full, g) in &self.globs {
+            if g.is_match(if *full { name } else { basename }) {
+                include = *value;
+            }
+        }
+        include
+    }
     pub(super) fn run(
         &self,
         pin: &Pin,
@@ -480,14 +491,7 @@ impl<'a> Lines<'a> {
                     Path::new(operand).join(suffix)
                 };
                 let name = name.to_string_lossy();
-                let basename = name.rsplit('/').next().unwrap_or(&name);
-                let mut include = !self.globs.iter().any(|g| g.0);
-                for (value, full, g) in &self.globs {
-                    if g.is_match(if *full { &name } else { basename }) {
-                        include = *value;
-                    }
-                }
-                if !include {
+                if !self.includes(&name) {
                     continue;
                 }
                 if self.files {

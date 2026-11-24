@@ -129,11 +129,15 @@ impl Map {
 }
 
 pub(super) struct Segments {
+    memory: Option<Vec<u8>>,
     pub map: Map,
     files: BTreeMap<u64, Envelope>,
     cache: std::sync::OnceLock<super::read_cache::ReadCache>,
 }
 impl Segments {
+    pub(super) fn memory(bytes: Vec<u8>) -> Self {
+        Self { memory: Some(bytes), map: Map::default(), files: Default::default(), cache: Default::default() }
+    }
     pub fn open(cache: &Path, map: Map) -> io::Result<Self> {
         let mut files = BTreeMap::new();
         let mut prev = 0;
@@ -155,6 +159,7 @@ impl Segments {
             }
         }
         Ok(Self {
+            memory: None,
             map,
             files,
             cache: Default::default(),
@@ -168,7 +173,7 @@ impl Segments {
         r: Range<u64>,
         mut consume: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
-        if r.end.saturating_sub(r.start) > 32768 {
+        if self.memory.is_some() || r.end.saturating_sub(r.start) > 32768 {
             return self.visit(r, consume);
         }
         let cache = self.cache.get_or_init(Default::default);
@@ -181,6 +186,9 @@ impl Segments {
         r: Range<u64>,
         mut consume: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        if let Some(bytes) = &self.memory {
+            return consume(bytes.get(r.start as usize..r.end as usize).ok_or_else(invalid)?);
+        }
         self.map.slices(r, |key, physical| {
             self.files[&key].visit(physical, &mut consume)
         })

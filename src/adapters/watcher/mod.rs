@@ -176,6 +176,7 @@ fn connect(root: &Path, endpoint: &Endpoint) -> io::Result<UnixStream> {
 }
 
 pub(crate) fn query(
+    root: &Path,
     cwd: &Path,
     args: &[String],
     out: &mut impl Write,
@@ -186,8 +187,7 @@ pub(crate) fn query(
     }
     let exchange = || -> io::Result<_> {
         let key = context(&executable_identity(&env::current_exe()?)?)?;
-        let root = repository::locate(cwd)?;
-        let mut socket = connect(&root, &Endpoint::new(&root)?)?;
+        let mut socket = connect(root, &Endpoint::new(root)?)?;
         {
             let mut send = BufWriter::new(&mut socket);
             wire::send_field(&mut send, &key)?;

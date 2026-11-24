@@ -31,7 +31,7 @@ pub struct Pin {
     coverage: std::sync::OnceLock<(usize, usize)>,
     sdk_catalog: Option<usize>,
     sdk_receipts: std::sync::OnceLock<Vec<crate::domain::code::CReceipt>>,
-    selector: File,
+    selector: Option<File>,
     pub generation: u64,
     pub indexed_commit: Option<String>,
     pub reused: bool,
@@ -188,6 +188,21 @@ fn checkpoint(_stage: Publication) {
     }
 }
 impl Pin {
+    pub(crate) fn is_memory(&self) -> bool { self.selector.is_none() }
+
+    pub(crate) fn memory(root: &Path, needs: crate::application::index::build::MemoryQuery) -> io::Result<Self> {
+        let paths = repository::plain_paths(root, false)?;
+        let capture = repository::CaptureRoot::new(root)?;
+        let (files, dir, data) = crate::application::index::build::memory_index(root, paths, needs, |p, stamp| capture.capture(p, stamp))?;
+        Ok(Self {
+            files, dir, root: root.into(), segment: Segments::memory(data),
+            generation: 0, segment_id: 0, reused: false, checkpoint: None,
+            indexed_commit: None, selector: None, native_v2: false,
+            sdk_catalog: None, sdk_receipts: Default::default(), coverage: Default::default(),
+            migration: super::registry::Migration::current(),
+        })
+    }
+
     /// File kinds and paths are immutable for the lifetime of this generation.
     pub(crate) fn coverage_counts(&self) -> (usize, usize) {
         *self.coverage.get_or_init(|| {
@@ -232,7 +247,7 @@ impl Pin {
             coverage: Default::default(),
             sdk_catalog: None,
             sdk_receipts: Default::default(),
-            selector: file,
+            selector: Some(file),
             generation: id,
             indexed_commit,
             segment_id,
@@ -376,8 +391,9 @@ impl Pin {
     fn select(cache: &Path, root: &Path, prior: Option<Self>) -> io::Result<Option<Self>> {
         if let Some(mut pin) = prior
             && pin.root == root
+            && let Some(selector) = &pin.selector
         {
-            let held = pin.selector.metadata()?;
+            let held = selector.metadata()?;
             match fs::metadata(cache.join("current")) {
                 Ok(selected) if (selected.dev(), selected.ino()) == (held.dev(), held.ino()) => {
                     pin.reused = true;
@@ -392,7 +408,10 @@ impl Pin {
     }
 
     pub fn refresh_with_prior(cwd: &Path, prior: Option<Self>) -> io::Result<Self> {
-        let root = repository::locate(cwd)?;
+        Self::refresh_root(repository::locate(cwd)?, prior)
+    }
+
+    pub(crate) fn refresh_root(root: PathBuf, prior: Option<Self>) -> io::Result<Self> {
         let cache = cwd_cache()?.join(repository::cache_key(&root));
         fs::create_dir_all(&cache)?;
         fs::set_permissions(&cache, fs::Permissions::from_mode(0o700))?;
@@ -703,7 +722,7 @@ impl Pin {
                     Some(receipts) => std::sync::OnceLock::from(receipts),
                     None => std::mem::take(&mut old.as_mut().unwrap().sdk_receipts),
                 },
-                selector: m,
+                selector: Some(m),
                 native_v2: true,
                 generation,
                 indexed_commit: commit,

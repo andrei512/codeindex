@@ -87,12 +87,6 @@ pub fn run(
                 .is_ok_and(|m| m.is_file() || m.file_type().is_fifo() || m.file_type().is_socket());
             if lines.explicit_stdin() || piped && lines.stdin_only() {
                 use std::io::Read;
-                if let Err(e) =
-                    std::env::current_dir().and_then(|cwd| super::repository::locate(&cwd))
-                {
-                    let _ = writeln!(err, "cx: {e}");
-                    return ExitCode::from(2);
-                }
                 let mut input = Vec::new();
                 if let Err(e) = std::io::stdin().read_to_end(&mut input) {
                     let _ = writeln!(err, "cx: {e}");
@@ -109,22 +103,18 @@ pub fn run(
                 return ExitCode::from(u8::from(!hit));
             }
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            match super::watcher::query(&cwd, &args, &mut out, &mut err) {
-                Ok(Some(code)) => return code,
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = writeln!(err, "cx: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
         return match (|| -> io::Result<ExitCode> {
             let cwd = std::env::current_dir()?;
-            let pin = Pin::refresh(&cwd)?;
             let is_lines = matches!(req.request, super::query::Request::Lines(_));
             let mut result = Outcome::default();
-            let answer = evaluate(&pin, req, &cwd, &mut result)?;
+            let answer = if let Some(root) = super::repository::find_worktree(&cwd)? {
+                if let Some(code) = super::watcher::query(&root, &cwd, &args, &mut out, &mut err)? {
+                    return Ok(code);
+                }
+                evaluate(&Pin::refresh_root(root, None)?, req, &cwd, &mut result)?
+            } else {
+                super::query::plain(req, &cwd, &mut result)?
+            };
             err.write_all(result.diagnostics.as_bytes())?;
             if answer.is_empty() {
                 return Ok(ExitCode::from(result.code));

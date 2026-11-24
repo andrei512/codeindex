@@ -75,6 +75,7 @@ impl<'a> Request<'a> {
     }
 }
 fn candidates(pin: &Pin, product: usize, q: &str) -> io::Result<Vec<usize>> {
+    if pin.is_memory() { return Ok((0..pin.files.len()).collect()); }
     let chars: Vec<_> = q.chars().take(18).collect();
     if chars.len() < 3 {
         return Ok((0..pin.files.len()).collect());
@@ -150,6 +151,19 @@ impl<'a> Invocation<'a> {
             display: Display::default(),
         })
     }
+}
+pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<String> {
+    use crate::application::index::build::MemoryQuery;
+    let needs = match &invocation.request {
+        Request::Lines(lines) => return lines.plain(cwd, outcome),
+        Request::Search(_) => MemoryQuery::Rank { breadcrumbs: invocation.display.json || !invocation.display.public },
+        Request::Symbol(_) => MemoryQuery::Symbols,
+        Request::NamedRelationship(..) | Request::Relationship(..) => MemoryQuery::Relationships,
+        Request::Section(..) | Request::Backlinks(_) => MemoryQuery::Markdown,
+        Request::Content(_) | Request::Regex(_) => MemoryQuery::Content,
+        Request::Exact(_) | Request::Path(_) | Request::PathRegex(_) | Request::Glob(_) => MemoryQuery::Paths,
+    };
+    evaluate(&Pin::memory(cwd, needs)?, invocation, cwd, outcome)
 }
 pub fn evaluate(
     pin: &Pin,
@@ -341,6 +355,8 @@ pub fn evaluate(
             return display::render(pin, cwd, sites, &display, mode == "search");
         }
     }
+    let paths_only = pin.is_memory() && matches!(req, Request::Path(_) | Request::PathRegex(_) | Request::Exact(_) | Request::Glob(_));
+    let (text_files, parsed_files) = pin.coverage_counts();
     Ok(object(&[
         ("root", quote(&pin.root.to_string_lossy())),
         ("mode", quote(mode)),
@@ -350,8 +366,8 @@ pub fn evaluate(
             "coverage",
             object(&[
                 ("paths", pin.files.len().to_string()),
-                ("text_files", pin.coverage_counts().0.to_string()),
-                ("parsed_files", pin.coverage_counts().1.to_string()),
+                ("text_files", if paths_only { "null".into() } else { text_files.to_string() }),
+                ("parsed_files", if pin.is_memory() && !matches!(req, Request::Symbol(_)) { "0".into() } else { parsed_files.to_string() }),
                 ("files_with_parse_errors", "null".into()),
                 ("skipped_paths", "null".into()),
                 ("symbols", quote("partial")),

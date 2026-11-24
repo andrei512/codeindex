@@ -40,19 +40,19 @@ fn optional_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 pub fn locate(cwd: &Path) -> io::Result<PathBuf> {
+    find_worktree(cwd)?.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "outside a Git worktree"))
+}
+pub(crate) fn find_worktree(cwd: &Path) -> io::Result<Option<PathBuf>> {
     let path = cwd.canonicalize()?;
     for root in path.ancestors() {
         match fs::symlink_metadata(root.join(".git")) {
-            Ok(m) if m.is_dir() || m.is_file() => return Ok(root.to_owned()),
+            Ok(m) if m.is_dir() || m.is_file() => return Ok(Some(root.to_owned())),
             Ok(_) => return Err(invalid("invalid .git marker")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "outside a Git worktree",
-    ))
+    Ok(None)
 }
 fn add_rules(bytes: &[u8], base: usize, fold: bool, rules: &mut Vec<ignore::Rule>) {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
@@ -69,6 +69,7 @@ struct Tree<'a> {
     cache: Option<PathBuf>,
     tracked: index::Tracked,
     fold: bool,
+    plain_hidden: Option<bool>,
 }
 struct Rules {
     parent: Option<Arc<Rules>>,
@@ -107,12 +108,13 @@ impl Walk<'_> {
         let dir = self.tree.root.join(rel);
         let mut old_rules = None;
         let mut control = None;
+        let control_name = if self.tree.plain_hidden.is_some() { ".ignore" } else { ".gitignore" };
         if !ignored {
-            let ignore = dir.join(".gitignore");
+            let ignore = dir.join(control_name);
             match fs::symlink_metadata(&ignore) {
                 Ok(m) if m.is_file() => {
                     let bytes =
-                        capture::read_control(self.tree.root, &Path::new(rel).join(".gitignore"), &m)?;
+                        capture::read_control(self.tree.root, &Path::new(rel).join(control_name), &m)?;
                     let mut nested = Vec::new();
                     add_rules(&bytes, self.names.len(), self.tree.fold, &mut nested);
                     if !nested.is_empty() {
@@ -136,7 +138,7 @@ impl Walk<'_> {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if name == ".git" || self.tree.fold && name.eq_ignore_ascii_case(".git") {
+            if self.tree.plain_hidden == Some(false) && name.starts_with('.') || name == ".git" || self.tree.fold && name.eq_ignore_ascii_case(".git") {
                 continue;
             }
             let path = if rel.is_empty() {
@@ -163,7 +165,7 @@ impl Walk<'_> {
                 }
                 continue;
             }
-            let is_control = name == ".gitignore";
+            let is_control = name == control_name;
             // Tracked leaves remain eligible under every ignore rule. Only directories
             // need a component on the stack while visiting their children.
             let match_rules = ty.is_dir() || !tracked;
@@ -183,7 +185,7 @@ impl Walk<'_> {
                         .is_some_and(|p| p.starts_with(&prefix))
                 };
                 if (!excluded || tracked_child())
-                    && (!entry.path().join(".git").try_exists()? || tracked_child())
+                    && (self.tree.plain_hidden.is_some() || !entry.path().join(".git").try_exists()? || tracked_child())
                 {
                     if let Some(jobs) = ready.as_deref_mut() {
                         jobs.push(Directory { rel: path, ignored: excluded, rules: self.rules.clone(), names: self.names.clone() });
@@ -191,7 +193,7 @@ impl Walk<'_> {
                         self.visit(&path, excluded, None)?;
                     }
                 }
-            } else if (tracked || !excluded) && (ty.is_file() || ty.is_symlink()) {
+            } else if (tracked || !excluded) && (ty.is_file() || self.tree.plain_hidden.is_none() && ty.is_symlink()) {
                 let metadata = entry.metadata()?;
                 let stamp = capture::stamp(&metadata);
                 let captured = if is_control && let Some((read_stamp, text)) = control.take() {
@@ -258,8 +260,40 @@ pub fn observe(root: &Path) -> io::Result<Vec<ObservedPath>> {
             add_rules(&bytes, 0, conf.ignore_case, &mut rules)
         }
     }
-    let tree = Tree { root, cache, tracked, fold: conf.ignore_case };
-    let mut walk = Walk { tree: &tree, rules: Arc::new(Rules { parent: None, local: rules }), names: Vec::new(), found: Vec::new() };
+    let tree = Tree { root, cache, tracked, fold: conf.ignore_case, plain_hidden: None };
+    walk(tree, rules, Vec::new())
+}
+
+pub(crate) fn plain_paths(root: &Path, hidden: bool) -> io::Result<Vec<ObservedPath>> {
+    // Anchored parent patterns retain their original base when a caller names
+    // a subdirectory explicitly or starts the command there.
+    let mut names = Vec::new();
+    let mut rules = Vec::new();
+    let ancestors: Vec<_> = root.ancestors().collect();
+    for &dir in ancestors.iter().rev() {
+        if let Some(name) = dir.file_name() {
+            names.push(CString::new(name.as_encoded_bytes()).map_err(invalid)?);
+        }
+        if dir == root { break; }
+        let ignore = dir.join(".ignore");
+        match fs::symlink_metadata(&ignore) {
+            Ok(m) if m.is_file() => {
+                let bytes = capture::read_control(dir, Path::new(".ignore"), &m)?;
+                add_rules(&bytes, names.len(), false, &mut rules);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let tree = Tree { root, cache: None, tracked: Default::default(), fold: false, plain_hidden: Some(hidden) };
+    walk(tree, rules, names)
+}
+
+fn walk(tree: Tree<'_>, rules: Vec<ignore::Rule>, names: Vec<CString>) -> io::Result<Vec<ObservedPath>> {
+    let mut walk = Walk {
+        tree: &tree, rules: Arc::new(Rules { parent: None, local: rules }), names, found: Vec::new(),
+    };
     let workers = if tree.tracked.paths.len() >= 256 {
         std::thread::available_parallelism().map_or(1, |n| n.get()).min(6)
     } else { 1 };

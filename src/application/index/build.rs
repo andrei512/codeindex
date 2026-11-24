@@ -32,15 +32,18 @@ fn analyze(path: &str, body: Option<&str>) -> Local {
     analyze_with_project(path, body, None)
 }
 fn analyze_with_project(path: &str, body: Option<&str>, project: Option<&code::CProject>) -> Local {
+    analyze_products(path, body, project, true, true)
+}
+fn analyze_products(path: &str, body: Option<&str>, project: Option<&code::CProject>, code_needed: bool, markdown_needed: bool) -> Local {
     let text = body.unwrap_or("");
     let code = Language::for_path(path)
-        .filter(|_| body.is_some())
+        .filter(|_| code_needed && body.is_some())
         .map_or_else(Analysis::default, |l| match project {
             Some(p) if matches!(l, Language::C | Language::Cpp) => p.analyze(l, path, text),
             _ => code::analyze(l, text),
         });
     let markdown =
-        (body.is_some() && markdown::is_markdown(path)).then(|| Parsed::parse(path, text));
+        (markdown_needed && body.is_some() && markdown::is_markdown(path)).then(|| Parsed::parse(path, text));
     let mut lf: Vec<_> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
     let partial_line = !text.is_empty() && !text.ends_with('\n');
     if partial_line {
@@ -638,3 +641,6 @@ mod tests {
         assert_eq!(heap, build(64));
     }
 }
+
+mod memory;
+pub(crate) use memory::{MemoryQuery, memory_index};

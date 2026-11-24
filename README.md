@@ -1,10 +1,12 @@
 # Codeindex
 
-Codeindex gives coding agents a local, searchable map of a Git working tree. It installs one command, `cx`. An agent can search for a concept in the docs, jump to a declaration, and follow a call back to the code that uses it. Bare searches print matching source lines. Named queries return JSON with repository-relative paths and locations the agent can open next.
+Codeindex gives coding agents a local, searchable map of a source folder. It installs one command, `cx`. An agent can search for a concept in the docs, jump to a declaration, and follow a call back to the code that uses it. Bare searches print matching source lines. Named queries return JSON with repository-relative paths and locations the agent can open next.
 
 Before changing a retry policy, an agent needs to know where it is documented, which function implements the delay, and who calls that function. Those are three different questions about the same checkout. Codeindex indexes source text, paths, code relationships, and Markdown together so an agent can follow that trail across files.
 
 Run a query anywhere inside the working tree. The first query builds the local index under `~/.codeindex`. Later queries refresh it against your working files, including uncommitted edits and eligible untracked files. There is no separate build command or server to configure.
+
+Outside Git, run the same commands from the folder you want to search. Pattern searches scan the named files or directories directly. Ranked, symbol, reference, and Markdown queries build their query data in RAM and release it when the command exits. Each invocation sees the current files.
 
 ## Install
 
@@ -18,7 +20,7 @@ To install from a checkout, run `cargo install --locked --path .`. The CLI targe
 
 The examples below describe this checkout. The design target, including differences from current behavior, is in the [CLI invocation contract](docs/boxes/cli/invocation.md).
 
-Use `cx PATTERN [PATH...]` for regular expressions. Use `-n` for line numbers, `-H` for filenames, `-F` for literal text, and `-A`, `-B`, or `-C` for context. Ordinary searches use Codeindex's native index. A single explicit file with piped stdout prints source text by default.
+Use `cx PATTERN [PATH...]` for regular expressions. Use `-n` for line numbers, `-H` for filenames, `-F` for literal text, and `-A`, `-B`, or `-C` for context. Inside Git, ordinary searches use Codeindex's native index. A single explicit file with piped stdout prints source text by default.
 
 ```console
 $ cx '^fn main' src/main.rs | head -1

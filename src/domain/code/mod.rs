@@ -474,8 +474,13 @@ impl ForwardNames {
         Self::resolve(units, Self { rows, ..Self::default() })
     }
 
-    fn resolve(units: &[Unit<'_>], mut names: Self) -> Self {
-        let paths: HashMap<_, _> = units.iter().enumerate().map(|(i, u)| (u.path, i)).collect();
+    pub(crate) fn declarations(units: &[Unit<'_>]) -> Self {
+        let mut names = Self::default();
+        names.collect_declarations(units);
+        names
+    }
+
+    fn collect_declarations(&mut self, units: &[Unit<'_>]) {
         for (file, u) in units.iter().enumerate() {
             for (local, d) in u.analysis.declarations.iter().enumerate() {
                 if !d.searchable() {
@@ -483,13 +488,18 @@ impl ForwardNames {
                 }
                 let name = &u.text[d.span.clone()];
                 let site = Site { file, local };
-                if let Some(sites) = names.by_name.get_mut(name) {
+                if let Some(sites) = self.by_name.get_mut(name) {
                     sites.push(site);
                 } else {
-                    names.by_name.insert(name.to_owned(), vec![site]);
+                    self.by_name.insert(name.to_owned(), vec![site]);
                 }
             }
         }
+    }
+
+    fn resolve(units: &[Unit<'_>], mut names: Self) -> Self {
+        let paths: HashMap<_, _> = units.iter().enumerate().map(|(i, u)| (u.path, i)).collect();
+        names.collect_declarations(units);
         direct::resolve(units, &paths, &mut names);
         cfamily::csharp::resolve(units, &paths, &mut names);
         rust::resolve(units, &paths, &mut names);

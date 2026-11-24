@@ -474,3 +474,65 @@ fn indexed_query_differentiates_empty_partial_and_invalid() {
     let invalid=repo.invoke(&repo.root,&["-k","query","--json","--column"]).unwrap();
     assert_eq!(invalid.status.code(),Some(2));
 }
+
+#[test]
+fn plain_folder_scans_operands_and_stdin_without_creating_a_cache() {
+    use std::{io::Write, os::unix::fs::symlink, process::Stdio};
+    let repo = Repo::new();
+    fs::remove_dir_all(repo.root.join(".git")).unwrap();
+    repo.write("lines.txt", "before\nA.b\naXb\nafter\n");
+    repo.write("binary", "A.b\0tail");
+    repo.write(".hidden", "A.b");
+    repo.write(".ignore", "skip.txt\n");
+    repo.write("skip.txt", "A.b");
+    fs::create_dir(repo.root.join("sub")).unwrap();
+    repo.write("sub/skip.txt", "A.b");
+    assert_eq!(repo.invoke(&repo.root, &["-F", "A.b", "sub"]).unwrap().status.code(), Some(1));
+    symlink("lines.txt", repo.root.join("link")).unwrap();
+    assert_eq!(repo.query(&["-niF", "a.b"]), "lines.txt:2:A.b\n");
+    assert_eq!(repo.query(&["-C1", "-F", "A.b", "lines.txt"]), "before\nA.b\naXb\n");
+    assert_eq!(repo.query(&["-l", "-g", "*.txt", "^a.b$"]), "lines.txt\n");
+    assert_eq!(repo.invoke(&repo.root, &["missing"]).unwrap().status.code(), Some(1));
+    assert_eq!(repo.invoke(&repo.root, &["x", "missing.txt"]).unwrap().status.code(), Some(2));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cx")).args(["-n", "yes"])
+        .current_dir(&repo.root).env("HOME", &repo.dir)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"no\nyes\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"2:yes\n");
+    assert!(!repo.dir.join(".codeindex").exists());
+}
+
+#[test]
+fn plain_folder_indexed_queries_match_worktree_and_see_edits() {
+    let repo = Repo::new();
+    let plain = repo.dir.join("plain");
+    fs::create_dir(&plain).unwrap();
+    for (name, body) in [
+        ("lib.ts", "export function retry() { return 1; }\n"),
+        ("main.ts", "import { retry } from './lib';\nfunction work() { retry(); }\n"),
+        ("guide.md", "# Guide\n## Timing\nRetry delay policy\n"),
+        ("link.md", "[timing](guide.md#timing)"),
+    ] {
+        repo.write(name, body);
+        fs::write(plain.join(name), body).unwrap();
+    }
+    let cases: &[&[&str]] = &[
+        &["--symbol", "retry"], &["--reference", "retry"], &["-k", "retry delay"],
+        &["--cx", "section", "guide.md#timing"], &["--cx", "backlinks", "guide.md#timing"],
+    ];
+    let outputs: Vec<_> = cases.iter().map(|args| {
+        let out = repo.invoke(&plain, args).unwrap();
+        assert!(out.status.success(), "{args:?} {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!out.stdout.is_empty(), "{args:?}");
+        out.stdout
+    }).collect();
+    assert!(!repo.dir.join(".codeindex").exists());
+    for (args, output) in cases.iter().zip(outputs) {
+        assert_eq!(output, repo.query(args).as_bytes(), "{args:?}");
+    }
+    fs::write(plain.join("lib.ts"), "export function renamed() {}").unwrap();
+    assert!(String::from_utf8(repo.invoke(&plain, &["--symbol","renamed"]).unwrap().stdout).unwrap().contains("renamed"));
+    assert!(repo.invoke(&plain, &["--symbol","retry"]).unwrap().stdout.is_empty());
+}
