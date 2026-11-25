@@ -84,7 +84,16 @@ def main():
             (directory / "blobs").mkdir()
             (directory / "blobs/blob.bin").write_bytes(b"bad\0\xffsecret_word\n")
             binary = "blobs/blob.bin"
+            (directory / "filters/multi.txt").write_bytes(b"alpha\nbeta\n")
+            (directory / "filters/.rgignore").write_text("hidden-by-rule\n")
+            (directory / "filters/hidden-by-rule").write_text("ignored-token\n")
+            (directory / "patterns.txt").write_text("^alpha$\n")
             commands = [
+                ["-U", r"alpha\nbeta", "filters"], ["--one-file-system", "flush", "filters"],
+                ["--sort", "path", "-d1", "alpha", "filters"],
+                ["-r", "$2:$1", "(fl)(ush)", "filters/mod.py"],
+                ["-f", "patterns.txt", "filters"], ["--pretty", "flush", "filters"],
+                ["ignored-token", "filters"], ["--no-ignore-dot", "ignored-token", "filters"],
                 ["--path-separator", "Z", "-n", "flush", "filters"],
                 ["--path-separator", r"\xFF", "-l", "flush", "filters"],
                 ["--path-separator", "abc", "flush", "filters"],

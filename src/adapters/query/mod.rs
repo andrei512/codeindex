@@ -2,6 +2,7 @@ mod display;
 mod json;
 use display::Display;
 mod lines;
+pub(crate) use lines::pcre::version as pcre_version;
 mod navigation;
 mod relationships;
 mod score;

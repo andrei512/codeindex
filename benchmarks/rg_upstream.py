@@ -13,13 +13,14 @@ def main():
     parser.add_argument("cx", type=Path)
     parser.add_argument("ripgrep", type=Path, help="checkout of ripgrep tag 14.1.1")
     parser.add_argument("results", type=Path, help="directory for the two test logs")
+    parser.add_argument("--pcre2", action="store_true", help="also run upstream PCRE2 tests")
     args = parser.parse_args()
     repo = args.ripgrep.resolve()
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     if revision != "4649aa9700619f94cf9c66876e9549d83420e16c":
         parser.error("expected ripgrep tag 14.1.1")
     build = subprocess.check_output(
-        ["cargo", "test", "--locked", "--test", "integration", "--no-run", "--message-format=json"],
+        ["cargo", "test", "--locked", *(["--features", "pcre2"] if args.pcre2 else []), "--test", "integration", "--no-run", "--message-format=json"],
         cwd=repo, text=True)
     artifacts = {msg["target"]["name"]: Path(msg["executable"]) for msg in
                  (json.loads(line) for line in build.splitlines())

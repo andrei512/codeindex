@@ -40,7 +40,7 @@ impl Rule {
         }
         let directory = bytes.ends_with(b"/");
         if directory {
-            bytes = &bytes[..bytes.len() - 1]
+            bytes = bytes[..bytes.len()-1].strip_suffix(b"\\").unwrap_or(&bytes[..bytes.len()-1]);
         }
         let basename = !bytes.contains(&b'/');
         bytes = bytes.strip_prefix(b"/").unwrap_or(bytes);

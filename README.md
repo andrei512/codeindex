@@ -17,6 +17,8 @@ cargo install --locked codeindex
 To install from a checkout, run `cargo install --locked --path .`. The CLI targets macOS and Linux. On macOS, a watcher keeps the index warm for five minutes after the last request.
 
 
+For lookarounds and backreferences, use `cx -P PATTERN` with the system PCRE2-8 shared library installed. `cx --pcre2-version` checks availability. The default search engine is built into Codeindex.
+
 ## Maintainability score
 
 Run `cx --score` for the repository, `cx --score src/` for a directory, or `cx --score src/main.rs` for a file. A file result explains each finding at its source location. For example, a Python function with five parameters and no other findings prints:

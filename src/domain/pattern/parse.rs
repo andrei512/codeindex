@@ -19,9 +19,14 @@ struct Parser {
     cursor: usize,
     flags: Flags,
     names: std::collections::HashSet<String>,
+    captures: Option<Vec<Option<String>>>,
+    byte_input:bool,
 }
 type Result<T> = std::result::Result<T, String>;
 pub(super) fn parse(pattern: &str, fold: bool) -> Result<Expr> {
+    parse_groups(pattern, fold, false,false).map(|(expr,_)|expr)
+}
+pub(super) fn parse_groups(pattern: &str, fold:bool, save:bool, byte_input:bool) -> Result<(Expr,Vec<Option<String>>)> {
     if pattern.len() > 128 * 1024 {
         return Err("pattern too long".into());
     }
@@ -34,12 +39,14 @@ pub(super) fn parse(pattern: &str, fold: bool) -> Result<Expr> {
             ..Flags::default()
         },
         names: Default::default(),
+        captures: save.then(Vec::new),
+        byte_input,
     };
     let body = p.expression(0)?;
     if p.peek().is_some() {
         return Err("unexpected closing parenthesis".into());
     }
-    Ok(body)
+    Ok((body,p.captures.unwrap_or_default()))
 }
 impl Parser {
     fn peek(&self) -> Option<char> {
@@ -81,7 +88,7 @@ impl Parser {
             }
         }
     }
-    fn capture_name(&mut self) -> Result<()> {
+    fn capture_name(&mut self) -> Result<String> {
         let start = self.cursor;
         if !self.peek().is_some_and(|c| c == '_' || c.is_alphabetic()) {
             return Err("invalid capture name".into());
@@ -92,12 +99,15 @@ impl Parser {
         {
             self.cursor += 1
         }
-        let name = self.chars[start..self.cursor].iter().collect();
+        let name:String = self.chars[start..self.cursor].iter().collect();
         self.expect('>')?;
-        if !self.names.insert(name) {
+        if !self.names.insert(name.clone()) {
             return Err("duplicate capture name".into());
         }
-        Ok(())
+        Ok(name)
+    }
+    fn capture(&mut self,name:Option<String>)->Option<usize>{
+        let names=self.captures.as_mut()?; names.push(name); Some(names.len())
     }
     fn expression(&mut self, depth: usize) -> Result<Expr> {
         if depth > 100 {
@@ -143,6 +153,7 @@ impl Parser {
         match c {
             '(' => {
                 let saved = self.flags;
+                let mut group=None;
                 if self.eat('?') {
                     if self.eat('<')
                         || (self.peek() == Some('P')
@@ -152,11 +163,12 @@ impl Parser {
                                 true
                             })
                     {
-                        self.capture_name()?;
+                        let name=self.capture_name()?;
+                        group=self.capture(Some(name));
                         let e = self.expression(depth + 1)?;
                         self.expect(')')?;
                         self.flags = saved;
-                        return Ok(e);
+                        return Ok(if let Some(i)=group {Expr::Capture(i,Box::new(e))} else {e});
                     }
                     let mut on = true;
                     let mut modified = false;
@@ -194,14 +206,14 @@ impl Parser {
                     if !self.eat(':') {
                         return Err("unsupported group construct or regex flags".into());
                     }
-                }
+                } else {group=self.capture(None);}
                 let e = self.expression(depth + 1)?;
                 self.expect(')')?;
                 self.flags = saved;
-                Ok(e)
+                Ok(if let Some(i)=group {Expr::Capture(i,Box::new(e))} else {e})
             }
             '[' => self.bracket(),
-            '.' if !self.flags.unicode => Err("byte-mode dot can match invalid UTF-8".into()),
+            '.' if !self.flags.unicode && !self.byte_input => Err("byte-mode dot can match invalid UTF-8".into()),
             '.' => Ok(Expr::Class(Class {
                 members: if self.flags.dot_all {
                     vec![]
@@ -262,7 +274,7 @@ impl Parser {
                 let m = self.escaped(c)?;
                 if !self.flags.unicode {
                     let set = self.class_set(m);
-                    if !set.0.iter().all(|r| r.1 < 128) {
+                    if !self.byte_input && !set.0.iter().all(|r| r.1 < 128) {
                         return Err("byte escape can match invalid UTF-8".into());
                     }
                     return Ok(self.one(Member::Set(set)));
@@ -502,7 +514,7 @@ impl Parser {
     }
     fn bracket(&mut self) -> Result<Expr> {
         let set = self.bracket_set(0)?;
-        if !self.flags.unicode && set.0.iter().any(|r| r.1 > 127) {
+        if !self.byte_input && !self.flags.unicode && set.0.iter().any(|r| r.1 > 127) {
             return Err("byte class can match invalid UTF-8".into());
         }
         Ok(self.one(Member::Set(set)))

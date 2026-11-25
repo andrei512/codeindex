@@ -1,6 +1,7 @@
 //! Prioritized Thompson automaton shared by content regex and byte-oriented path glob queries.
 mod glob;
 mod parse;
+mod captures;
 mod sets;
 mod unicode;
 pub use glob::Glob;
@@ -84,6 +85,7 @@ impl Assertion {
 }
 #[derive(Debug)]
 enum Expr {
+    Capture(usize,Box<Expr>),
     Empty,
     Class(Class),
     Assert(Assertion),
@@ -130,6 +132,7 @@ fn required_literal(expr: &Expr, best: &mut String) {
 }
 #[derive(Debug)]
 enum Inst {
+    Save(usize,usize),
     Accept,
     Consume(Class, usize),
     Assert(Assertion, usize),
@@ -149,11 +152,15 @@ enum Starts {
 pub struct Regex {
     start: usize,
     program: Vec<Inst>,
+    names: Vec<Option<String>>,
     required: String,
     starts: Starts,
 }
 pub(crate) fn word_char(c: char) -> bool { unicode::word(c) }
 impl Regex {
+    pub(crate) fn instruction_bytes(&self) -> usize {
+        std::mem::size_of_val(self.program.as_slice())
+    }
     pub fn new(pattern: &str) -> Result<Self, String> {
         Self::with_case_folding(pattern, false)
     }
@@ -189,7 +196,24 @@ impl Regex {
             start,
             program,
             required,
+            names: Vec::new(),
         })
+    }
+    pub(crate) fn byte_input(pattern:&str,fold:bool,groups:bool)->Result<Self,String> {
+        let(expr,names)=parse::parse_groups(pattern,fold,groups,true)?;
+        let mut re=Self::compile(expr)?;re.names=names;Ok(re)
+    }
+    pub(crate) fn capturing(pattern:&str,fold:bool)->Result<Self,String>{
+        let (expr,names)=parse::parse_groups(pattern,fold,true,false)?;
+        let mut re=Self::compile(expr)?;
+        re.names=names;
+        Ok(re)
+    }
+    pub(crate) fn capture_id(&self,name:&str)->Option<usize>{
+        name.parse().ok().or_else(||self.names.iter().position(|v|v.as_deref()==Some(name)).map(|i|i+1))
+    }
+    pub(crate) fn groups(&self,text:&str,range:Range<usize>)->Option<Vec<Option<Range<usize>>>>{
+        captures::groups(self,text,range)
     }
     pub fn required_literal(&self) -> &str {
         &self.required
@@ -228,6 +252,7 @@ fn push(p: &mut Vec<Inst>, inst: Inst) -> Result<usize, String> {
 }
 fn emit(e: &Expr, next: usize, p: &mut Vec<Inst>) -> Result<usize, String> {
     match e {
+        Expr::Capture(i,body)=> { let end=push(p,Inst::Save(i*2+1,next))?; let start=emit(body,end,p)?; push(p,Inst::Save(i*2,start)) },
         Expr::Empty => Ok(next),
         Expr::Class(c) => push(p, Inst::Consume(c.clone(), next)),
         Expr::Assert(a) => push(p, Inst::Assert(*a, next)),
@@ -355,6 +380,7 @@ impl Scratch {
                         self.stack.clear();
                         break;
                     }
+                    Inst::Save(_,next) => self.stack.push((*next,start)),
                     Inst::Fork(a, b) => {
                         self.stack.push((*b, start));
                         self.stack.push((*a, start))

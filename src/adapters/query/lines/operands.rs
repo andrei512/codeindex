@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) fn separator(value: &str) -> Result<Option<u8>, String> {
+pub(super) fn unescape(value: &str) -> Vec<u8> {
     let mut bytes = value.bytes().peekable();
     let mut decoded = Vec::new();
     while let Some(byte) = bytes.next() {
@@ -42,6 +42,11 @@ pub(super) fn separator(value: &str) -> Result<Option<u8>, String> {
         bytes.next();
         decoded.push(escaped);
     }
+    decoded
+}
+
+pub(super) fn separator(value: &str) -> Result<Option<u8>, String> {
+    let decoded = unescape(value);
     match decoded.as_slice() {
         [] => Ok(None),
         [byte] => Ok(Some(*byte)),
@@ -63,7 +68,11 @@ impl Lines<'_> {
                 }
             }
         }
-        out.extend_from_slice(suffix);
+        if self.null_path {
+            out.push(0);
+        } else {
+            out.extend_from_slice(suffix);
+        }
     }
 
     pub(super) fn operand(&self, cwd: &Path, name: &str, outcome: &mut Outcome) -> Option<PathBuf> {
@@ -100,13 +109,47 @@ impl Lines<'_> {
         out: &mut Vec<u8>,
         stats: &mut events::Stats,
     ) -> bool {
-        if self.text {
+        self.scan_input(name, bytes, show_path, true, out, stats)
+    }
+
+    pub(super) fn scan_input(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        show_path: bool,
+        explicit: bool,
+        out: &mut Vec<u8>,
+        stats: &mut events::Stats,
+    ) -> bool {
+        let decoded = self.encoding.decode(bytes);
+        let bytes = decoded.as_ref();
+        if self.text || self.null_data {
             return self.scan(name, bytes, show_path, out, stats);
         }
         let Some(offset) = bytes.iter().position(|&b| b == 0) else {
             return self.scan(name, bytes, show_path, out, stats);
         };
-        if self.count || self.list || self.quiet || self.json {
+        // A buffered search can emit complete records from earlier reads before
+        // it observes the first NUL. The read containing the NUL is withheld.
+        let block_start = offset / (64 * 1024) * (64 * 1024);
+        let prior = bytes[..block_start]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        if !explicit && !self.binary {
+            if self.count || self.without || prior == 0 {
+                return false;
+            }
+            let hit = self.scan(name, &bytes[..prior], show_path, out, stats);
+            if hit && !self.quiet && !self.list {
+                if self.filename.unwrap_or(show_path) {
+                    self.print_path(out, name, b": ");
+                }
+                writeln!(out,"WARNING: stopped searching binary file after match (found \"\\0\" byte around offset {offset})").unwrap();
+            }
+            return hit;
+        }
+        if self.count || self.without || self.list || self.quiet || self.json {
             let mut lines = bytes.to_vec();
             for b in &mut lines {
                 if *b == 0 {
@@ -114,6 +157,9 @@ impl Lines<'_> {
                 }
             }
             return self.scan(name, &lines, show_path, out, stats);
+        }
+        if prior != 0 {
+            self.scan(name, &bytes[..prior], show_path, out, stats);
         }
         let hit = self.max != Some(0)
             && bytes

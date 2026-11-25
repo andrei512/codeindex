@@ -10,6 +10,9 @@ fn literal(c: char, s: &mut String) {
 }
 impl Glob {
     pub fn new(pattern: &str) -> Result<Self, String> {
+        Self::with_case(pattern,false)
+    }
+    pub(crate) fn with_case(pattern:&str,fold:bool)->Result<Self,String>{
         if pattern.len() > 16_384 {
             return Err("glob is too long".into());
         }
@@ -94,7 +97,7 @@ impl Glob {
             return Err("unclosed glob alternate".into());
         }
         out.push_str(")\\z");
-        Regex::new(&out).map(Self)
+        Regex::with_case_folding(&out,fold).map(Self)
     }
     pub fn is_match(&self, path: &str) -> bool {
         let mut scratch = Scratch::new(self.0.program.len());

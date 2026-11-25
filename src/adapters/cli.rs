@@ -6,7 +6,21 @@ use std::{
     process::ExitCode,
 };
 mod help;
+mod search_args;
 pub(crate) use help::{argument_error, is_command};
+pub(crate) fn name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::args_os()
+            .next()
+            .and_then(|s| {
+                std::path::Path::new(&s)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "cx".into())
+    })
+}
 pub fn run(
     args: impl Iterator<Item = OsString>,
     mut out: impl Write,
@@ -54,9 +68,27 @@ pub fn run(
             }
             Err(e) => Err(e),
         }
+    } else if args.as_slice() == ["--pcre2-version"] {
+        match super::query::pcre_version() {
+            Ok(v) => writeln!(out, "{v}"),
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                return ExitCode::FAILURE;
+            }
+        }
     } else if args.as_slice() == ["--version"] {
         writeln!(out, "cx {}", env!("CARGO_PKG_VERSION"))
     } else {
+        let indexed = args.first().is_some_and(|arg| {
+            matches!(
+                arg.as_str(),
+                "--score" | "--cx" | "-k" | "--keywords" | "--symbol" | "--reference" | "--refs"
+            )
+        });
+        if !indexed && let Err(e) = search_args::expand(&mut args, &mut err) {
+            let _ = writeln!(err, "{}: {e}", name());
+            return ExitCode::from(2);
+        }
         if args.is_empty() {
             let _ = writeln!(err, "cx: a search pattern is required");
             return ExitCode::from(2);
@@ -77,13 +109,17 @@ pub fn run(
         let req = match Invocation::parse(&args) {
             Ok(r) => r,
             Err(e) => {
-                let _ = writeln!(err, "cx: {e}");
+                let _ = writeln!(err, "{}: {e}", name());
                 return ExitCode::from(2);
             }
         };
         if let super::query::Request::Lines(lines) = &req.request {
             if let Some(list) = lines.type_listing() {
-                return if out.write_all(list.as_bytes()).and_then(|_| out.flush()).is_ok() {
+                return if out
+                    .write_all(list.as_bytes())
+                    .and_then(|_| out.flush())
+                    .is_ok()
+                {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::from(2)
@@ -96,15 +132,11 @@ pub fn run(
                 use std::io::Read;
                 let mut input = Vec::new();
                 if let Err(e) = std::io::stdin().read_to_end(&mut input) {
-                    let _ = writeln!(err, "cx: {e}");
+                    let _ = writeln!(err, "{}: {e}", name());
                     return ExitCode::from(2);
                 }
                 let (text, hit) = lines.stream(&input);
-                if out
-                    .write_all(&text)
-                    .and_then(|_| out.flush())
-                    .is_err()
-                {
+                if out.write_all(&text).and_then(|_| out.flush()).is_err() {
                     return ExitCode::from(2);
                 }
                 return ExitCode::from(u8::from(!hit));
@@ -114,8 +146,13 @@ pub fn run(
             let cwd = std::env::current_dir()?;
             let is_lines = matches!(req.request, super::query::Request::Lines(_));
             let mut result = Outcome::default();
-            let answer = if let Some(root) = super::repository::find_worktree(&cwd)? {
-                if let Some(code) = super::watcher::query(&root, &cwd, &args, &mut out, &mut err)? {
+            let root = super::repository::find_worktree(&cwd)?
+                .filter(|root| !is_lines || super::repository::usable_marker(root));
+            let answer = if let Some(root) = root {
+                if !matches!(&req.request, super::query::Request::Lines(lines) if lines.requires_caller())
+                    && let Some(code) =
+                        super::watcher::query(&root, &cwd, &args, &mut out, &mut err)?
+                {
                     return Ok(code);
                 }
                 evaluate(&Pin::refresh_root(root, None)?, req, &cwd, &mut result)?
@@ -135,7 +172,7 @@ pub fn run(
             Ok(code) if out.flush().is_ok() => code,
             Ok(_) => ExitCode::FAILURE,
             Err(e) => {
-                let _ = writeln!(err, "cx: {e}");
+                let _ = writeln!(err, "{}: {e}", name());
                 ExitCode::from(2)
             }
         };
@@ -143,7 +180,7 @@ pub fn run(
     match result.and_then(|_| out.flush()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let _ = writeln!(err, "cx: {e}");
+            let _ = writeln!(err, "{}: {e}", name());
             ExitCode::FAILURE
         }
     }

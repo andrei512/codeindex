@@ -8,6 +8,7 @@ mod inflate;
 mod key;
 mod provenance;
 mod sparse;
+pub(crate) mod search_paths;
 mod walk_pool;
 pub use capture::{capture, capture_observed};
 pub(crate) use capture::CaptureRoot;
@@ -216,6 +217,10 @@ impl Walk<'_> {
         Ok(())
     }
 }
+pub(crate) fn usable_marker(root:&Path)->bool {
+    root.join(".git").is_dir() || git_dirs(root).is_ok()
+}
+
 fn git_dirs(root: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let marker = root.join(".git");
     let git = if marker.is_dir() {
