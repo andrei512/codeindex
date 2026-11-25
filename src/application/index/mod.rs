@@ -27,8 +27,9 @@ pub(crate) fn same_observation(a: &[ObservedPath], b: &[ObservedPath]) -> bool {
             .zip(b)
             .all(|(a, b)| a.path == b.path && a.stamp == b.stamp)
 }
-pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE4";
+pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE5";
 pub struct Entry {
+    pub(crate) test_score: crate::domain::code::score::Saved,
     pub(crate) score: crate::domain::code::score::Saved,
     pub(crate) blob: Option<crate::domain::BlobId>,
     catalog_row: Range<u64>,
@@ -94,12 +95,16 @@ impl Entry {
         for &end in ends {
             put(w, end)?;
         }
-        self.write_score(w)?;
+        Self::write_score(w, &self.score)?;
+        Self::write_score(w, &self.test_score)?;
         Ok(())
     }
-    fn write_score(&self, w: &mut impl Write) -> io::Result<()> {
-        w.write_all(&[u8::from(self.score.is_some())])?;
-        if let Some(s) = &self.score {
+    fn write_score(
+        w: &mut impl Write,
+        saved: &crate::domain::code::score::Saved,
+    ) -> io::Result<()> {
+        w.write_all(&[u8::from(saved.is_some())])?;
+        if let Some(s) = saved {
             put(w, s.lines)?;
             put(w, s.findings.len())?;
             for f in &s.findings {
@@ -112,10 +117,36 @@ impl Entry {
         Ok(())
     }
 }
+fn read_score(d: &mut Decoder) -> io::Result<crate::domain::code::score::Saved> {
+    Ok(match d.take(1)? {
+        [0] => None,
+        [1] => {
+            use crate::domain::code::score::{Finding, Rule, Score};
+            let lines = d.num()?;
+            let count = d.num()?;
+            let mut findings = Vec::new();
+            for _ in 0..count {
+                let rule = *Rule::ALL.get(d.take(1)?[0] as usize).ok_or_else(bad)?;
+                let line = d.num()?;
+                let value = d.num()?;
+                let unit = d.string()?.to_owned();
+                findings.push(Finding {
+                    rule,
+                    line,
+                    value,
+                    unit,
+                });
+            }
+            Some(std::sync::Arc::new(Score { lines, findings }))
+        }
+        _ => return Err(bad()),
+    })
+}
 pub(crate) fn files(bytes: &[u8], source_len: u64) -> io::Result<Vec<Entry>> {
     let mut d = Decoder(bytes);
     let catalog_size = bytes.len();
-    let scores = bytes.starts_with(CATALOG_MAGIC);
+    let test_scores = bytes.starts_with(CATALOG_MAGIC);
+    let scores = test_scores || bytes.starts_with(b"CIXFILE4");
     let hashes = scores || bytes.starts_with(b"CIXFILE3");
     let packed = hashes || bytes.starts_with(b"CIXFILE2");
     if packed {
@@ -177,37 +208,17 @@ pub(crate) fn files(bytes: &[u8], source_len: u64) -> io::Result<Vec<Entry>> {
         {
             return Err(bad());
         }
-        let score = if scores {
-            match d.take(1)? {
-                [0] => None,
-                [1] => {
-                    use crate::domain::code::score::{Finding, Rule, Score};
-                    let lines = d.num()?;
-                    let count = d.num()?;
-                    let mut findings = Vec::new();
-                    for _ in 0..count {
-                        let rule = *Rule::ALL.get(d.take(1)?[0] as usize).ok_or_else(bad)?;
-                        let line = d.num()?;
-                        let value = d.num()?;
-                        let unit = d.string()?.to_owned();
-                        findings.push(Finding {
-                            rule,
-                            line,
-                            value,
-                            unit,
-                        });
-                    }
-                    Some(std::sync::Arc::new(Score { lines, findings }))
-                }
-                _ => return Err(bad()),
-            }
+        let score = if scores { read_score(&mut d)? } else { None };
+        let test_score = if test_scores {
+            read_score(&mut d)?
         } else {
             None
         };
         files.push(Entry {
+            test_score,
             score,
             blob,
-            catalog_row: if hashes {
+            catalog_row: if test_scores {
                 row_start..(catalog_size - d.0.len()) as u64
             } else {
                 0..0

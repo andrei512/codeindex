@@ -1,0 +1,429 @@
+{
+  "split": "dev",
+  "selected_files": 479,
+  "repositories": 41,
+  "binary_sha256": [
+    "16cdbb2b1b81b13feeda3d60397664aa84038615cd55ab1f77d303d1f288d3a8",
+    "82cf09ce40cb91616ccb7dacafaf90cac670dd8901dfe947052e03aba2f5d747"
+  ],
+  "conditional_challenge": [
+    {
+      "yes_silent": 3,
+      "no_silent": 3,
+      "uncertain_silent": 1
+    },
+    {
+      "yes_flagged": 3,
+      "no_silent": 3,
+      "uncertain_silent": 1
+    }
+  ],
+  "review": [
+    {
+      "conditional_logic": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_flagged": 2,
+        "negative_silent": 41
+      },
+      "verbosity": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_silent": 40,
+        "positive_silent": 2,
+        "uncertain": 1
+      }
+    },
+    {
+      "conditional_logic": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_silent": 43
+      },
+      "verbosity": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_silent": 40,
+        "positive_silent": 2,
+        "uncertain": 1
+      }
+    }
+  ],
+  "changes": [
+    {
+      "repository": "Alamofire/Alamofire",
+      "path": "Tests/CacheTests.swift",
+      "before": 9.842730062691357,
+      "after": 10,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 179,
+          "unit": "verifyResponse",
+          "value": 2,
+          "threshold": 2
+        }
+      ],
+      "added": []
+    },
+    {
+      "repository": "google/googletest",
+      "path": "googletest/test/googletest-printers-test.cc",
+      "before": 9.536386775820922,
+      "after": 9.24065629842734,
+      "removed": [],
+      "added": [
+        {
+          "rule": "conditional test expectation",
+          "line": 1169,
+          "unit": "indexed assertions in alternative loop arms",
+          "value": 2,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-fs-readdir.c",
+      "before": 9.24065629842734,
+      "after": 9.387218218812514,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 465,
+          "unit": "readdir_symlink_readdir_cb",
+          "value": 2,
+          "threshold": 2
+        }
+      ],
+      "added": []
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-fs.c",
+      "before": 6.6977506970276295,
+      "after": 6.850428222656731,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 854,
+          "unit": "check_utime",
+          "value": 4,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 4112,
+          "unit": "thread_main",
+          "value": 2,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 854,
+          "unit": "check_utime",
+          "value": 2,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-ipc-send-recv.c",
+      "before": 9.096655465156703,
+      "after": 9.387218218812514,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 88,
+          "unit": "recv_cb",
+          "value": 4,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 301,
+          "unit": "read_cb",
+          "value": 4,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 377,
+          "unit": "run_ipc_send_recv_helper",
+          "value": 2,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 88,
+          "unit": "recv_cb",
+          "value": 2,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 301,
+          "unit": "read_cb",
+          "value": 3,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-ping-pong.c",
+      "before": 9.24065629842734,
+      "after": 9.24065629842734,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 121,
+          "unit": "pinger_read_cb",
+          "value": 3,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 121,
+          "unit": "pinger_read_cb",
+          "value": 2,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-platform-output.c",
+      "before": 7.807211195951886,
+      "after": 7.867478299822955,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 27,
+          "unit": "TEST_IMPL",
+          "value": 7,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 27,
+          "unit": "TEST_IMPL",
+          "value": 6,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-poll.c",
+      "before": 6.927249385808097,
+      "after": 7.086076582386545,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 178,
+          "unit": "connection_close_cb",
+          "value": 4,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 207,
+          "unit": "connection_poll_cb",
+          "value": 7,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 178,
+          "unit": "connection_close_cb",
+          "value": 2,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 207,
+          "unit": "connection_poll_cb",
+          "value": 5,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "libuv/libuv",
+      "path": "test/test-write-cancel.c",
+      "before": 9.842730062691357,
+      "after": 9.842730062691357,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 186,
+          "unit": "pipe_cancel_setup",
+          "value": 3,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 186,
+          "unit": "pipe_cancel_setup",
+          "value": 2,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "moby/buildkit",
+      "path": "frontend/dockerfile/dockerfile_history_test.go",
+      "before": 9.278514194865718,
+      "after": 9.35180736302492,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 211,
+          "unit": "testHistoryError",
+          "value": 4,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 211,
+          "unit": "testHistoryError",
+          "value": 3,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "pallets/click",
+      "path": "tests/test_termui.py",
+      "before": 6.286645056343968,
+      "after": 5.926693970329248,
+      "removed": [],
+      "added": [
+        {
+          "rule": "conditional test expectation",
+          "line": 1709,
+          "unit": "expected_output",
+          "value": 4,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assert/Common/Collect-Input.Tests.ps1",
+      "before": 9.387218218812514,
+      "after": 10,
+      "removed": [
+        {
+          "rule": "compound conditions",
+          "line": 81,
+          "unit": "<file>",
+          "value": 2,
+          "threshold": 2
+        },
+        {
+          "rule": "branch complexity",
+          "line": 1,
+          "unit": "<file>",
+          "value": 14,
+          "threshold": 9
+        }
+      ],
+      "added": []
+    },
+    {
+      "repository": "spf13/cobra",
+      "path": "command_test.go",
+      "before": 7.818741311404713,
+      "after": 8.00145701917924,
+      "removed": [
+        {
+          "rule": "nested regions",
+          "line": 1431,
+          "unit": "TestSuggestions",
+          "value": 4,
+          "threshold": 2
+        },
+        {
+          "rule": "nested regions",
+          "line": 1719,
+          "unit": "testPersistentHooks",
+          "value": 2,
+          "threshold": 2
+        }
+      ],
+      "added": [
+        {
+          "rule": "nested regions",
+          "line": 1431,
+          "unit": "TestSuggestions",
+          "value": 3,
+          "threshold": 2
+        }
+      ]
+    },
+    {
+      "repository": "spf13/cobra",
+      "path": "completions_test.go",
+      "before": 4.030979126869904,
+      "after": 3.8748455707112774,
+      "removed": [],
+      "added": [
+        {
+          "rule": "conditional test expectation",
+          "line": 3990,
+          "unit": "expectedNumSubCommands",
+          "value": 3,
+          "threshold": 2
+        }
+      ]
+    }
+  ],
+  "synthetic_controls": {
+    "files": 34,
+    "passing_before": 24,
+    "passing_after": 34
+  },
+  "other_checks": {
+    "suite_nesting_paired_cases": 245,
+    "plain_and_indexed_verified": true,
+    "paired_preferences_unchanged": false,
+    "localized_verbosity_unchanged": true,
+    "compatibility_byte_identical": true,
+    "codescene_macro_mae": [
+      0.2603198029982371,
+      0.26030848449323585
+    ],
+    "go_within_half": [
+      3972,
+      3971
+    ],
+    "aromalia_files_with_findings": [
+      80,
+      69
+    ]
+  },
+  "warm_full_corpus_score_query_ms": {
+    "files": 477,
+    "rounds": 21,
+    "old_ms": 15.7875,
+    "new_ms": 29.296875,
+    "median_paired_delta_ms": 12.673542
+  }
+}

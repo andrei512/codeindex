@@ -23,3 +23,4 @@ flowchart LR
 
 - [From a finding to a score](interpretation.md) follows a five-parameter function through collection, aggregation and validation.
 - [Recognizing test code](test-code.md) explains how to use `cx --score --roles` to distinguish runnable tests, helpers and production code in one file.
+- [Designing a maintainability score for tests](test-scoring-design.md) explains the proposed rules, the empirical evidence, and how a rule earns a place in the score.

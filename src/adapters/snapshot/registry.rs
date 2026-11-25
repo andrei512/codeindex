@@ -93,7 +93,7 @@ const RULES: &[Rule] = &[
     revised(44, CODE),
     revised(45, CODE), // SQL dollar-quoted bodies
     repaired_profile(46), // Additional native language profiles and their evidence.
-    Rule { revision: 5, from: &[1, 2, 3, 4], ..rule(47, bit(FILES)) }, // File-local score semantics.
+    Rule { revision: 6, from: &[1, 2, 3, 4, 5], ..rule(47, bit(FILES)) }, // File-local score semantics.
 ];
 const _: () = assert!(N == 8 && SOURCE == 2);
 

@@ -4,7 +4,13 @@ use super::{Analysis, Language, Token};
 use std::sync::Arc;
 mod control;
 mod duplicates;
+mod embedded_tests;
+mod registrations;
 mod scan;
+mod suite_length;
+pub(crate) mod suite_nesting;
+pub(crate) mod test_logic;
+pub(crate) use suite_length::{adjust as suite_adjustment, candidate as suite_candidate};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -16,9 +22,10 @@ pub(crate) enum Rule {
     Nesting,
     Arguments,
     Duplication,
+    Oracle,
 }
 impl Rule {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Complexity,
         Self::Length,
         Self::Conditionals,
@@ -26,6 +33,7 @@ impl Rule {
         Self::Nesting,
         Self::Arguments,
         Self::Duplication,
+        Self::Oracle,
     ];
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -36,32 +44,68 @@ impl Rule {
             Self::Nesting => "nesting depth",
             Self::Arguments => "parameters",
             Self::Duplication => "similar body (code lines)",
+            Self::Oracle => "conditional test expectation",
         }
     }
     pub(crate) fn threshold(self) -> usize {
         match self {
             Self::Complexity => 9,
             Self::Length => 70,
-            Self::Conditionals | Self::Bumps => 2,
+            Self::Conditionals | Self::Bumps | Self::Oracle => 2,
             Self::Nesting => 4,
             Self::Arguments => 5,
             Self::Duplication => 10,
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Finding {
     pub rule: Rule,
     pub line: usize,
     pub unit: String,
     pub value: usize,
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Score {
     pub lines: usize,
     pub findings: Vec<Finding>,
 }
 pub(crate) type Saved = Option<Arc<Score>>;
+/// Store an override only when the default policy changes the base score.
+pub(super) fn for_tests(
+    path: &str,
+    text: &str,
+    base: Option<&Score>,
+    analysis: &Analysis,
+    project: bool,
+    syntax: Option<(&[Token], &[usize])>,
+) -> Saved {
+    let original = base.filter(|s| s.lines > 0)?;
+    let mut adjusted = suite_candidate(path, original)
+        .and_then(|lang| suite_adjustment(lang, path, text, original));
+    if let Some(lang) = suite_nesting::candidate(path)
+        && let Some(result) =
+            suite_nesting::adjust(lang, path, text, adjusted.as_ref().unwrap_or(original))
+    {
+        adjusted = Some(result);
+    }
+    if let Some(lang) = test_logic::candidate(path) {
+        // The test policy measures written C syntax independently of build flags.
+        let facts = (!(project && matches!(lang, Language::C | Language::Cpp))).then_some(analysis);
+        if let Some(result) = test_logic::adjust(
+            lang,
+            path,
+            text,
+            adjusted.as_ref().unwrap_or(original),
+            facts,
+            syntax,
+        ) {
+            adjusted = Some(result);
+        }
+    }
+    adjusted.filter(|s| s != original).map(Arc::new)
+}
+
 impl Score {
     fn record(&mut self, rule: Rule, value: usize, line: usize, name: &str) {
         if value >= rule.threshold() {
@@ -74,7 +118,7 @@ impl Score {
         }
     }
     pub(crate) fn value(&self) -> f64 {
-        let mut sums = [0.; 7];
+        let mut sums = [0.; 8];
         let mut deeply_nested_units = 0usize;
         for f in &self.findings {
             let value = f.value as f64;
@@ -89,12 +133,21 @@ impl Score {
                 *total += value;
             }
         }
-        let [cc, lines, conditions, bumps, nesting, args, duplicates] = sums;
+        let [
+            cc,
+            lines,
+            conditions,
+            bumps,
+            nesting,
+            args,
+            duplicates,
+            oracle,
+        ] = sums;
         let base = if cc > 0. || lines > 0. { 2_f64 } else { 0. };
         let penalty = (cc * 0.18).max(base.max(lines * 0.036) + conditions)
             // Taper repeated bumps within a unit. Count independent deep units
             // separately so one function cannot mask complexity in another.
-            + bumps
+            + bumps + oracle
             + nesting + deeply_nested_units.saturating_sub(1) as f64
             + if args > 0. { 2. } else { 0. }
             + if duplicates > 0. { 4. } else { 0. };

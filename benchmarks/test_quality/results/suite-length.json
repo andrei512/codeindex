@@ -1,0 +1,470 @@
+{
+  "split": "dev",
+  "files": 479,
+  "scored": 469,
+  "old_digest": "bce5ffb64ba9049424dbc71652f07b02508d9d4eb4e42015d34137201858f1a8",
+  "new_digest": "08552f282414aae6e4c0bda59f6d64c98636bec921a122db16f804c9044d874a",
+  "files_changed": [
+    {
+      "repository": "dart-lang/http",
+      "path": "pkgs/cronet_http/example/integration_test/client_profile_test.dart",
+      "old_score": 7.768440804861117,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 14,
+          "unit": "main",
+          "value": 449,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "dart-lang/http",
+      "path": "pkgs/http2/test/src/ping/ping_handler_test.dart",
+      "old_score": 9.532775845509097,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 14,
+          "unit": "main",
+          "value": 84,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/Format.Tests.ps1",
+      "old_score": 7.118133413768606,
+      "new_score": 7.640091518201925,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 129,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assert/Collection/Should-Any.Tests.ps1",
+      "old_score": 7.2037170675758295,
+      "new_score": 7.698879041274348,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 121,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assert/Common/Collect-Input.Tests.ps1",
+      "old_score": 8.418757860080508,
+      "new_score": 8.679575849015762,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 110,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assert/General/Should-Be.Tests.ps1",
+      "old_score": 8.149131720230491,
+      "new_score": 8.54537958097891,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 85,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assert/General/Should-BeLessThanOrEqual.Tests.ps1",
+      "old_score": 8.429228015211379,
+      "new_score": 8.816158827775617,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 80,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "pester/Pester",
+      "path": "tst/functions/assertions/BeGreaterThan.Tests.ps1",
+      "old_score": 8.661726120736933,
+      "new_score": 9.096655465156703,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 87,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "rack/rack",
+      "path": "test/spec_mock_request.rb",
+      "old_score": 8.59234709622734,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 268,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "rack/rack",
+      "path": "test/spec_response.rb",
+      "old_score": 7.053120523635496,
+      "new_score": 8.434992897733945,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 450,
+          "unit": "each",
+          "value": 148,
+          "threshold": 70
+        },
+        {
+          "rule": "unit lines",
+          "line": 641,
+          "unit": "each",
+          "value": 153,
+          "threshold": 70
+        },
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 324,
+          "threshold": 70
+        }
+      ],
+      "after": [
+        {
+          "rule": "unit lines",
+          "line": 450,
+          "unit": "each",
+          "value": 148,
+          "threshold": 70
+        },
+        {
+          "rule": "unit lines",
+          "line": 641,
+          "unit": "each",
+          "value": 153,
+          "threshold": 70
+        }
+      ]
+    },
+    {
+      "repository": "rack/rack",
+      "path": "test/spec_tempfile_reaper.rb",
+      "old_score": 9.366543680976836,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 115,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/check.sql",
+      "old_score": 8.982705754785211,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 189,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/index.sql",
+      "old_score": 6.666497829029363,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 729,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/pktap.sql",
+      "old_score": 8.59234709622734,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 268,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/proctap.sql",
+      "old_score": 7.712828635839234,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 462,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/ruletap.sql",
+      "old_score": 8.30404040792573,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 329,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    },
+    {
+      "repository": "theory/pgtap",
+      "path": "test/sql/unique.sql",
+      "old_score": 8.897044087751382,
+      "new_score": 10,
+      "before": [
+        {
+          "rule": "unit lines",
+          "line": 1,
+          "unit": "<file>",
+          "value": 206,
+          "threshold": 70
+        }
+      ],
+      "after": []
+    }
+  ],
+  "files_scoring_higher": 17,
+  "files_scoring_lower": 0,
+  "before": {
+    "conditional_logic": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_flagged": 4,
+      "negative_silent": 36,
+      "unscored": 3
+    },
+    "verbosity": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_flagged": 8,
+      "negative_silent": 30,
+      "positive_silent": 2,
+      "uncertain": 1,
+      "unscored": 2
+    }
+  },
+  "after": {
+    "conditional_logic": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_flagged": 4,
+      "negative_silent": 36,
+      "unscored": 3
+    },
+    "verbosity": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_silent": 38,
+      "positive_silent": 2,
+      "uncertain": 1,
+      "unscored": 2
+    }
+  },
+  "localized_verbosity": [
+    {
+      "unit": "TestActiveHelpWithComps",
+      "path": "active_help_test.go",
+      "expected": "yes",
+      "reviewers": 1,
+      "length_findings": []
+    },
+    {
+      "unit": "TestDisableActiveHelp",
+      "path": "active_help_test.go",
+      "expected": "yes",
+      "reviewers": 1,
+      "length_findings": []
+    },
+    {
+      "unit": "testURLCacheContainsCachedResponsesForAllRequests",
+      "path": "Tests/CacheTests.swift",
+      "expected": "yes",
+      "reviewers": 2,
+      "length_findings": []
+    },
+    {
+      "unit": "TestVisitParents",
+      "path": "command_test.go",
+      "expected": "yes",
+      "reviewers": 1,
+      "length_findings": []
+    },
+    {
+      "unit": "testThatDelayedUploadStreamResultsInMultipleProgressValues",
+      "path": "Tests/ConcurrencyTests.swift",
+      "expected": "yes",
+      "reviewers": 1,
+      "length_findings": []
+    },
+    {
+      "unit": "TestActiveHelpForFlag",
+      "path": "active_help_test.go",
+      "expected": "no",
+      "reviewers": 1,
+      "length_findings": []
+    },
+    {
+      "unit": "testDefaultCachePolicy",
+      "path": "Tests/CacheTests.swift",
+      "expected": "no",
+      "reviewers": 1,
+      "length_findings": []
+    }
+  ],
+  "repetition_probe": [
+    {
+      "unit": "TestActiveHelpWithComps",
+      "expected": true,
+      "matches": [
+        [
+          "executeCommand",
+          "Errorf",
+          "Join"
+        ],
+        [
+          "Errorf",
+          "Join",
+          "Sprintf"
+        ],
+        [
+          "Join",
+          "Sprintf",
+          "Errorf"
+        ]
+      ]
+    },
+    {
+      "unit": "TestDisableActiveHelp",
+      "expected": true,
+      "matches": [
+        [
+          "Setenv",
+          "activeHelpEnvVar",
+          "Name"
+        ]
+      ]
+    },
+    {
+      "unit": "testURLCacheContainsCachedResponsesForAllRequests",
+      "expected": true,
+      "matches": []
+    },
+    {
+      "unit": "TestVisitParents",
+      "expected": true,
+      "matches": []
+    },
+    {
+      "unit": "testThatDelayedUploadStreamResultsInMultipleProgressValues",
+      "expected": false,
+      "matches": []
+    },
+    {
+      "unit": "TestActiveHelpForFlag",
+      "expected": false,
+      "matches": []
+    },
+    {
+      "unit": "testDefaultCachePolicy",
+      "expected": false,
+      "matches": []
+    }
+  ],
+  "conditional_challenge": {
+    "yes_silent": 3,
+    "no_silent": 3,
+    "uncertain_silent": 1
+  },
+  "paired_controls_unchanged": 12,
+  "warm_cli_timing": {
+    "files": 477,
+    "rounds": 21,
+    "old_ms": 6.804458,
+    "new_ms": 8.023209,
+    "median_paired_delta_ms": 1.2039170000000006
+  }
+}

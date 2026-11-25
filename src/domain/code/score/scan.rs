@@ -78,7 +78,7 @@ fn command(lang: Language) -> bool {
             | Mako
     )
 }
-fn branch(lang: Language, w: &str) -> bool {
+pub(super) fn branch(lang: Language, w: &str) -> bool {
     match lang {
         Html | Css | Proto => false,
         Lua => matches!(w, "if" | "elseif" | "for" | "while" | "until"),
@@ -160,11 +160,11 @@ fn parameters(lang: Language, t: &[Token], pairs: &[usize], open: usize) -> usiz
     }
     count + usize::from(occupied)
 }
-struct Region<'a> {
-    name: &'a str,
-    start: usize,
+pub(super) struct Region<'a> {
+    pub(super) name: &'a str,
+    pub(super) start: usize,
     body: usize,
-    end: usize,
+    pub(super) end: usize,
     args: usize,
 }
 // Decorator lines immediately preceding a Python method can override binding.
@@ -267,7 +267,7 @@ fn lua_regions<'a>(t: &[Token<'a>], pairs: &[usize]) -> Vec<Region<'a>> {
     regions
 }
 
-fn regions<'a>(
+pub(super) fn regions<'a>(
     lang: Language,
     text: &'a str,
     t: &[Token<'a>],

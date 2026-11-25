@@ -148,7 +148,7 @@ def run(folder, split, binary):
             home.mkdir()
             result = json.loads(
                 subprocess.check_output(
-                    [binary, "--score", "--json"],
+                    [binary, "--score", "--ignore-test-rules", "--json"],
                     cwd=repo,
                     env=dict(
                         os.environ,

@@ -11,6 +11,7 @@ pub(super) fn query(
     cwd: &Path,
     path: Option<&str>,
     json: bool,
+    test_rules: bool,
     outcome: &mut Outcome,
 ) -> io::Result<String> {
     let scope = path
@@ -33,7 +34,13 @@ pub(super) fn query(
         }
         included += 1;
         let single = f.path() == scope && !json;
-        let score = f.score.as_deref().filter(|s| s.lines > 0);
+        let score = if test_rules {
+            f.test_score.as_deref()
+        } else {
+            None
+        }
+        .or(f.score.as_deref())
+        .filter(|s| s.lines > 0);
         let value = score.map(Score::value);
         if json {
             rows.push(object(&[
@@ -67,7 +74,7 @@ pub(super) fn query(
             loc += s.lines;
             weighted += value * s.lines as f64;
             if !json && !s.findings.is_empty() {
-                worst.push((value, f.path(), s));
+                worst.push((value, f.path(), s.findings.len()));
             }
         } else if single {
             if f.score.is_some() {
@@ -112,13 +119,8 @@ pub(super) fn query(
         "{:.2}/10 | {supported}/{included} indexed files scored | {loc} lines",
         weighted / loc as f64
     );
-    for (value, path, s) in worst.into_iter().take(10) {
-        write!(
-            output,
-            "\n{path}: {value:.2}/10 ({} findings)",
-            s.findings.len()
-        )
-        .unwrap();
+    for (value, path, count) in worst.into_iter().take(10) {
+        write!(output, "\n{path}: {value:.2}/10 ({} findings)", count).unwrap();
     }
     Ok(output)
 }

@@ -1,0 +1,94 @@
+{
+  "aromalia": {
+    "units": 830,
+    "groups": 166,
+    "units_by_language": {
+      "csharp": 166,
+      "java": 166,
+      "javascript": 166,
+      "python": 166,
+      "typescript": 166
+    },
+    "decisions": 8300,
+    "by_rule": {
+      "AssertionRoulette": {
+        "negative": 451,
+        "positive": 379
+      },
+      "ConditionalTestLogic": {
+        "negative": 596,
+        "positive": 234
+      },
+      "DuplicateAssert": {
+        "negative": 686,
+        "positive": 144
+      },
+      "EmptyTest": {
+        "negative": 719,
+        "positive": 111
+      },
+      "ExceptionHandling": {
+        "negative": 612,
+        "positive": 218
+      },
+      "IgnoredTest": {
+        "negative": 700,
+        "positive": 130
+      },
+      "MagicNumberTest": {
+        "negative": 592,
+        "positive": 238
+      },
+      "RedundantPrint": {
+        "negative": 660,
+        "positive": 170
+      },
+      "SleepyTest": {
+        "negative": 678,
+        "positive": 152
+      },
+      "UnknownTest": {
+        "negative": 580,
+        "positive": 250
+      }
+    }
+  },
+  "pontillo": {
+    "units": 9421,
+    "groups": 65,
+    "units_by_language": {
+      "java": 9421
+    },
+    "decisions": 37534,
+    "by_rule": {
+      "EagerTest": {
+        "negative": 6745,
+        "positive": 2582
+      },
+      "MysteryGuest": {
+        "negative": 7915,
+        "positive": 1472
+      },
+      "ResourceOptimism": {
+        "negative": 8694,
+        "positive": 710
+      },
+      "TestRedundancy": {
+        "negative": 9381,
+        "positive": 35
+      }
+    },
+    "source_rows": 9633,
+    "distinct_method_keys": 9428,
+    "excluded_unpinned_methods": {
+      "aletheia": 7
+    },
+    "omitted_conflicting_labels": {
+      "EagerTest": 94,
+      "ResourceOptimism": 17,
+      "TestRedundancy": 5,
+      "MysteryGuest": 34
+    }
+  },
+  "normalized_sha256": "0d64116b867c42c3aa82fbe054da7e396b2dccc9b645431132c5b062cdabc756"
+}

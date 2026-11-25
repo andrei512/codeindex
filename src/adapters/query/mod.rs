@@ -24,6 +24,7 @@ pub enum Request<'a> {
     Lines(lines::Lines<'a>),
     Roles(Option<&'a str>, bool),
     Score(Option<&'a str>, bool),
+    BaselineScore(Option<&'a str>, bool),
     Search(&'a str),
     Symbol(&'a str),
     Content(&'a str),
@@ -120,17 +121,26 @@ impl<'a> Invocation<'a> {
             let mut path = None;
             let mut json = false;
             let mut roles = false;
+            let mut baseline = false;
             for arg in &args[1..] {
                 if arg == "--json" && !json {
                     json = true;
-                } else if arg == "--roles" && !roles {
+                } else if arg == "--ignore-test-rules" && !baseline && !roles {
+                    baseline = true;
+                } else if arg == "--roles" && !roles && !baseline {
                     roles = true;
                 } else if arg.starts_with('-') || path.replace(arg.as_str()).is_some() {
                     return Err("usage: cx --score [FILE|DIR] [--roles] [--json]".into());
                 }
             }
             return Ok(Self {
-                request: if roles {Request::Roles(path,json)} else {Request::Score(path, json)},
+                request: if roles {
+                    Request::Roles(path, json)
+                } else if baseline {
+                    Request::BaselineScore(path, json)
+                } else {
+                    Request::Score(path, json)
+                },
                 mode,
                 display: Display::default(),
             });
@@ -177,8 +187,12 @@ impl<'a> Invocation<'a> {
 }
 pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<Vec<u8>> {
     use crate::application::index::build::MemoryQuery;
+    let scope;
     let needs = match &invocation.request {
-        Request::Score(..) => MemoryQuery::Score,
+        Request::Score(path, _) | Request::BaselineScore(path, _) => {
+            scope = path.map(|p| relationships::relative(cwd, cwd, p)).transpose()?.unwrap_or_default();
+            MemoryQuery::Score { scope: &scope, test_rules: matches!(invocation.request, Request::Score(..)) }
+        }
         Request::Roles(..) => MemoryQuery::Source,
         Request::Lines(lines) => return lines.plain(cwd, outcome),
         Request::Search(_) => MemoryQuery::Rank { breadcrumbs: invocation.display.json || !invocation.display.public },
@@ -215,7 +229,8 @@ fn evaluate_indexed(pin: &Pin, invocation: Invocation<'_>, cwd: &Path, outcome: 
     let mut md = None;
     match req {
         Request::Roles(path,json) => return score::roles(pin,cwd,path,json,outcome),
-        Request::Score(path, json) => return score::query(pin, cwd, path, json, outcome),
+        Request::Score(path, json) => return score::query(pin, cwd, path, json, true, outcome),
+        Request::BaselineScore(path, json) => return score::query(pin, cwd, path, json, false, outcome),
         Request::Lines(_) => unreachable!("line search returns raw bytes"),
         Request::NamedRelationship(op, name) => {
             return relationships::query(

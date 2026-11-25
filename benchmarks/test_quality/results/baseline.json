@@ -1,0 +1,753 @@
+{
+  "split": "dev",
+  "mode": "baseline",
+  "repositories": 41,
+  "files": 479,
+  "binary_sha256": "1c8497b45a76ab32f13ca6677ce6706f4bfe0cc3c4841957bbef51e31f30cbdd",
+  "output_sha256": "bce5ffb64ba9049424dbc71652f07b02508d9d4eb4e42015d34137201858f1a8",
+  "reference_sha256": "83055be31997a9ab98799c469289fd4d83d64dcc2a1bdb197cf86da95a814c26",
+  "inputs": {
+    "test_quality/blind.lock.json": "25550d1d22b0902cb044668861639594b529f3f69641d3811b0002c80ee76d1f",
+    "test_quality/conditional.jsonl": "723a5b2bfd1387ea56fff747cd1472f5cc2019bc8b61b6106c740dba6dbb0e95",
+    "test_quality/dev_sample.jsonl": "5e534febcc0567860e696033dfccd09fee1984b3916969b6b037eb74e21b343f",
+    "test_quality/pairs/manifest.json": "d0fe0bf069b9dd9c2db1e9da94b6bf9c79ca10a470ca7c503ac68355f1c12507",
+    "test_quality/review_a.jsonl": "cb236bf794f8ad0cd876dae088377b22fa6e1973a3cbf4c841848ca699b5754b",
+    "test_quality/review_b.jsonl": "9e3089dabf70f472f7fbb1c4d96893d1abdb4334a83f230a85f241c48d343672",
+    "test_roles/assets.jsonl": "48499d8fa8be766535260ffc5c8b9a8a4696b0585b22d5ef8c3053a44c8c2398",
+    "test_roles/public.jsonl": "cde98fd9a3c56ade305eb9fab2adf5c5376487e5e8123fd6e813757b715ccfe1",
+    "test_roles/runner.jsonl": "ddc560f8a6c33fcb80a39cd51efbfa132d75fda162765df2840130208a908666"
+  },
+  "profiles": {
+    "assembly": {
+      "files": 9,
+      "scored": 9,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "batchfile": {
+      "files": 5,
+      "scored": 5,
+      "omitted": 0,
+      "mean": 9.932747332883045,
+      "findings": 1
+    },
+    "c": {
+      "files": 172,
+      "scored": 172,
+      "omitted": 0,
+      "mean": 9.830653981403744,
+      "findings": 104
+    },
+    "cmake": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 9.885423295139837,
+      "findings": 3
+    },
+    "cpp": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 9.509849538203124,
+      "findings": 11
+    },
+    "csharp": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "css": {
+      "files": 6,
+      "scored": 5,
+      "omitted": 1,
+      "mean": 9.92239259968041,
+      "findings": 1
+    },
+    "dart": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.526919267026104,
+      "findings": 8
+    },
+    "dockerfile": {
+      "files": 14,
+      "scored": 13,
+      "omitted": 0,
+      "mean": 9.654711714064103,
+      "findings": 14
+    },
+    "go": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 8.981215054784327,
+      "findings": 83
+    },
+    "hack": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "hcl": {
+      "files": 9,
+      "scored": 9,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "html": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 9.04065417945759,
+      "findings": 12
+    },
+    "java": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.955458332724215,
+      "findings": 1
+    },
+    "js": {
+      "files": 15,
+      "scored": 14,
+      "omitted": 1,
+      "mean": 9.804165008685302,
+      "findings": 18
+    },
+    "kotlin": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.82491949108929,
+      "findings": 8
+    },
+    "lua": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.676638236367795,
+      "findings": 5
+    },
+    "makefile": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "mako": {
+      "files": 6,
+      "scored": 5,
+      "omitted": 0,
+      "mean": 9.9376416658139,
+      "findings": 1
+    },
+    "markdown": {
+      "files": 11,
+      "scored": 11,
+      "omitted": 0,
+      "mean": 9.9639513906137,
+      "findings": 1
+    },
+    "nix": {
+      "files": 10,
+      "scored": 10,
+      "omitted": 0,
+      "mean": 9.783408286649152,
+      "findings": 5
+    },
+    "objectivec": {
+      "files": 6,
+      "scored": 6,
+      "omitted": 0,
+      "mean": 9.845904424647003,
+      "findings": 6
+    },
+    "perl": {
+      "files": 7,
+      "scored": 1,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "php": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.912459745544645,
+      "findings": 2
+    },
+    "plpgsql": {
+      "files": 8,
+      "scored": 8,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "powershell": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 8.238414646667607,
+      "findings": 19
+    },
+    "procfile": {
+      "files": 5,
+      "scored": 5,
+      "omitted": 0,
+      "mean": 10,
+      "findings": 0
+    },
+    "proto": {
+      "files": 10,
+      "scored": 10,
+      "omitted": 0,
+      "mean": 9.80043847191289,
+      "findings": 10
+    },
+    "python": {
+      "files": 47,
+      "scored": 47,
+      "omitted": 0,
+      "mean": 9.436977887880234,
+      "findings": 62
+    },
+    "ruby": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.204545906838431,
+      "findings": 6
+    },
+    "rust": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.9402360780551,
+      "findings": 1
+    },
+    "shell": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.734510547250764,
+      "findings": 4
+    },
+    "sql": {
+      "files": 9,
+      "scored": 9,
+      "omitted": 0,
+      "mean": 7.779897847102379,
+      "findings": 9
+    },
+    "starlark": {
+      "files": 7,
+      "scored": 7,
+      "omitted": 0,
+      "mean": 9.817185460155075,
+      "findings": 3
+    },
+    "swift": {
+      "files": 6,
+      "scored": 6,
+      "omitted": 0,
+      "mean": 8.322367442700775,
+      "findings": 22
+    }
+  },
+  "file_level_review": {
+    "conditional_logic": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_flagged": 4,
+      "negative_silent": 36,
+      "unscored": 3
+    },
+    "verbosity": {
+      "disagreement": 11,
+      "na": 51,
+      "negative_flagged": 8,
+      "negative_silent": 30,
+      "positive_silent": 2,
+      "uncertain": 1,
+      "unscored": 2
+    }
+  },
+  "reviewed_files": 105,
+  "review_by_profile": {
+    "assembly": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "batchfile": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "c": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "negative_silent": 2
+      }
+    },
+    "cmake": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_silent": 2
+      }
+    },
+    "cpp": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      }
+    },
+    "csharp": {
+      "conditional_logic": {
+        "negative_silent": 3
+      },
+      "verbosity": {
+        "negative_silent": 3
+      }
+    },
+    "css": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "dart": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_flagged": 2
+      }
+    },
+    "dockerfile": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "go": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "negative_silent": 1,
+        "positive_silent": 1
+      }
+    },
+    "hack": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "negative_silent": 2
+      }
+    },
+    "hcl": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "html": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "java": {
+      "conditional_logic": {
+        "na": 2,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "na": 2,
+        "negative_silent": 1
+      }
+    },
+    "js": {
+      "conditional_logic": {
+        "disagreement": 2,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "disagreement": 2,
+        "negative_silent": 1
+      }
+    },
+    "kotlin": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      }
+    },
+    "lua": {
+      "conditional_logic": {
+        "na": 2,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "na": 2
+      }
+    },
+    "makefile": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_silent": 2
+      }
+    },
+    "mako": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "markdown": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_silent": 2
+      }
+    },
+    "nix": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "objectivec": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "negative_silent": 3
+      }
+    },
+    "perl": {
+      "conditional_logic": {
+        "unscored": 3
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "unscored": 2
+      }
+    },
+    "php": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_silent": 2
+      }
+    },
+    "plpgsql": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "powershell": {
+      "conditional_logic": {
+        "negative_flagged": 3
+      },
+      "verbosity": {
+        "negative_flagged": 2,
+        "negative_silent": 1
+      }
+    },
+    "procfile": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "proto": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "python": {
+      "conditional_logic": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "na": 1,
+        "negative_silent": 1
+      }
+    },
+    "ruby": {
+      "conditional_logic": {
+        "negative_silent": 3
+      },
+      "verbosity": {
+        "negative_flagged": 1,
+        "negative_silent": 2
+      }
+    },
+    "rust": {
+      "conditional_logic": {
+        "na": 1,
+        "negative_silent": 2
+      },
+      "verbosity": {
+        "na": 1,
+        "negative_silent": 2
+      }
+    },
+    "shell": {
+      "conditional_logic": {
+        "na": 3
+      },
+      "verbosity": {
+        "na": 3
+      }
+    },
+    "sql": {
+      "conditional_logic": {
+        "negative_silent": 3
+      },
+      "verbosity": {
+        "negative_flagged": 3
+      }
+    },
+    "starlark": {
+      "conditional_logic": {
+        "na": 2,
+        "negative_silent": 1
+      },
+      "verbosity": {
+        "na": 2,
+        "negative_silent": 1
+      }
+    },
+    "swift": {
+      "conditional_logic": {
+        "disagreement": 2,
+        "negative_flagged": 1
+      },
+      "verbosity": {
+        "disagreement": 1,
+        "positive_silent": 1,
+        "uncertain": 1
+      }
+    }
+  },
+  "conditional_challenge": {
+    "yes_silent": 3,
+    "no_silent": 3,
+    "uncertain_silent": 1
+  },
+  "paired_controls": [
+    {
+      "id": "python-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "python-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "rust-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "rust-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "prefer_right",
+      "scores": [
+        9.842730062691357,
+        10
+      ]
+    },
+    {
+      "id": "go-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "go-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "prefer_right",
+      "scores": [
+        9.842730062691357,
+        10
+      ]
+    },
+    {
+      "id": "js-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "js-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "prefer_right",
+      "scores": [
+        9.842730062691357,
+        10
+      ]
+    },
+    {
+      "id": "ts-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "ts-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "prefer_right",
+      "scores": [
+        9.842730062691357,
+        10
+      ]
+    },
+    {
+      "id": "java-fixture_layout",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "observed": "tie",
+      "scores": [
+        10,
+        10
+      ]
+    },
+    {
+      "id": "java-conditional_logic",
+      "family": "absolute-negative-double-nonnegative",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "observed": "prefer_right",
+      "scores": [
+        9.842730062691357,
+        10
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "dataset": "aromalia",
+  "files_scored": 830,
+  "files_with_findings": 80,
+  "files_without_findings": 750,
+  "findings_by_rule": {
+    "branch complexity": 11,
+    "compound conditions": 1,
+    "nested regions": 67,
+    "nesting depth": 7,
+    "parameters": 7,
+    "unit lines": 5
+  },
+  "published_file_rule_decisions": 8300,
+  "directly_equivalent_published_rules": [],
+  "binary_sha256": "1c8497b45a76ab32f13ca6677ce6706f4bfe0cc3c4841957bbef51e31f30cbdd",
+  "fixture_bundle_sha256": "5347089839bbd74c879285518a74aea81cc7f409501cad178a25116bd5f02364"
+}

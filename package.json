@@ -6,6 +6,14 @@
   },
   "nx": {
     "targets": {
+      "eval-test-quality": {
+        "dependsOn": ["build-cx"],
+        "command": "python3 benchmarks/test_quality/eval.py"
+      },
+      "eval-test-nesting": {
+        "dependsOn": ["build-cx"],
+        "command": "python3 benchmarks/test_quality/nesting/eval.py --output target/test-quality/nesting-dev.json"
+      },
       "eval-test-roles": {
         "dependsOn": ["build-cx"],
         "command": "python3 benchmarks/test_roles/eval.py"

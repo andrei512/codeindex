@@ -216,6 +216,8 @@ pub(super) fn collect(lang: Language, path: &str, s: &Syntax, res: &mut Roles) {
                         | "afterEach"
                         | "beforeAll"
                         | "afterAll"
+                        | "setUpAll"
+                        | "tearDownAll"
                         | "setUp"
                         | "tearDown"
                 )
@@ -232,7 +234,7 @@ pub(super) fn collect(lang: Language, path: &str, s: &Syntax, res: &mut Roles) {
                 }
                 let setup = matches!(
                     w,
-                    "beforeEach" | "afterEach" | "beforeAll" | "afterAll" | "setUp" | "tearDown"
+                    "beforeEach" | "afterEach" | "beforeAll" | "afterAll" | "setUp" | "tearDown" | "setUpAll" | "tearDownAll"
                 );
                 if setup || s.string(j + 1) {
                     s.add(
@@ -243,6 +245,10 @@ pub(super) fn collect(lang: Language, path: &str, s: &Syntax, res: &mut Roles) {
                         "test framework registration",
                     );
                 }
+            }
+            Powershell if test_file && ["BeforeAll", "BeforeEach", "AfterEach", "AfterAll"]
+                .iter().any(|hook| w.eq_ignore_ascii_case(hook)) && s.w(i + 1) == "{" => {
+                s.add(res, i, s.close(i + 1), Support, "Pester setup or teardown");
             }
             Powershell if w.eq_ignore_ascii_case("It") && test_file && s.string(i + 1) => {
                 s.add(res, i, s.body(i + 2), Test, "Pester case")

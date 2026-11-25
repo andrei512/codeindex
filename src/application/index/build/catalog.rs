@@ -67,6 +67,9 @@ pub(super) fn write(
         if let Some((p, old)) = previous.zip(prior)
             && let old = &p.entries()[old]
             && !old.catalog_row.is_empty()
+            && old.path() == f.path()
+            && old.score == f.score
+            && old.test_score == f.test_score
             && old.blob == f.blob
             && old.catalog_stamp() == f.stamp()
         {

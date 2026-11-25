@@ -1,0 +1,23 @@
+{
+  "aromalia": {
+    "repository": "publiosilva/aroma-lia-evaluation-rp",
+    "revision": "d35f1bb9c2483d694c58b3a3bfddb5a800691507",
+    "files": {
+      "single-language-analysis/dataset-sheets/ground-truth/java.csv": "d40791affbe7df249663955ed78467cdf64159d5abe9ed89718907d4257da1ac",
+      "single-language-analysis/dataset-sheets/ground-truth/python.csv": "49610585299a61d5fcdae8f4304fc76b45027a8baf386365e7736ac0692828ca",
+      "single-language-analysis/dataset-sheets/ground-truth/csharp.csv": "e80cba529a437566f699358880a490e897ffdad636c4a82ec97de529c19effc1",
+      "single-language-analysis/dataset-sheets/ground-truth/javascript.csv": "d70b3ff23e118b61f6899fe047e977c1602df542cbaa2ed7e6d0d2d8435056c0",
+      "single-language-analysis/dataset-sheets/ground-truth/typescript.csv": "8686908c0ed296a06e9c9d8fe60372b546070bcca71871ee53f9e30136281f51",
+      "single-language-analysis/dataset-files/java/summary.csv": "8d8909ad06491105ee63419f720dd978860f86f5739f44b4d0c9cf8e7c81cc7c"
+    },
+    "fixture_bundle_sha256": "5347089839bbd74c879285518a74aea81cc7f409501cad178a25116bd5f02364"
+  },
+  "pontillo": {
+    "repository": "darioamorosodaragona-tuni/ML-Test-Smell-Detection-Online-Appendix",
+    "revision": "6c74556fe8332e5e0864b8019cd8ddee2979af84",
+    "files": {
+      "dataset/entireDataset.csv": "1e96cef96eb01241f7509bea9fe79ead00b84aee689f5d8b609a0ed00cb16a95",
+      "dataset/projects.csv": "74003e012aabfbe458cf4e602b1fc967cb69bf6e4974f86347ae63e0766c9f72"
+    }
+  }
+}

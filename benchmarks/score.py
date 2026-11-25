@@ -49,7 +49,7 @@ def main():
             (root / f"p{i:04}.py").write_bytes(row["task"].encode())
         home = Path(tmp) / "home"
         home.mkdir()
-        result = json.loads(subprocess.check_output([binary, "--score", "--json"], cwd=root,
+        result = json.loads(subprocess.check_output([binary, "--score", "--ignore-test-rules", "--json"], cwd=root,
                             env=dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))))
     if result["scored_files"] != len(rows) or len(result["files"]) != len(rows):
         raise ValueError("cx did not score the entire corpus")

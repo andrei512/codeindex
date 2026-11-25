@@ -1,0 +1,185 @@
+{
+  "pairs": [
+    {
+      "id": "python-fixture_layout",
+      "language": "python",
+      "profile": "python",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "python/compact/test_transform.py",
+      "right": "python/expanded/test_transform.py",
+      "subject": "python/subject.py",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "python-conditional_logic",
+      "language": "python",
+      "profile": "python",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "python/branch/test_transform.py",
+      "right": "python/focused/test_transform.py",
+      "subject": "python/subject.py",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "rust-fixture_layout",
+      "language": "rust",
+      "profile": "rust",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "rust/compact/transform_test.rs",
+      "right": "rust/expanded/transform_test.rs",
+      "subject": "rust/subject.rs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "rust-conditional_logic",
+      "language": "rust",
+      "profile": "rust",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "rust/branch/transform_test.rs",
+      "right": "rust/focused/transform_test.rs",
+      "subject": "rust/subject.rs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "go-fixture_layout",
+      "language": "go",
+      "profile": "go",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "go/compact/transform_test.go",
+      "right": "go/expanded/transform_test.go",
+      "subject": "go/subject.go",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "go-conditional_logic",
+      "language": "go",
+      "profile": "go",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "go/branch/transform_test.go",
+      "right": "go/focused/transform_test.go",
+      "subject": "go/subject.go",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "js-fixture_layout",
+      "language": "js",
+      "profile": "js",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "js/compact/transform.test.js",
+      "right": "js/expanded/transform.test.js",
+      "subject": "js/subject.cjs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "js-conditional_logic",
+      "language": "js",
+      "profile": "js",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "js/branch/transform.test.js",
+      "right": "js/focused/transform.test.js",
+      "subject": "js/subject.cjs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "ts-fixture_layout",
+      "language": "ts",
+      "profile": "js",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "ts/compact/transform.test.ts",
+      "right": "ts/expanded/transform.test.ts",
+      "subject": "ts/subject.cjs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "ts-conditional_logic",
+      "language": "ts",
+      "profile": "js",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "ts/branch/transform.test.ts",
+      "right": "ts/focused/transform.test.ts",
+      "subject": "ts/subject.cjs",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "java-fixture_layout",
+      "language": "java",
+      "profile": "java",
+      "kind": "fixture_layout",
+      "expected": "tie",
+      "left": "java/compact/TransformTest.java",
+      "right": "java/expanded/TransformTest.java",
+      "subject": "java/Subject.java",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    },
+    {
+      "id": "java-conditional_logic",
+      "language": "java",
+      "profile": "java",
+      "kind": "conditional_logic",
+      "expected": "prefer_right",
+      "left": "java/branch/TransformTest.java",
+      "right": "java/focused/TransformTest.java",
+      "subject": "java/Subject.java",
+      "family": "absolute-negative-double-nonnegative",
+      "representative_mutants": [
+        -1,
+        2
+      ]
+    }
+  ],
+  "split": "dev"
+}

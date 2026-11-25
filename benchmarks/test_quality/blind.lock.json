@@ -1,0 +1,177 @@
+[
+  {
+    "profile": "assembly",
+    "repository": "netwide-assembler/nasm",
+    "revision": "fbdc88565ccccfa0e8c69b21b1953d1eded02e89"
+  },
+  {
+    "profile": "batchfile",
+    "repository": "npocmaka/batch.scripts",
+    "revision": "7e784303a5672cfac29f2bc725bf545aa19622b5"
+  },
+  {
+    "profile": "c",
+    "repository": "libcheck/check",
+    "revision": "35d9cc011faa0545bf56d5062ae90bbc2688eba7"
+  },
+  {
+    "profile": "cmake",
+    "repository": "vector-of-bool/cmrc",
+    "revision": "952ffddba731fc110bd50409e8d2b8a06abbd237"
+  },
+  {
+    "profile": "cpp",
+    "repository": "catchorg/Catch2",
+    "revision": "35d98071b9871d8be82c136e7e4f223be5261ffc"
+  },
+  {
+    "profile": "csharp",
+    "repository": "nunit/nunit",
+    "revision": "4d5e38b2f7e491ddf544cdb90cf76b4c192cfa98"
+  },
+  {
+    "profile": "css",
+    "repository": "w3c/csswg-drafts",
+    "revision": "98292d4403cbe9bda1fe9944f758f152e8a77274"
+  },
+  {
+    "profile": "dart",
+    "repository": "dart-lang/test",
+    "revision": "2e516e906babd2e41a481713d07c5135c47cc5ab"
+  },
+  {
+    "profile": "dockerfile",
+    "repository": "hadolint/hadolint",
+    "revision": "1d901b9c0b0d0445d19b1a9128d89fa55bb4604e"
+  },
+  {
+    "profile": "go",
+    "repository": "stretchr/testify",
+    "revision": "87a7b9d57689f6579db2da795ab8deeab29cb724"
+  },
+  {
+    "profile": "hack",
+    "repository": "slackhq/hack-json-schema",
+    "revision": "a1375316a70eeedb33fba431e21d9d8dde9bdaea"
+  },
+  {
+    "profile": "hcl",
+    "repository": "hashicorp/terraform-provider-random",
+    "revision": "2dfef278e317a7791aded308c978216b544b7ce2"
+  },
+  {
+    "profile": "html",
+    "repository": "whatwg/html",
+    "revision": "2a4e7866828adc0948cf397e48515fcd3bda8562"
+  },
+  {
+    "profile": "java",
+    "repository": "assertj/assertj",
+    "revision": "7d78ce8d00d60fd670def2ff5499053ae2294ce8"
+  },
+  {
+    "profile": "js",
+    "repository": "avajs/ava",
+    "revision": "fc83bdc0265cb0d0081fcd735c23d891a28c1880"
+  },
+  {
+    "profile": "kotlin",
+    "repository": "kotest/kotest",
+    "revision": "1185d7cfad8e7f9446b6b071a82e9483c3f41575"
+  },
+  {
+    "profile": "lua",
+    "repository": "lunarmodules/busted",
+    "revision": "22f8089f461a563fb9553ab56f926c6805850833"
+  },
+  {
+    "profile": "makefile",
+    "repository": "mirror/make",
+    "revision": "c63a5bc6a2881d515bb3020ed477fcba08fb2f3d"
+  },
+  {
+    "profile": "mako",
+    "repository": "Pylons/deform",
+    "revision": "3977582583d8982d3931b1eacf63c4de4841726e"
+  },
+  {
+    "profile": "markdown",
+    "repository": "markdown-it/markdown-it",
+    "revision": "a8c00d474ec9b304fad9b71c16d6fa8b4909279e"
+  },
+  {
+    "profile": "nix",
+    "repository": "cachix/devenv",
+    "revision": "3d7e56e3eb43f2bb55821f90057290ab98d1c810"
+  },
+  {
+    "profile": "objectivec",
+    "repository": "erikdoe/ocmock",
+    "revision": "7f6e9e9b6c9ffa19a9040860da9f7a1f202b9f4d"
+  },
+  {
+    "profile": "perl",
+    "repository": "Test-More/test-more",
+    "revision": "38b0e20ff712d39e01e443a4d736ef73bf0a2c06"
+  },
+  {
+    "profile": "php",
+    "repository": "pestphp/pest",
+    "revision": "0fe7c2440cd408f462db3437f1a06e195f4eb94e"
+  },
+  {
+    "profile": "plpgsql",
+    "repository": "pgpartman/pg_partman",
+    "revision": "e0a6c384a6c77846d2560f9251089339c9637814"
+  },
+  {
+    "profile": "powershell",
+    "repository": "PowerShell/PSReadLine",
+    "revision": "a2d143f78904f8a954f8d4b055e55ceca6939bfc"
+  },
+  {
+    "profile": "procfile",
+    "repository": "DarthSim/overmind",
+    "revision": "f57a6d00fc8b2eafd1d12014283eea25c7132d6e"
+  },
+  {
+    "profile": "proto",
+    "repository": "protocolbuffers/protobuf-go",
+    "revision": "0ce559824de1378ee786af66d3c25fa2478f91db"
+  },
+  {
+    "profile": "python",
+    "repository": "pytest-dev/pluggy",
+    "revision": "a0e47471d7f5147e72d82fc434c97596df20e642"
+  },
+  {
+    "profile": "ruby",
+    "repository": "rspec/rspec-core",
+    "revision": "aec5f49485d97908183dbe790a7fefb8baaa8091"
+  },
+  {
+    "profile": "rust",
+    "repository": "rust-lang/regex",
+    "revision": "fde4946d4a3cb367338a21493ec91ec7106a12b4"
+  },
+  {
+    "profile": "shell",
+    "repository": "shellspec/shellspec",
+    "revision": "f2d13f991885ef44e6b54e571e0842222251b111"
+  },
+  {
+    "profile": "sql",
+    "repository": "timescale/timescaledb",
+    "revision": "b5c29ca68317dd046616acbff026779f551adf21"
+  },
+  {
+    "profile": "starlark",
+    "repository": "bazelbuild/rules_cc",
+    "revision": "cbc3a4a0a3e984d4ed3e532671bd5b4a2e8a2ef6"
+  },
+  {
+    "profile": "swift",
+    "repository": "Quick/Nimble",
+    "revision": "727f75d91a0f7501d08d938966d17e6728b76a2a"
+  }
+]

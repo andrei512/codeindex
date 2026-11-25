@@ -812,6 +812,7 @@ impl crate::application::index::build::Previous for Pin {
         };
         Ok(Local {
             score: self.files[id].score.clone(),
+            test_score: self.files[id].test_score.clone(),
             code,
             markdown,
             lf,

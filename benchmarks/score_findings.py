@@ -187,7 +187,7 @@ def evaluate(folder, binary, controls=False):
             dest.write_text(c["source"])
         out = json.loads(
             subprocess.check_output(
-                [binary.resolve(), "--score", "--json"],
+                [binary.resolve(), "--score", "--ignore-test-rules", "--json"],
                 cwd=root,
                 env=dict(os.environ, HOME=td, XDG_CONFIG_HOME=td + "/.config"),
             )

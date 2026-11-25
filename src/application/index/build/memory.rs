@@ -2,8 +2,8 @@
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemoryQuery {
-    Score,
+pub(crate) enum MemoryQuery<'a> {
+    Score { scope: &'a str, test_rules: bool },
     Source,
     Paths,
     Content,
@@ -46,6 +46,7 @@ pub(crate) fn memory_index(
             original_stamp: None,
             catalog_row: 0..0,
             score: None,
+            test_score: None,
             blob: None,
             evidence: 0..0,
         });
@@ -59,7 +60,7 @@ pub(crate) fn memory_index(
             .as_ref()
             .map_or("", |r| &source[r.start as usize..r.end as usize])
     };
-    let scoring = query == MemoryQuery::Score;
+    let scoring = matches!(query, MemoryQuery::Score { .. });
     let project = ((graph || scoring) && files.iter().any(|f| c_project::database(f.path()))).then(|| {
         code::CProject::new(
             root,
@@ -76,13 +77,17 @@ pub(crate) fn memory_index(
     let locals: Vec<_> = files
         .iter()
         .map(|file| {
+            let score_policy = match query {
+                MemoryQuery::Score { scope, test_rules } if Path::new(file.path()).starts_with(scope) => Some(test_rules),
+                _ => None,
+            };
             analyze_products(
                 file.path(),
                 file.bytes.as_ref().map(|_| text(file)),
                 project.as_ref(),
-                graph || scoring,
-                !graph,
-                scoring,
+                graph || score_policy.is_some(),
+                !graph && (!scoring || score_policy.is_some()),
+                score_policy,
             )
         })
         .collect();
@@ -90,6 +95,7 @@ pub(crate) fn memory_index(
     if scoring {
         for (f, l) in files.iter_mut().zip(locals) {
             f.score = l.score;
+            f.test_score = l.test_score;
         }
         return Ok((files, dir, source.into_bytes()));
     }

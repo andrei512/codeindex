@@ -193,23 +193,37 @@ pub(crate) fn classify_with(
         pairs: &pairs,
         text,
     };
+    collect_syntax(lang, path, syntax, result, context, &mut read)
+}
+
+/// Reuse the query's tokenization for runner evidence available in this file.
+pub(super) fn local_regions(lang: Language, path: &str, text: &str, tokens: &[Token], pairs: &[usize]) -> Roles {
+    let result = Roles { base: file_role(path, Some(lang)), regions: Vec::new() };
+    collect_syntax(lang, path, Syntax { text, tokens, pairs }, result, &mut Context::default(), &mut |_| Ok(None))
+        .expect("file-local role collection performs no I/O")
+}
+
+fn collect_syntax(
+    lang: Language, path: &str, syntax: Syntax, mut result: Roles, context: &mut Context,
+    read: &mut impl FnMut(&std::path::Path) -> std::io::Result<Option<String>>,
+) -> std::io::Result<Roles> {
     if lang == Language::Js {
-        javascript::collect(path, &syntax, &mut result, &mut read)?;
+        javascript::collect(path, &syntax, &mut result, read)?;
     } else if matches!(lang, Language::Java | Language::Swift | Language::Hack) {
         context
             .classes
-            .collect(lang, path, &syntax, &mut result, &mut read)?;
+            .collect(lang, path, &syntax, &mut result, &mut *read)?;
     } else if lang == Language::Starlark {
         starlark::collect(&syntax, &mut result);
     } else if matches!(lang, Language::C | Language::Cpp) {
         context
             .headers
-            .collect(path, &syntax, &mut result, &mut read)?;
+            .collect(path, &syntax, &mut result, &mut *read)?;
     } else {
         registrations::collect(lang, path, &syntax, &mut result);
     }
-    build_roles::collect(lang, path, &syntax, &mut result, &mut read)?;
-    asset_syntax::collect(lang, path, &syntax, &mut result, &mut read)?;
+    build_roles::collect(lang, path, &syntax, &mut result, read)?;
+    asset_syntax::collect(lang, path, &syntax, &mut result, read)?;
     result
         .regions
         .sort_by_key(|r| (r.start, std::cmp::Reverse(r.end)));
@@ -217,6 +231,22 @@ pub(crate) fn classify_with(
         .regions
         .dedup_by_key(|r| (r.start, r.end, r.evidence.0));
     Ok(result)
+}
+
+pub(super) fn on_test_path(path: &str, lang: Language) -> bool {
+    file_role(path, Some(lang)).0 == Role::Support
+}
+
+pub(super) fn suite_regions(lang: Language, path: &str, text: &str, tokens: &[Token], pairs: &[usize]) -> Vec<Region> {
+    let syntax = Syntax { tokens, pairs, text };
+    let mut roles = Roles { base: file_role(path, Some(lang)), regions: Vec::new() };
+    if matches!(lang, Language::Sql | Language::PlPgSql) {
+        if !build_roles::tap_regions(&syntax, &mut roles) { return Vec::new(); }
+    } else {
+        registrations::collect(lang, path, &syntax, &mut roles);
+    }
+    roles.regions.sort_by_key(|r| (r.start, r.end));
+    roles.regions
 }
 
 struct Syntax<'a> {

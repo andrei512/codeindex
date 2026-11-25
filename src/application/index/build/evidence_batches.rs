@@ -143,6 +143,7 @@ mod tests {
             .iter()
             .map(|(path, s)| Entry {
                 score: None,
+            test_score: None,
                 blob: None,
                 catalog_row: 0..0,
                 original_stamp: None,

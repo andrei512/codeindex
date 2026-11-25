@@ -37,6 +37,7 @@ impl Previous for Generation {
         assert!(!markdown::is_markdown(file.path()));
         Ok(Local {
             score: file.score.clone(),
+            test_score: file.test_score.clone(),
             code: Analysis::default(),
             lf: file.line_ends.clone(),
             partial_line: false,

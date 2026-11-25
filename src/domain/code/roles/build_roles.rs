@@ -354,33 +354,7 @@ fn test_runner(cmd: &str) -> bool {
 }
 
 fn sql(path: &str, s: &Syntax<'_>, out: &mut Roles, read: &mut Reader<'_>) -> io::Result<()> {
-    let (mut plan, mut finish) = (false, false);
-    for i in 0..s.tokens.len() {
-        if !s.w(i).eq_ignore_ascii_case("select") {
-            continue;
-        }
-        let mut f = i + 1;
-        if s.w(f) == "*" && s.w(f + 1).eq_ignore_ascii_case("from") {
-            f += 2
-        }
-        if s.w(f + 1) == "." {
-            f += 2
-        }
-        if s.w(f + 1) != "(" {
-            continue;
-        }
-        match s.w(f).to_ascii_lowercase().as_str() {
-            "plan" | "no_plan" => plan = true,
-            "finish" => finish = true,
-            "ok" | "is" | "isnt" | "throws_ok" | "lives_ok" | "results_eq"
-                if out.base.0 == Role::Support =>
-            {
-                s.add(out, i, s.close(f + 1), Role::Test, "pgTAP assertion")
-            }
-            _ => {}
-        }
-    }
-    if plan && finish {
+    if tap_regions(s, out) {
         out.base = Evidence(Role::Test, "pgTAP script with a plan and finish");
         return Ok(());
     }
@@ -402,6 +376,49 @@ fn sql(path: &str, s: &Syntax<'_>, out: &mut Roles, read: &mut Reader<'_>) -> io
         }
     }
     Ok(())
+}
+
+pub(super) fn tap_regions(s: &Syntax, out: &mut Roles) -> bool {
+    let (mut plan, mut finish) = (false, false);
+    let mut wrappers = Vec::new();
+    for i in 0..s.tokens.len() {
+        if !s.w(i).eq_ignore_ascii_case("select") {
+            continue;
+        }
+        let mut f = i + 1;
+        if s.w(f) == "*" && s.w(f + 1).eq_ignore_ascii_case("from") {
+            f += 2
+        }
+        if s.w(f + 1) == "." {
+            f += 2
+        }
+        if s.w(f + 1) != "(" {
+            continue;
+        }
+        match s.w(f).to_ascii_lowercase().as_str() {
+            "plan" | "no_plan" => plan = true,
+            "finish" => finish = true,
+            "check_test" if plan && !finish && (i == 0 || s.w(i - 1) == ";")
+                && s.w(i + 1) == "*" && s.w(i + 2).eq_ignore_ascii_case("from") => {
+                if let Some(end) = s.close(f + 1)
+                    && matches!(s.w(end + 1), ";" | "") {
+                    wrappers.push((i, end));
+                }
+            }
+            "ok" | "is" | "isnt" | "throws_ok" | "lives_ok" | "results_eq"
+                if out.base.0 == Role::Support =>
+            {
+                s.add(out, i, s.close(f + 1), Role::Test, "pgTAP assertion")
+            }
+            _ => {}
+        }
+    }
+    if plan && finish {
+        for (i, end) in wrappers {
+            s.add(out, i, Some(end), Role::Test, "pgTAP assertion");
+        }
+    }
+    plan && finish
 }
 
 // Evaluate the small, side-effect-free subset of GNU make used to select a SQL case.

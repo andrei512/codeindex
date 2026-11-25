@@ -560,6 +560,23 @@ fn score_roundtrips_updates_and_matches_plain_folder() {
         repo.invoke(&plain, &["--score", "unit.py"]).unwrap().stdout,
         old.as_bytes()
     );
+    for cwd in [&repo.root, &plain] {
+        for args in [vec!["--score", "unit.py"], vec!["--score", "--json"]] {
+            let expected = repo.invoke(cwd, &args).unwrap();
+            let mut baseline_args = args;
+            baseline_args.push("--ignore-test-rules");
+            let actual = repo.invoke(cwd, &baseline_args).unwrap();
+            assert!(actual.status.success());
+            assert_eq!(actual.stdout, expected.stdout);
+        }
+        for args in [
+            ["--score", "--roles", "--ignore-test-rules"],
+            ["--score", "--ignore-test-rules", "--roles"],
+            ["--score", "--ignore-test-rules", "--ignore-test-rules"],
+        ] {
+            assert_eq!(repo.invoke(cwd, &args).unwrap().status.code(), Some(2));
+        }
+    }
     repo.write("unit.py", "def inspect(a):\n    return a\n");
     assert!(repo.query(&["--score", "unit.py"]).contains("10.00/10"));
     fs::rename(repo.root.join("unit.py"), repo.root.join("renamed.py")).unwrap();
@@ -571,6 +588,23 @@ fn score_roundtrips_updates_and_matches_plain_folder() {
             .status
             .success()
     );
+}
+
+#[test]
+fn persisted_test_score_follows_edits_and_renames() {
+    let repo = Repo::new();
+    let path = "test_counter.py";
+    let text = "def test_total(a, b, actual):\n    n = 0\n    if a:\n        n += 1\n    if b:\n        n += 1\n    assert n == actual\n";
+    repo.write(path, text);
+    let finding = "conditional test expectation";
+    assert!(repo.query(&["--score", path]).contains(finding));
+    assert!(!repo.query(&["--score", path, "--ignore-test-rules"]).contains(finding));
+    fs::rename(repo.root.join(path), repo.root.join("counter.py")).unwrap();
+    assert!(!repo.query(&["--score", "counter.py"]).contains(finding));
+    fs::rename(repo.root.join("counter.py"), repo.root.join(path)).unwrap();
+    assert!(repo.query(&["--score", path]).contains(finding));
+    repo.write(path, &text.replace("assert n == actual", "assert n == 2"));
+    assert!(!repo.query(&["--score", path]).contains(finding));
 }
 
 #[test]
@@ -590,4 +624,22 @@ fn roles_follow_edits_and_work_in_plain_folders() {
     assert_eq!(git,run(&plain));
     repo.write("checks.rs","pub fn verifies() {}\n");
     assert!(run(&repo.root).contains("\"regions\":[]"));
+}
+
+#[test]
+fn suite_length_policy_uses_the_pinned_source_and_keeps_the_original_score() {
+    let repo = Repo::new();
+    let path = "suite.Tests.ps1";
+    let suite = "It 'case' {\n  Assert-True\n}\n".repeat(30);
+    repo.write(path, &suite);
+    assert!(!repo.query(&["--score", path]).contains("unit lines"));
+    assert!(repo.query(&["--score", "--ignore-test-rules", path]).contains("<file> | unit lines 90"));
+    let large = format!("{suite}BeforeAll {{\n{}}}\n", "  Invoke-Step\n".repeat(75));
+    repo.write(path, &large);
+    assert!(repo.query(&["--score", path]).contains("BeforeAll { | unit lines 77"));
+    let plain = repo.dir.join("plain-suite");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join(path), large).unwrap();
+    let args = ["--score", "--json", path];
+    assert_eq!(repo.query(&args).as_bytes(), repo.invoke(&plain, &args).unwrap().stdout);
 }

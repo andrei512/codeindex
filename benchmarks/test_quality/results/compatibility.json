@@ -1,0 +1,642 @@
+{
+  "numeric_dev": {
+    "split": "dev",
+    "corpus": "357950e1a2101f574d8de4f2cb7a990a6b572dcc1fc21db25e5ccdd824787701",
+    "binary_sha256": "1c8497b45a76ab32f13ca6677ce6706f4bfe0cc3c4841957bbef51e31f30cbdd",
+    "languages": {
+      "C": {
+        "cases": 2,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 2,
+        "mae": 0.4188482157610127,
+        "within_half": 2,
+        "findings": null
+      },
+      "C#": {
+        "cases": 1,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 1,
+        "mae": 0.7716614007794291,
+        "within_half": 0,
+        "findings": null
+      },
+      "C++": {
+        "cases": 7,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 4,
+        "compared": 3,
+        "mae": 0.35325962535850586,
+        "within_half": 2,
+        "findings": null
+      },
+      "Go": {
+        "cases": 4842,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 132,
+        "compared": 4710,
+        "mae": 0.23010568386820066,
+        "within_half": 3972,
+        "findings": null
+      },
+      "HCL": {
+        "cases": 1,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 1,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "JSON": {
+        "cases": 76,
+        "reference_null_cx_null": 76,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "Java": {
+        "cases": 150,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 150,
+        "mae": 0.12179389741560387,
+        "within_half": 140,
+        "findings": null
+      },
+      "JavaScript": {
+        "cases": 5,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 1,
+        "compared": 4,
+        "mae": 0.0,
+        "within_half": 4,
+        "findings": null
+      },
+      "Markdown": {
+        "cases": 41,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 41,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "No extension": {
+        "cases": 28,
+        "reference_null_cx_null": 19,
+        "missing_score": 0,
+        "reference_null_cx_scored": 9,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "PHP": {
+        "cases": 1,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 1,
+        "mae": 0.0,
+        "within_half": 1,
+        "findings": null
+      },
+      "Protobuf": {
+        "cases": 164,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 164,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "Python": {
+        "cases": 207,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 7,
+        "compared": 200,
+        "mae": 0.19501392121326902,
+        "within_half": 166,
+        "findings": null
+      },
+      "Rust": {
+        "cases": 18,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 18,
+        "mae": 0.2521954825881125,
+        "within_half": 14,
+        "findings": null
+      },
+      "SQL": {
+        "cases": 21,
+        "reference_null_cx_null": 1,
+        "missing_score": 0,
+        "reference_null_cx_scored": 20,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "Shell": {
+        "cases": 98,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 98,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "TOML": {
+        "cases": 3,
+        "reference_null_cx_null": 3,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "Terraform": {
+        "cases": 6,
+        "reference_null_cx_null": 0,
+        "missing_score": 0,
+        "reference_null_cx_scored": 6,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      },
+      "YAML": {
+        "cases": 79,
+        "reference_null_cx_null": 79,
+        "missing_score": 0,
+        "reference_null_cx_scored": 0,
+        "compared": 0,
+        "mae": null,
+        "within_half": 0,
+        "findings": null
+      }
+    },
+    "macro_language_mae": 0.2603198029982371,
+    "by_path_role": {
+      "other-path": {
+        "n": 5035,
+        "mae": 0.22615236329434035
+      },
+      "test-path": {
+        "n": 54,
+        "mae": 0.17779900152182945
+      }
+    },
+    "by_reference_score": {
+      "4..<9": {
+        "n": 1337,
+        "mae": 0.49973568821030756
+      },
+      "perfect": {
+        "n": 2163,
+        "mae": 0.036249539202843545
+      },
+      "9..<10": {
+        "n": 1510,
+        "mae": 0.23868191357996954
+      },
+      "below 4": {
+        "n": 79,
+        "mae": 0.5229650294999566
+      }
+    }
+  },
+  "forge_training": {
+    "dataset_sha256": "06b694877c0279fbd60ddcd138392bf63fa28202d0a307cab37f5ee5d86a18ec",
+    "binary_sha256": "1c8497b45a76ab32f13ca6677ce6706f4bfe0cc3c4841957bbef51e31f30cbdd",
+    "files": 5000,
+    "exact_within_1e_9": 1617,
+    "within_half_point": 4254,
+    "mean_absolute_error": 0.2272348056841902,
+    "median_absolute_error": 0.14400083327064017,
+    "worst_error": 2.0798108783118376,
+    "findings_by_rule_and_start_line": {
+      "matched": {
+        "parameters": 351,
+        "nested regions": 2959,
+        "nesting depth": 1980,
+        "branch complexity": 3052,
+        "compound conditions": 1172,
+        "unit lines": 122,
+        "similar body (code lines)": 32
+      },
+      "missed": {
+        "nested regions": 1942,
+        "branch complexity": 520,
+        "parameters": 373,
+        "similar body (code lines)": 267,
+        "nesting depth": 453,
+        "unit lines": 55,
+        "compound conditions": 156,
+        "Duplicated Function Blocks": 19,
+        "Brain Method": 3
+      },
+      "extra": {
+        "branch complexity": 1303,
+        "parameters": 180,
+        "nested regions": 1383,
+        "compound conditions": 283,
+        "nesting depth": 812,
+        "unit lines": 58,
+        "similar body (code lines)": 89
+      }
+    }
+  },
+  "published_findings": {
+    "C": {
+      "files": 19,
+      "labeled": 276,
+      "matched_rule_and_line": 271
+    },
+    "C++": {
+      "files": 1,
+      "labeled": 598,
+      "matched_rule_and_line": 565,
+      "matched_in_function": 564,
+      "unmatched_function_findings": 82,
+      "unmatched_file_categories": 3
+    }
+  },
+  "balanced_finding_panel": {
+    "panel_sha256": "6f3c1f799f5c88096ee1419a74bd23f1d3f3f6f06e0da83696750f698125bfcf",
+    "binary_sha256": "1c8497b45a76ab32f13ca6677ce6706f4bfe0cc3c4841957bbef51e31f30cbdd",
+    "files": 552,
+    "languages": {
+      "C": {
+        "branch complexity": {
+          "matched": 19,
+          "missed": 3,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 4,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 8,
+          "missed": 1,
+          "extra": 0
+        }
+      },
+      "C++": {
+        "branch complexity": {
+          "matched": 16,
+          "missed": 3,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 15,
+          "missed": 8,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 2,
+          "missed": 4,
+          "extra": 0
+        }
+      },
+      "C#": {
+        "branch complexity": {
+          "matched": 5,
+          "missed": 3,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 9,
+          "missed": 0,
+          "extra": 2
+        },
+        "unit lines": {
+          "matched": 1,
+          "missed": 2,
+          "extra": 0
+        }
+      },
+      "Java": {
+        "branch complexity": {
+          "matched": 11,
+          "missed": 0,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 6,
+          "missed": 0,
+          "extra": 1
+        },
+        "unit lines": {
+          "matched": 6,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Go": {
+        "branch complexity": {
+          "matched": 13,
+          "missed": 0,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 2,
+          "missed": 1,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 4,
+          "missed": 2,
+          "extra": 0
+        }
+      },
+      "Rust": {
+        "branch complexity": {
+          "matched": 6,
+          "missed": 0,
+          "extra": 7
+        },
+        "parameters": {
+          "matched": 0,
+          "missed": 1,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 4,
+          "missed": 2,
+          "extra": 1
+        }
+      },
+      "Python": {
+        "branch complexity": {
+          "matched": 24,
+          "missed": 5,
+          "extra": 3
+        },
+        "parameters": {
+          "matched": 25,
+          "missed": 6,
+          "extra": 7
+        },
+        "unit lines": {
+          "matched": 3,
+          "missed": 6,
+          "extra": 0
+        }
+      },
+      "TypeScript": {
+        "branch complexity": {
+          "matched": 6,
+          "missed": 9,
+          "extra": 4
+        },
+        "parameters": {
+          "matched": 0,
+          "missed": 1,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 0,
+          "missed": 2,
+          "extra": 1
+        }
+      },
+      "JavaScript": {
+        "branch complexity": {
+          "matched": 4,
+          "missed": 1,
+          "extra": 1
+        },
+        "parameters": {
+          "matched": 3,
+          "missed": 1,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 1,
+          "missed": 1,
+          "extra": 0
+        }
+      },
+      "Kotlin": {
+        "branch complexity": {
+          "matched": 11,
+          "missed": 3,
+          "extra": 3
+        },
+        "parameters": {
+          "matched": 4,
+          "missed": 1,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 0,
+          "missed": 0,
+          "extra": 1
+        }
+      },
+      "Swift": {
+        "branch complexity": {
+          "matched": 2,
+          "missed": 7,
+          "extra": 3
+        },
+        "parameters": {
+          "matched": 24,
+          "missed": 4,
+          "extra": 4
+        },
+        "unit lines": {
+          "matched": 0,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Ruby": {
+        "branch complexity": {
+          "matched": 7,
+          "missed": 4,
+          "extra": 3
+        },
+        "parameters": {
+          "matched": 2,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 1,
+          "missed": 6,
+          "extra": 3
+        }
+      },
+      "PHP": {
+        "branch complexity": {
+          "matched": 13,
+          "missed": 3,
+          "extra": 0
+        },
+        "parameters": {
+          "matched": 0,
+          "missed": 0,
+          "extra": 2
+        },
+        "unit lines": {
+          "matched": 3,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Lua": {
+        "branch complexity": {
+          "matched": 24,
+          "missed": 0,
+          "extra": 2
+        },
+        "parameters": {
+          "matched": 5,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 2,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Objective-C": {
+        "branch complexity": {
+          "matched": 19,
+          "missed": 3,
+          "extra": 3
+        },
+        "parameters": {
+          "matched": 0,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 4,
+          "missed": 1,
+          "extra": 1
+        }
+      },
+      "Perl": {
+        "branch complexity": {
+          "matched": 7,
+          "missed": 12,
+          "extra": 13
+        },
+        "parameters": {
+          "matched": 0,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 1,
+          "missed": 2,
+          "extra": 2
+        }
+      },
+      "Shell": {
+        "branch complexity": {
+          "matched": 11,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 5,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "PowerShell": {
+        "branch complexity": {
+          "matched": 7,
+          "missed": 1,
+          "extra": 2
+        },
+        "unit lines": {
+          "matched": 8,
+          "missed": 1,
+          "extra": 0
+        }
+      },
+      "Starlark": {
+        "branch complexity": {
+          "matched": 15,
+          "missed": 0,
+          "extra": 1
+        },
+        "unit lines": {
+          "matched": 10,
+          "missed": 3,
+          "extra": 0
+        }
+      },
+      "CMake": {
+        "branch complexity": {
+          "matched": 20,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 10,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Hack": {
+        "branch complexity": {
+          "matched": 5,
+          "missed": 0,
+          "extra": 2
+        },
+        "unit lines": {
+          "matched": 8,
+          "missed": 0,
+          "extra": 0
+        }
+      },
+      "Dart": {
+        "branch complexity": {
+          "matched": 6,
+          "missed": 0,
+          "extra": 0
+        },
+        "unit lines": {
+          "matched": 9,
+          "missed": 0,
+          "extra": 1
+        }
+      },
+      "Protobuf": {
+        "unit lines": {
+          "matched": 6,
+          "missed": 0,
+          "extra": 0
+        }
+      }
+    }
+  }
+}

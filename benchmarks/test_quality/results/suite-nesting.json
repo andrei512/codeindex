@@ -1,0 +1,345 @@
+{
+  "split": "dev",
+  "frameworks_and_dialects": 59,
+  "paired_controls": 245,
+  "baseline_failing_pairs": [
+    [
+      "Pester",
+      "independent"
+    ],
+    [
+      "Pester",
+      "quiet"
+    ],
+    [
+      "Pester",
+      "setup"
+    ],
+    [
+      "Pester",
+      "siblings"
+    ],
+    [
+      "Pester",
+      "test"
+    ],
+    [
+      "Test::More",
+      "quiet"
+    ],
+    [
+      "Test::More",
+      "siblings"
+    ],
+    [
+      "Test::More",
+      "test"
+    ],
+    [
+      "RSpec",
+      "independent"
+    ],
+    [
+      "Minitest Spec",
+      "independent"
+    ],
+    [
+      "Dart test",
+      "independent"
+    ],
+    [
+      "Flutter test",
+      "independent"
+    ],
+    [
+      "Kotest DescribeSpec",
+      "independent"
+    ],
+    [
+      "Pest",
+      "independent"
+    ],
+    [
+      "Web Platform Tests steps",
+      "test"
+    ],
+    [
+      "NixOS Python subtests",
+      "test"
+    ],
+    [
+      "Test2::V0",
+      "quiet"
+    ],
+    [
+      "Test2::V0",
+      "siblings"
+    ],
+    [
+      "Test2::V0",
+      "test"
+    ],
+    [
+      "Kotest FunSpec",
+      "independent"
+    ],
+    [
+      "Kotest FreeSpec",
+      "independent"
+    ],
+    [
+      "Kotest ShouldSpec",
+      "independent"
+    ]
+  ],
+  "candidate_failing_pairs": [],
+  "candidate_matches_in_plain_and_indexed_folders": true,
+  "repositories": 41,
+  "selected_files": 479,
+  "before_and_after_numeric_files": [
+    469,
+    475
+  ],
+  "changed_files": [
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojo/asset.t",
+      "before": null,
+      "after": 8.359878084838423,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojo/base_util.t",
+      "before": null,
+      "after": 10,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojo/hypnotoad.t",
+      "before": null,
+      "after": 9.059060904079463,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojo/ioloop_ipv6.t",
+      "before": null,
+      "after": 10,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojolicious/external_app.t",
+      "before": null,
+      "after": 10,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "mojolicious/mojo",
+      "path": "t/mojolicious/types.t",
+      "before": null,
+      "after": 9.414468185296428,
+      "old_depth": [],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/Format.Tests.ps1",
+      "before": 7.640091518201925,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 54,
+          "threshold": 2
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/functions/assert/Collection/Should-Any.Tests.ps1",
+      "before": 7.698879041274348,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 36,
+          "threshold": 2
+        },
+        {
+          "rule": "nesting depth",
+          "line": 1,
+          "unit": "<file>",
+          "value": 4,
+          "threshold": 4
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/functions/assert/Common/Collect-Input.Tests.ps1",
+      "before": 8.679575849015762,
+      "after": 9.387218218812514,
+      "old_depth": [
+        {
+          "rule": "nesting depth",
+          "line": 1,
+          "unit": "<file>",
+          "value": 5,
+          "threshold": 4
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/functions/assert/General/Should-Be.Tests.ps1",
+      "before": 8.54537958097891,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 13,
+          "threshold": 2
+        },
+        {
+          "rule": "nesting depth",
+          "line": 1,
+          "unit": "<file>",
+          "value": 4,
+          "threshold": 4
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/functions/assert/General/Should-BeLessThanOrEqual.Tests.ps1",
+      "before": 8.816158827775617,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 9,
+          "threshold": 2
+        },
+        {
+          "rule": "nesting depth",
+          "line": 1,
+          "unit": "<file>",
+          "value": 4,
+          "threshold": 4
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/functions/assertions/BeGreaterThan.Tests.ps1",
+      "before": 9.096655465156703,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 3,
+          "threshold": 2
+        },
+        {
+          "rule": "nesting depth",
+          "line": 1,
+          "unit": "<file>",
+          "value": 5,
+          "threshold": 4
+        }
+      ],
+      "new_depth": []
+    },
+    {
+      "repo": "pester/Pester",
+      "path": "tst/testProjects/BasicTests/folder1/file1.Tests.ps1",
+      "before": 9.688208329069498,
+      "after": 10,
+      "old_depth": [
+        {
+          "rule": "nested regions",
+          "line": 1,
+          "unit": "<file>",
+          "value": 5,
+          "threshold": 2
+        }
+      ],
+      "new_depth": []
+    }
+  ],
+  "before_and_after_file_level_review": [
+    {
+      "conditional_logic": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_flagged": 4,
+        "negative_silent": 36,
+        "unscored": 3
+      },
+      "verbosity": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_silent": 38,
+        "positive_silent": 2,
+        "uncertain": 1,
+        "unscored": 2
+      }
+    },
+    {
+      "conditional_logic": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_flagged": 2,
+        "negative_silent": 41
+      },
+      "verbosity": {
+        "disagreement": 11,
+        "na": 51,
+        "negative_silent": 40,
+        "positive_silent": 2,
+        "uncertain": 1
+      }
+    }
+  ],
+  "located_conditionals": {
+    "yes_silent": 3,
+    "no_silent": 3,
+    "uncertain_silent": 1
+  },
+  "unchanged_other_panels": [
+    "conditional_challenge",
+    "localized_verbosity",
+    "paired_controls"
+  ],
+  "codescene_development_macro_mae": [
+    0.2603198029982371,
+    0.2603198029982371
+  ],
+  "aromalia_files": 830,
+  "baseline_sha256": "13ef26fa6eeb580e2a5867a7ca4650e38e906dfa2027da6082e13800752e259b",
+  "candidate_sha256": "16cdbb2b1b81b13feeda3d60397664aa84038615cd55ab1f77d303d1f288d3a8",
+  "compatibility_verified": true
+}

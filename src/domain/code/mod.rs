@@ -200,8 +200,20 @@ pub(crate) fn scored(
     path: &str,
     project: Option<&CProject>,
 ) -> (Analysis, score::Saved) {
-    if let Some(result) = extended::scored(lang, text) {
-        return result;
+    let (facts, base, _) = score_file(lang, text, path, project, false);
+    (facts, base)
+}
+
+pub(crate) fn score_file(lang: Language, text: &str, path: &str, project: Option<&CProject>, test_rules: bool)
+    -> (Analysis, score::Saved, score::Saved) {
+    let finish = |facts: Analysis, base: score::Saved, syntax: Option<(&[Token], &[usize])>| {
+        let adjusted = if test_rules {
+            score::for_tests(path, text, base.as_deref(), &facts, project.is_some(), syntax)
+        } else { None };
+        (facts, base, adjusted)
+    };
+    if let Some((facts, base)) = extended::scored(lang, text) {
+        return finish(facts, base, None);
     }
     let tokens = lexer::tokens(text, lang);
     if matches!(lang, Language::Rust | Language::Python | Language::Js) {
@@ -216,7 +228,7 @@ pub(crate) fn scored(
             script::analyze_paired(lang, text, &tokens, &pairs)
         };
         let score = score::with_pairs(lang, text, &tokens, &pairs, &facts);
-        return (facts, score);
+        return finish(facts, score, (lang != Language::Rust).then_some((&tokens, &pairs)));
     }
     let facts = match project {
         Some(p) if matches!(lang, Language::C | Language::Cpp) => p.analyze(lang, path, text),
@@ -225,8 +237,14 @@ pub(crate) fn scored(
         }
         _ => analyze_tokens(lang, text, &tokens),
     };
-    let score = score::with_tokens(lang, text, &tokens, &facts);
-    (facts, score)
+    if matches!(lang, Language::Sql | Language::PlPgSql) {
+        let base = score::with_tokens(lang, text, &tokens, &facts);
+        finish(facts, base, None)
+    } else {
+        let pairs = script::paired_for_score(&tokens);
+        let base = score::with_pairs(lang, text, &tokens, &pairs, &facts);
+        finish(facts, base, Some((&tokens, &pairs)))
+    }
 }
 pub fn analyze(lang: Language, text: &str) -> Analysis {
     if let Some(facts) = extended::analyze(lang, text) { return facts; }
