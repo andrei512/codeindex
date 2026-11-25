@@ -170,9 +170,7 @@ In file 7, suppose the source begins with `client.send(msg)`. The parser assigns
 
 The [language binding profiles](boxes/binding/profiles.md) define the distinguishing context, evidence, identity, and differential fixtures for the registered modes. The schemas here govern ownership, addressing and public normalization. Pack implementations must demonstrate the recorded observations against the pinned offline providers, including any successful legacy live answers.
 
-## Topics
-
-### Derived and operational records
+## Related contracts
 
 - [Index layouts](boxes/indexes/layout.md) defines lookup structures derived from domain facts.
 - [Generation format](boxes/generations/contract.md) defines persistent identities and pin lifetime.

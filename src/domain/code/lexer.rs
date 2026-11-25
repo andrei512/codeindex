@@ -149,6 +149,20 @@ fn delimited_literal(lang: Language, tail: &str) -> Option<usize> {
     )
 }
 
+pub(super) fn cmake_bracket(s: &str) -> Option<(usize, usize)> {
+    let tail = s.strip_prefix('[')?;
+    let equals = tail.bytes().take_while(|&c| c == b'=').count();
+    if tail.as_bytes().get(equals) != Some(&b'[') {
+        return None;
+    }
+    let open = equals + 2;
+    let close = format!("]{}]", "=".repeat(equals));
+    let end = s[open..]
+        .find(&close)
+        .map_or(s.len(), |i| open + i + close.len());
+    Some((open, end))
+}
+
 pub(super) fn tokens(source: &str, lang: Language) -> Vec<Token<'_>> {
     let bytes = source.as_bytes();
     let mut result: Vec<Token> = Vec::new();
@@ -193,6 +207,22 @@ pub(super) fn tokens(source: &str, lang: Language) -> Vec<Token<'_>> {
             i = tail.find("#>").map_or(bytes.len(), |end| start + end + 2);
             line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
             continue;
+        }
+        if lang == Language::CMake && matches!(c, '#' | '[') {
+            let input = tail.strip_prefix('#').unwrap_or(tail);
+            if let Some((_, end)) = cmake_bracket(input) {
+                i = start + usize::from(c == '#') + end;
+                line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
+                if c != '#' {
+                    result.push(Token {
+                        text: &source[start..i],
+                        span: start..i,
+                        line: start_line,
+                        kind: Kind::String,
+                    });
+                }
+                continue;
+            }
         }
         if lang.line_comment(tail) {
             i = source[start..]

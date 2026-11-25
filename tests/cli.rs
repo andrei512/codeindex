@@ -536,3 +536,39 @@ fn plain_folder_indexed_queries_match_worktree_and_see_edits() {
     assert!(String::from_utf8(repo.invoke(&plain, &["--symbol","renamed"]).unwrap().stdout).unwrap().contains("renamed"));
     assert!(repo.invoke(&plain, &["--symbol","retry"]).unwrap().stdout.is_empty());
 }
+
+#[test]
+fn score_roundtrips_updates_and_matches_plain_folder() {
+    let repo = Repo::new();
+    let code = "def inspect(a, b, c, d, e):\n    return a\n";
+    repo.write("unit.py", code);
+    repo.write("notes.txt", "ignored by scoring\n");
+    let old = repo.query(&["--score", "unit.py"]);
+    assert!(
+        old.contains("9.69/10") && old.contains("unit.py:1: inspect | parameters 5"),
+        "{old}"
+    );
+    assert_eq!(repo.query(&["--score", "unit.py"]), old);
+    assert!(
+        repo.query(&["--score"])
+            .contains("1/2 indexed files scored")
+    );
+    let plain = repo.dir.join("plain");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join("unit.py"), code).unwrap();
+    assert_eq!(
+        repo.invoke(&plain, &["--score", "unit.py"]).unwrap().stdout,
+        old.as_bytes()
+    );
+    repo.write("unit.py", "def inspect(a):\n    return a\n");
+    assert!(repo.query(&["--score", "unit.py"]).contains("10.00/10"));
+    fs::rename(repo.root.join("unit.py"), repo.root.join("renamed.py")).unwrap();
+    assert!(repo.query(&["--score", "renamed.py"]).contains("10.00/10"));
+    assert!(
+        !repo
+            .invoke(&repo.root, &["--score", "unit.py"])
+            .unwrap()
+            .status
+            .success()
+    );
+}

@@ -174,7 +174,7 @@ pub(super) fn parameters(
         }
     }
 }
-pub(super) fn angle_end(t: &[Token], mut p: usize) -> Option<usize> {
+pub(in crate::domain::code) fn angle_end(t: &[Token], mut p: usize) -> Option<usize> {
     if tok(t, p) != "<" {
         return None;
     }

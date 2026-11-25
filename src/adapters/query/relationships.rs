@@ -14,7 +14,7 @@ use std::{
     io,
     path::{Component, Path},
 };
-fn relative(root: &Path, cwd: &Path, input: &str) -> io::Result<String> {
+pub(super) fn relative(root: &Path, cwd: &Path, input: &str) -> io::Result<String> {
     let path = cwd.join(input);
     let mut out = std::path::PathBuf::new();
     for c in path.components() {

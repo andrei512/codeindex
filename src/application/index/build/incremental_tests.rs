@@ -36,6 +36,7 @@ impl Previous for Generation {
         let file = &self.files[id];
         assert!(!markdown::is_markdown(file.path()));
         Ok(Local {
+            score: file.score.clone(),
             code: Analysis::default(),
             lf: file.line_ends.clone(),
             partial_line: false,

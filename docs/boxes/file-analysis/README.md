@@ -9,6 +9,12 @@ Owns code parsers, Markdown parsing and lexical extraction. For code it emits de
 
 Every supported format implements the same file-local contract: declare capabilities, borrow captured source, write typed output, then report coverage. Select the implementation once per input version and distinct syntax mode. Contexts that use the same mode share its output. Code formats may retain language-specific evidence for binding. Plain text only needs lexical analysis. The [document analysis schema](../../domain.md#repository-and-document-analysis) defines the shared fields.
 
+## What one edit produces
+
+A change to a function body may add a reference, a searchable word and a branch. The builder captures its new text and requests the affected products. Language analysis returns declarations and uses alongside the file-local score when scoring is enabled. Each finding carries a rule, unit name, line and observed value. Binding can then revisit the use in project context. Rendering a score needs only the saved measurements.
+
+Markdown takes a different route through the same boundary. One heading tree supplies section ranges for navigation and section-length measurements for scoring. Moving a heading can change both its parent and the breadcrumb attached to a ranked hit. See [maintainability measurements](../../scoring/README.md) for the consumer’s view.
+
 ## Topics
 
 ### Design

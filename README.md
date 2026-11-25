@@ -16,6 +16,22 @@ cargo install --locked codeindex
 
 To install from a checkout, run `cargo install --locked --path .`. The CLI targets macOS and Linux. On macOS, a watcher keeps the index warm for five minutes after the last request.
 
+
+## Maintainability score
+
+Run `cx --score` for the repository, `cx --score src/` for a directory, or `cx --score src/main.rs` for a file. A file result explains each finding at its source location. For example, a Python function with five parameters and no other findings prints:
+
+```text
+example.py: 9.69/10 (2 lines)
+example.py:1: inspect | parameters 5 (threshold 5)
+```
+
+Repository and directory scores are line-weighted averages. The output shows coverage and up to ten lowest-scoring files with findings. Add `--json` for every file and finding. Empty files, binaries, and unrecognized formats contribute no weight. Markdown contributes a separate measurement of section length to the same average.
+
+The native index stores file-local measurements for every supported language. cx measures branch complexity (9), unit length in token-bearing lines (70), logical operators in a condition (2), distinct nested regions (2), structural nesting depth (4), parameters (5), and similar bodies (10 lines). Numbers in parentheses are inclusive reporting thresholds. In brace-based procedural languages, nesting follows control suites. Nested object and collection literals add no control depth. Go and JavaScript callback bodies have their own measurements. Python and Rust method parameter counts exclude recognized receivers. Build and configuration files can have named targets or blocks. Markdown uses nonblank lines per section. Duplication compares non-overlapping bodies within a file using a 87.5% Jaccard threshold on adjacent token pairs, counting repetitions. A score of 10 means no measured rule fired.
+
+The numeric model is independently calibrated against published Python examples. Accuracy varies with the language and rule. [Public evaluation and reproduction instructions](benchmarks/README.md#maintainability-score-accuracy)
+
 ## Search from the shell
 
 The examples below describe this checkout. The design target, including differences from current behavior, is in the [CLI invocation contract](docs/boxes/cli/invocation.md).

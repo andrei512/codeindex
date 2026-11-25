@@ -34,12 +34,10 @@ Moving unchanged Markdown from `a/notes.md` to `b/notes.md` preserves its headin
 ### Refresh
 
 - [Checkpoints and the five-minute watcher](checkpoints.md) explains file identity, incremental work and freshness when a query follows a save.
-- [Publishing small edits and upgrading an index](boxes/generations/incremental.md) shows how native updates reuse bytes, when a reader can reuse an older encoding, and where path changes still trigger a bulk build.
+
 
 ### Contracts
 
-- [Domain model](domain.md) defines the entities, values, owners and invariants.
-- [System catalog](boxes/README.md) locates each of the eight components and its contracts.
 - [Build and query cases](build-cases.md) traces ownership and required work across refresh, failure and concurrent reads.
 - [Comparing implementations](conformance.md) defines independent query witnesses and experiments for physical design choices.
 - [Repairing the conformance findings](conformance-repair.md) assigns the known discrepancies to owners and defines how to verify their fixes.

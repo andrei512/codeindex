@@ -15,7 +15,38 @@ pub(super) fn analyze(lang: Language, source: &str) -> Analysis {
     if lang == Language::Mako {
         return mako::analyze(source);
     }
-    let t = tokens(source, lang);
+    analyze_tokens(lang, source, &tokens(source, lang))
+}
+
+pub(super) fn scored(
+    lang: Language,
+    source: &str,
+) -> (Analysis, crate::domain::code::score::Saved) {
+    use crate::domain::code::{Kind, Token as SourceToken, score};
+    let tokens = tokens(source, lang);
+    let facts = analyze_tokens(lang, source, &tokens);
+    let mut previous = 0;
+    let mut line = 1;
+    let shared = tokens
+        .iter()
+        .map(|t| {
+            line += source.as_bytes()[previous..t.at]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            previous = t.at;
+            SourceToken {
+                text: t.text,
+                span: t.span(),
+                line,
+                kind: if t.name() { Kind::Word } else { Kind::Punct },
+            }
+        })
+        .collect::<Vec<_>>();
+    let result = score::with_tokens(lang, source, &shared, &facts);
+    (facts, result)
+}
+fn analyze_tokens(lang: Language, source: &str, t: &[Token]) -> Analysis {
     match lang {
         Language::Ruby => ruby::analyze(source, &t),
         Language::Lua => lua::analyze(&t),

@@ -4,6 +4,7 @@ use display::Display;
 mod lines;
 mod navigation;
 mod relationships;
+mod score;
 use crate::{
     adapters::snapshot::Pin,
     adapters::snapshot::manifest::*,
@@ -20,6 +21,7 @@ use std::{collections::BTreeSet, io, path::Path};
 
 pub enum Request<'a> {
     Lines(lines::Lines<'a>),
+    Score(Option<&'a str>, bool),
     Search(&'a str),
     Symbol(&'a str),
     Content(&'a str),
@@ -112,6 +114,22 @@ pub struct Invocation<'a> {
 impl<'a> Invocation<'a> {
     pub fn parse(args: &'a [String]) -> Result<Self, String> {
         let mode = args.first().ok_or("missing pattern")?.as_str();
+        if mode == "--score" {
+            let mut path = None;
+            let mut json = false;
+            for arg in &args[1..] {
+                if arg == "--json" && !json {
+                    json = true;
+                } else if arg.starts_with('-') || path.replace(arg.as_str()).is_some() {
+                    return Err("usage: cx --score [FILE|DIR] [--json]".into());
+                }
+            }
+            return Ok(Self {
+                request: Request::Score(path, json),
+                mode,
+                display: Display::default(),
+            });
+        }
         if mode == "--cx" {
             let tail = &args[1..];
             let mode = tail.first().ok_or("missing indexed command")?.as_str();
@@ -155,6 +173,7 @@ impl<'a> Invocation<'a> {
 pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<String> {
     use crate::application::index::build::MemoryQuery;
     let needs = match &invocation.request {
+        Request::Score(..) => MemoryQuery::Score,
         Request::Lines(lines) => return lines.plain(cwd, outcome),
         Request::Search(_) => MemoryQuery::Rank { breadcrumbs: invocation.display.json || !invocation.display.public },
         Request::Symbol(_) => MemoryQuery::Symbols,
@@ -182,6 +201,7 @@ pub fn evaluate(
     let mut truncated = false;
     let mut md = None;
     match req {
+        Request::Score(path, json) => return score::query(pin, cwd, path, json, outcome),
         Request::Lines(lines) => return lines.run(pin, cwd, outcome),
         Request::NamedRelationship(op, name) => {
             return relationships::query(

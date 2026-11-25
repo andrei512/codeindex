@@ -1,0 +1,394 @@
+[
+  {
+    "language": "C",
+    "extensions": [
+      "c"
+    ],
+    "repository": "libuv/libuv",
+    "revision": "de4c8602d54255c4e7f3fa91dd6f44b682679724"
+  },
+  {
+    "language": "C",
+    "extensions": [
+      "c"
+    ],
+    "repository": "madler/zlib",
+    "revision": "617e19a81f38c15ff04de9f86882f42ad8a8ffd1"
+  },
+  {
+    "language": "C++",
+    "extensions": [
+      "cpp",
+      "cc"
+    ],
+    "repository": "google/googletest",
+    "revision": "a46a6012a133c7c0929fdae55b321c2fe65f3c5f"
+  },
+  {
+    "language": "C++",
+    "extensions": [
+      "cpp",
+      "cc"
+    ],
+    "repository": "nlohmann/json",
+    "revision": "322063822f66533bb81ef8e938fd07e5f6394917"
+  },
+  {
+    "language": "C#",
+    "extensions": [
+      "cs"
+    ],
+    "repository": "FluentValidation/FluentValidation",
+    "revision": "5903fa65863ec66dabf10646b9c09b33130a03e8"
+  },
+  {
+    "language": "C#",
+    "extensions": [
+      "cs"
+    ],
+    "repository": "serilog/serilog",
+    "revision": "43105b35095337d77f022561a8f2d3db2f9a7937"
+  },
+  {
+    "language": "Java",
+    "extensions": [
+      "java"
+    ],
+    "repository": "junit-team/junit-framework",
+    "revision": "06d45ac333d451c5e1f7a98dd5005b7224513684"
+  },
+  {
+    "language": "Java",
+    "extensions": [
+      "java"
+    ],
+    "repository": "square/retrofit",
+    "revision": "54c204719ac5bf952402aaf81f54f9a2f24beee2"
+  },
+  {
+    "language": "Go",
+    "extensions": [
+      "go"
+    ],
+    "repository": "spf13/cobra",
+    "revision": "adbc8813901bba65827259daa8e22ff94ec1f30e"
+  },
+  {
+    "language": "Go",
+    "extensions": [
+      "go"
+    ],
+    "repository": "go-git/go-git",
+    "revision": "9f261d7e3f2a9c41dbd2209c7c2d0a9c66679f1b"
+  },
+  {
+    "language": "Rust",
+    "extensions": [
+      "rs"
+    ],
+    "repository": "BurntSushi/ripgrep",
+    "revision": "3e85c6c148fdce38a99ceeb9d2780dc7b03b4a4f"
+  },
+  {
+    "language": "Rust",
+    "extensions": [
+      "rs"
+    ],
+    "repository": "tokio-rs/bytes",
+    "revision": "67edc2b999d669eb4f471aff576e213dbcb58871"
+  },
+  {
+    "language": "Python",
+    "extensions": [
+      "py"
+    ],
+    "repository": "pallets/click",
+    "revision": "08b803cf32ceb2ae6a772c62d5da42757a897d44"
+  },
+  {
+    "language": "Python",
+    "extensions": [
+      "py"
+    ],
+    "repository": "psf/requests",
+    "revision": "3c7baaa05ab4aa49cc819ce3a819d260de19c157"
+  },
+  {
+    "language": "TypeScript",
+    "extensions": [
+      "ts"
+    ],
+    "repository": "trpc/trpc",
+    "revision": "f6d113b3aa64ac07533a727fbf81774e8de81e67"
+  },
+  {
+    "language": "TypeScript",
+    "extensions": [
+      "ts"
+    ],
+    "repository": "sindresorhus/got",
+    "revision": "c196ad006b5c5c21717bafb93a384e68d2f33998"
+  },
+  {
+    "language": "JavaScript",
+    "extensions": [
+      "js"
+    ],
+    "repository": "expressjs/express",
+    "revision": "43fca52d28a422c8be48fd489cbd4f2d6152bab6"
+  },
+  {
+    "language": "JavaScript",
+    "extensions": [
+      "js"
+    ],
+    "repository": "sindresorhus/execa",
+    "revision": "6f856d55bd3ea8b3f240a7fc4502d2ac50697eec"
+  },
+  {
+    "language": "Kotlin",
+    "extensions": [
+      "kt"
+    ],
+    "repository": "square/moshi",
+    "revision": "889013ec2edb8d8034902662a1dc8c4f3b3f8111"
+  },
+  {
+    "language": "Kotlin",
+    "extensions": [
+      "kt"
+    ],
+    "repository": "coil-kt/coil",
+    "revision": "14d99b18c4491fd6eccdc54454f3c079a90e3c10"
+  },
+  {
+    "language": "Swift",
+    "extensions": [
+      "swift"
+    ],
+    "repository": "Alamofire/Alamofire",
+    "revision": "dea4bab91767a971d6e112bc955c6a82295589b7"
+  },
+  {
+    "language": "Swift",
+    "extensions": [
+      "swift"
+    ],
+    "repository": "ReactiveX/RxSwift",
+    "revision": "3e33f90c1bcd3cdea25bdb49bd4a594a50c3ab84"
+  },
+  {
+    "language": "Ruby",
+    "extensions": [
+      "rb"
+    ],
+    "repository": "rack/rack",
+    "revision": "b432304e8ddc23cc98564d2a8365827b59a835bd"
+  },
+  {
+    "language": "Ruby",
+    "extensions": [
+      "rb"
+    ],
+    "repository": "ruby/rake",
+    "revision": "a1953315801cd03b21d12b171b9cedebd740ab9d"
+  },
+  {
+    "language": "PHP",
+    "extensions": [
+      "php"
+    ],
+    "repository": "thephpleague/flysystem",
+    "revision": "12930254888f54a48ea9d8ac04c2f73a0e3b09f1"
+  },
+  {
+    "language": "PHP",
+    "extensions": [
+      "php"
+    ],
+    "repository": "composer/semver",
+    "revision": "e6f8ac797a0cb36d71d8aaf8388798dadb431c97"
+  },
+  {
+    "language": "Lua",
+    "extensions": [
+      "lua"
+    ],
+    "repository": "lunarmodules/Penlight",
+    "revision": "44007e5420adfd421f01c1172172902ae0f074bb"
+  },
+  {
+    "language": "Lua",
+    "extensions": [
+      "lua"
+    ],
+    "repository": "Kong/kong",
+    "revision": "e329db8a35cce33dd88c74ca08dcd9bc8b8ed137"
+  },
+  {
+    "language": "Objective-C",
+    "extensions": [
+      "m"
+    ],
+    "repository": "AFNetworking/AFNetworking",
+    "revision": "d9f589cc2c1fe9d55eb5eea00558010afea7a41e"
+  },
+  {
+    "language": "Objective-C",
+    "extensions": [
+      "m"
+    ],
+    "repository": "jverkoey/nimbus",
+    "revision": "06acbbf510b87008b48f855d84a97d1807b6eb7a"
+  },
+  {
+    "language": "Perl",
+    "extensions": [
+      "pm",
+      "pl"
+    ],
+    "repository": "mojolicious/mojo",
+    "revision": "d232174795b0b6b019e9a1f67e8400025b073d7b"
+  },
+  {
+    "language": "Perl",
+    "extensions": [
+      "pm",
+      "pl"
+    ],
+    "repository": "Perl-Toolchain-Gang/ExtUtils-MakeMaker",
+    "revision": "d0dc922ad272ee868329b6009e831c1ee30a89c0"
+  },
+  {
+    "language": "Shell",
+    "extensions": [
+      "sh",
+      "bash"
+    ],
+    "grammar": "bash",
+    "repository": "scop/bash-completion",
+    "revision": "ddf4f5e44818e00c51e984c019c15b6d73a2e79b"
+  },
+  {
+    "language": "Shell",
+    "extensions": [
+      "sh",
+      "bash"
+    ],
+    "grammar": "bash",
+    "repository": "bats-core/bats-core",
+    "revision": "e3175e2f39ef170dccdee3f7a4e404e82a5fd4f7"
+  },
+  {
+    "language": "PowerShell",
+    "extensions": [
+      "ps1",
+      "psm1"
+    ],
+    "grammar": "powershell",
+    "repository": "pester/Pester",
+    "revision": "8c6fb875ba176af5247754098ef94d2449b169f9"
+  },
+  {
+    "language": "PowerShell",
+    "extensions": [
+      "ps1",
+      "psm1"
+    ],
+    "grammar": "powershell",
+    "repository": "PowerShell/PSScriptAnalyzer",
+    "revision": "0151b9dafd1a7ba4279e0deeb03f04661223e629"
+  },
+  {
+    "language": "Starlark",
+    "extensions": [
+      "bzl"
+    ],
+    "grammar": "starlark",
+    "repository": "bazel-contrib/rules_go",
+    "revision": "e5a457da845621241d89a277c9dbf5dd14c3df7e"
+  },
+  {
+    "language": "Starlark",
+    "extensions": [
+      "bzl"
+    ],
+    "grammar": "starlark",
+    "repository": "bazel-contrib/rules_python",
+    "revision": "778bb6836229d8743d812f3dbfc0059ce7a01d6b"
+  },
+  {
+    "language": "CMake",
+    "extensions": [
+      "cmake"
+    ],
+    "grammar": "cmake",
+    "repository": "Kitware/CMake",
+    "revision": "7f614a46bc3616f2d4079de52d3d81dcb5687bfe"
+  },
+  {
+    "language": "CMake",
+    "extensions": [
+      "cmake"
+    ],
+    "grammar": "cmake",
+    "repository": "KDE/extra-cmake-modules",
+    "revision": "dc2bc9b098ded38d12a9b8e30df575de6e070095"
+  },
+  {
+    "language": "Hack",
+    "extensions": [
+      "hack",
+      "php"
+    ],
+    "grammar": "hack",
+    "repository": "hhvm/hsl",
+    "revision": "fd98852f3f9255ca2ad9577c2a1b2f747ece8a12"
+  },
+  {
+    "language": "Hack",
+    "extensions": [
+      "hack",
+      "php"
+    ],
+    "grammar": "hack",
+    "repository": "hhvm/hacktest",
+    "revision": "823d2261bb784087ec3bc6bbbaf9157cb8abd40c"
+  },
+  {
+    "language": "Dart",
+    "extensions": [
+      "dart"
+    ],
+    "grammar": "dart",
+    "repository": "dart-lang/http",
+    "revision": "05c4f243bb376536e21f865cee58172eec81a681"
+  },
+  {
+    "language": "Dart",
+    "extensions": [
+      "dart"
+    ],
+    "grammar": "dart",
+    "repository": "dart-lang/shelf",
+    "revision": "2856b69e67726aa646dc786fa3d6d6dbf42877f4"
+  },
+  {
+    "language": "Protobuf",
+    "extensions": [
+      "proto"
+    ],
+    "grammar": "proto",
+    "repository": "bufbuild/protovalidate",
+    "revision": "804b6087217194c7827e0d63bf2f6ae70d01f41b"
+  },
+  {
+    "language": "Protobuf",
+    "extensions": [
+      "proto"
+    ],
+    "grammar": "proto",
+    "repository": "googleapis/googleapis",
+    "revision": "25fb8ea2d4bfa8fd41e24b28029e34a4adc35db0"
+  }
+]

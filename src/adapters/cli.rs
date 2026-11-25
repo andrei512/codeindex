@@ -64,7 +64,7 @@ pub fn run(
         if std::io::IsTerminal::is_terminal(&std::io::stdout())
             && !matches!(
                 args[0].as_str(),
-                "--cx" | "-k" | "--keywords" | "--symbol" | "--reference" | "--refs"
+                "--score" | "--cx" | "-k" | "--keywords" | "--symbol" | "--reference" | "--refs"
             )
         {
             args.insert(0, "--cx-terminal".into());

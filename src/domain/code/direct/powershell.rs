@@ -36,6 +36,7 @@ pub(in crate::domain::code) fn analyze(text: &str, tokens: &[Token]) -> Analysis
         let prev = i.checked_sub(1).map(|j| &tokens[j]);
         let command_start = prev.is_none_or(|p| {
             p.line < token.line
+                || (p.span.start == 0 && p.text == "\u{feff}")
                 || matches!(p.text, ";" | "|" | "&" | "{" | "(" | "=")
                 || p.text.eq_ignore_ascii_case("return")
         });

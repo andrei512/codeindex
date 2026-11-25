@@ -5,7 +5,7 @@ page-type: landing
 
 Coding agents spend time rediscovering a repository on every task. Searching for `send` finds the word in method definitions, unrelated calls, tests and prose. To change one method safely, an agent needs to know which definition a particular call reaches, who else calls it, and which section of the docs describes its behavior.
 
-Codeindex is a local code search and navigation tool for coding agents. Its `cx` CLI answers those questions from a shared repository index. An agent can ask its first question from anywhere inside a Git working tree. The CLI finds the root, builds or refreshes the index under `~/.codeindex`, and answers from one consistent version of the code and docs. Subsequent queries reuse that work.
+Codeindex is a local code search and navigation tool for coding agents. Its `cx` CLI answers those questions from a shared repository index. An agent can ask its first question from anywhere inside a Git working tree. The CLI finds the root, builds or refreshes the index under `~/.codeindex`, and answers from one consistent version of the code and docs. Subsequent queries reuse that work. Outside Git, ordinary search scans the requested input and indexed queries keep their results in memory for one invocation.
 
 ## What an agent can ask
 
@@ -40,7 +40,12 @@ flowchart LR
 
 ## Topics
 
-### Design
+### Working with a checkout
+
+- [Follow a change from its policy to its callers](using-cx.md) walks from ranked documentation to declarations and references.
+- [Maintainability measurements](scoring/README.md) explains file scores, their underlying findings and what they establish about test code.
+
+### Engine design
 
 - [First principles](first_principles.md) defines the rule for deciding which work belongs in the engine.
 - [Architecture](architecture.md) follows a request from repository capture to a pinned answer.

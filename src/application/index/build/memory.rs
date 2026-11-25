@@ -3,6 +3,7 @@ use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryQuery {
+    Score,
     Paths,
     Content,
     Markdown,
@@ -43,6 +44,7 @@ pub(crate) fn memory_index(
             line_ends: Vec::new(),
             original_stamp: None,
             catalog_row: 0..0,
+            score: None,
             blob: None,
             evidence: 0..0,
         });
@@ -55,7 +57,8 @@ pub(crate) fn memory_index(
             .as_ref()
             .map_or("", |r| &source[r.start as usize..r.end as usize])
     };
-    let project = (graph && files.iter().any(|f| c_project::database(f.path()))).then(|| {
+    let scoring = query == MemoryQuery::Score;
+    let project = ((graph || scoring) && files.iter().any(|f| c_project::database(f.path()))).then(|| {
         code::CProject::new(
             root,
             files
@@ -75,12 +78,19 @@ pub(crate) fn memory_index(
                 file.path(),
                 file.bytes.as_ref().map(|_| text(file)),
                 project.as_ref(),
-                graph,
+                graph || scoring,
                 !graph,
+                scoring,
             )
         })
         .collect();
     drop(project);
+    if scoring {
+        for (f, l) in files.iter_mut().zip(locals) {
+            f.score = l.score;
+        }
+        return Ok((files, dir, source.into_bytes()));
+    }
     let units: Vec<_> = files
         .iter()
         .zip(&locals)

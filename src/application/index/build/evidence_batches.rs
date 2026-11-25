@@ -142,6 +142,7 @@ mod tests {
         let files: Vec<_> = specs
             .iter()
             .map(|(path, s)| Entry {
+                score: None,
                 blob: None,
                 catalog_row: 0..0,
                 original_stamp: None,

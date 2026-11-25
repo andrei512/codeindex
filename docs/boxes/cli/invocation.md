@@ -5,7 +5,7 @@ page-type: reference
 
 This is the design target for the native Codeindex CLI. It defines what an agent can type, what bytes it can read back, and how it can tell a miss from an incomplete answer. The compatibility target and the current implementation are tracked separately below.
 
-## Four forms an agent needs
+## Query forms
 
 | Question | Invocation | Example stdout |
 | --- | --- | --- |
@@ -13,6 +13,9 @@ This is the design target for the native Codeindex CLI. It defines what an agent
 | Which passages discuss this topic? | `cx -k 'retry policy'` | `docs/retries.md:18:Retry failed requests up to three times.` |
 | Where is this name declared? | `cx --symbol retry_delay` | `src/retry.rs:12:pub fn retry_delay() {` |
 | Where is this declaration used? | `cx --reference retry_delay` | `src/client.rs:47:    retry_delay();` |
+| Which parts of this file contribute to its maintainability score? | `cx --score example.py` | `example.py:1: inspect \| parameters 5 (threshold 5)` |
+
+`cx --score [FILE|DIR] [--json]` uses the current indexed generation. The default scope is the whole repository. File output includes measured values, thresholds, unit names, and source lines. Directory output includes coverage, the line-weighted mean, and the ten lowest scores with findings. JSON includes every file and finding in scope. Empty or unsupported files have a null score. A missing path returns exit status 1.
 
 Codeindex executes every search natively. Use the installed ripgrep executable only as a test oracle. Repository discovery, pinning and refresh belong to Codeindex. An indexed query observes a single generation.
 

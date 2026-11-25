@@ -6,6 +6,10 @@
   },
   "nx": {
     "targets": {
+      "eval-score": {
+        "dependsOn": ["build-cx"],
+        "command": "python3 benchmarks/score.py"
+      },
       "build-cx": {
         "command": "cargo build --release --locked"
       }

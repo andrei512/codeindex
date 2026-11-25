@@ -1,0 +1,14 @@
+kind: site
+title: Codeindex
+root: README.md
+structure: structure
+navbar:
+  Home: README.md
+  Using cx: using-cx.md
+  System catalog: boxes/README.md
+  First principles: first_principles.md
+  Architecture: architecture.md
+  Measurements: scoring/README.md
+watch:
+  - "**/*.md"
+  - "**/*.yml"

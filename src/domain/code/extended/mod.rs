@@ -32,6 +32,29 @@ impl Language {
     }
 }
 
+pub(super) fn scored(lang: Language, text: &str) -> Option<(Analysis, super::score::Saved)> {
+    if matches!(
+        lang,
+        Language::Lua | Language::Ruby | Language::Perl | Language::Assembly | Language::PlPgSql
+    ) {
+        return Some(scripts::scored(lang, text));
+    }
+    if !matches!(
+        lang,
+        Language::Go
+            | Language::Java
+            | Language::Kotlin
+            | Language::ObjectiveC
+            | Language::Dart
+            | Language::Php
+            | Language::Hack
+    ) {
+        return None;
+    }
+    let mut score = None;
+    let facts = objects::analyze_scored(lang, text, Some(&mut score));
+    Some((facts, score))
+}
 pub(super) fn analyze(lang: Language, source: &str) -> Option<Analysis> {
     use Language::*;
     Some(match lang {

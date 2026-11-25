@@ -27,8 +27,9 @@ pub(crate) fn same_observation(a: &[ObservedPath], b: &[ObservedPath]) -> bool {
             .zip(b)
             .all(|(a, b)| a.path == b.path && a.stamp == b.stamp)
 }
-pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE3";
+pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE4";
 pub struct Entry {
+    pub(crate) score: crate::domain::code::score::Saved,
     pub(crate) blob: Option<crate::domain::BlobId>,
     catalog_row: Range<u64>,
     observation: Observation,
@@ -93,13 +94,29 @@ impl Entry {
         for &end in ends {
             put(w, end)?;
         }
+        self.write_score(w)?;
+        Ok(())
+    }
+    fn write_score(&self, w: &mut impl Write) -> io::Result<()> {
+        w.write_all(&[u8::from(self.score.is_some())])?;
+        if let Some(s) = &self.score {
+            put(w, s.lines)?;
+            put(w, s.findings.len())?;
+            for f in &s.findings {
+                w.write_all(&[f.rule as u8])?;
+                put(w, f.line)?;
+                put(w, f.value)?;
+                string(w, &f.unit)?;
+            }
+        }
         Ok(())
     }
 }
 pub(crate) fn files(bytes: &[u8], source_len: u64) -> io::Result<Vec<Entry>> {
     let mut d = Decoder(bytes);
     let catalog_size = bytes.len();
-    let hashes = bytes.starts_with(CATALOG_MAGIC);
+    let scores = bytes.starts_with(CATALOG_MAGIC);
+    let hashes = scores || bytes.starts_with(b"CIXFILE3");
     let packed = hashes || bytes.starts_with(b"CIXFILE2");
     if packed {
         d.take(8)?;
@@ -160,7 +177,35 @@ pub(crate) fn files(bytes: &[u8], source_len: u64) -> io::Result<Vec<Entry>> {
         {
             return Err(bad());
         }
+        let score = if scores {
+            match d.take(1)? {
+                [0] => None,
+                [1] => {
+                    use crate::domain::code::score::{Finding, Rule, Score};
+                    let lines = d.num()?;
+                    let count = d.num()?;
+                    let mut findings = Vec::new();
+                    for _ in 0..count {
+                        let rule = *Rule::ALL.get(d.take(1)?[0] as usize).ok_or_else(bad)?;
+                        let line = d.num()?;
+                        let value = d.num()?;
+                        let unit = d.string()?.to_owned();
+                        findings.push(Finding {
+                            rule,
+                            line,
+                            value,
+                            unit,
+                        });
+                    }
+                    Some(std::sync::Arc::new(Score { lines, findings }))
+                }
+                _ => return Err(bad()),
+            }
+        } else {
+            None
+        };
         files.push(Entry {
+            score,
             blob,
             catalog_row: if hashes {
                 row_start..(catalog_size - d.0.len()) as u64

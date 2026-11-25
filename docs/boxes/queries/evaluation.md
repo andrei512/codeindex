@@ -8,7 +8,7 @@ Query execution borrows a pinned generation and a typed request. The pin selects
 ```text
 evaluate(pin, request) → answer | invalid selector | unreadable generation
 list answer = { ordered hits, truncated, coverage where applicable }
-position selector = { repository path, line ≥ 1, UTF-16 column ≥ 1 }
+position selector = { repository path, line ≥ 1, column ≥ 1, input coordinate convention }
 ```
 
 ## Reader plans
@@ -17,7 +17,7 @@ position selector = { repository path, line ≥ 1, UTF-16 column ≥ 1 }
 | --- | --- |
 | Literal or regex | Derive mandatory trigrams where possible; intersect candidate lists; verify on pinned bytes; convert true matches to source locations. A pattern without mandatory keys scans visible text. |
 | Ranked chunks | Normalize each query phrase, match adjacent positions in the same field, combine phrase contributions per chunk using visible corpus statistics, then select by score and tie order. Produce snippets and breadcrumbs for returned chunks. |
-| Relationship at a position | Resolve the file inside the pin, translate UTF-16 to a byte position, select the applicable contexts, find the shortest containing sites separately in each distinct analysis, and follow the corresponding contextual bindings, target postings and optional navigation groups. |
+| Relationship at a position | Resolve the file inside the pin, validate the selector and translate its input coordinate to a byte position, select the applicable contexts, find the shortest containing sites separately in each distinct analysis, and follow the corresponding contextual bindings, target postings and optional navigation groups. |
 | Markdown | Resolve a section address to a subtree or parent. For backlinks use the normalized written destination as the lookup key. A target heading need not exist for referring links to exist. |
 
 Do cheap candidate selection before source access. A cursor may stop after the first extra verified distinct hit only if its traversal order is the final result order. Ranked results require all relevant score contributions or a proven safe upper bound. Snippet formatting and ancestry recovery can wait until selection. Keep these costs out of the builder.
@@ -57,7 +57,7 @@ A non-BMP character before a symbol exercises UTF-16 conversion. A verified set 
 | Section and backlinks | Section returns the pinned subtree bytes, path, anchor, title, parent handle, line, bounds and breadcrumbs from root to selected section. Missing section is a lookup error; asking for the root's parent succeeds with null. Backlinks sort by source path, link byte offset, source section ordinal and target fragment; each hit gives the written target, referring handle and breadcrumbs. |
 | Status | Read the pin's manifest and coverage summaries. Count visible paths, text files, parsed files and files with parse errors according to their capabilities. Report the generation's semantic coverage and any gaps. |
 
-Content and symbol columns count bytes starting at one. Relationship selectors and hits count UTF-16 code units starting at one. LF separates lines; CR remains in the preceding line. Reject a selector inside a surrogate pair or beyond end of line. A position at line end is a valid boundary and can yield zero sites. For source `🙂x\r\n`, `x` starts at byte column 5 and UTF-16 column 3. UTF-16 column 2 is invalid.
+Content and symbol columns count bytes starting at one. The public `cx --reference FILE LINE COL` selector uses a one-based UTF-8 byte column. Advanced `cx --cx references FILE LINE COL` and relationship JSON hit columns count UTF-16 code units starting at one. LF separates lines; CR remains in the preceding line. Reject a selector inside a surrogate pair or beyond end of line. A position at line end is a valid boundary and can yield zero sites. For source `🙂x\r\n`, `x` starts at byte column 5 and UTF-16 column 3. UTF-16 column 2 is invalid.
 
 ## Ranking arithmetic and excerpt oracle
 

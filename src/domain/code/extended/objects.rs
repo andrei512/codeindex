@@ -192,7 +192,7 @@ impl<'a> Syntax<'a> {
         }
         None
     }
-    fn finish(mut self) -> Analysis {
+    fn finish(mut self, source: &str, score: Option<&mut super::super::score::Saved>) -> Analysis {
         self.extract();
         self.decls.sort_by_key(|d| d.at);
         self.decls.dedup_by_key(|d| d.at);
@@ -362,6 +362,9 @@ impl<'a> Syntax<'a> {
                 span: t.span.clone(),
                 owner: caller,
             });
+        }
+        if let Some(dest) = score {
+            *dest = super::super::score::with_tokens(self.lang, source, &self.t, &out);
         }
         out
     }
@@ -572,12 +575,19 @@ fn reserved(s: &str) -> bool {
 }
 
 pub(super) fn analyze(lang: Language, source: &str) -> Analysis {
+    analyze_scored(lang, source, None)
+}
+pub(super) fn analyze_scored(
+    lang: Language,
+    source: &str,
+    score: Option<&mut super::super::score::Saved>,
+) -> Analysis {
     let lang = if lang == Language::Php && hack_header_len(source).is_some() {
         Language::Hack
     } else {
         lang
     };
-    Syntax::new(lang, source).finish()
+    Syntax::new(lang, source).finish(source, score)
 }
 
 fn hack_header_len(source: &str) -> Option<usize> {

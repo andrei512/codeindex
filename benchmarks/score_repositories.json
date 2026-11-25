@@ -1,0 +1,90 @@
+{
+  "pydantic": {
+    "repository": "pydantic/pydantic",
+    "revision": "b834e9845de3fadc59a21fd226fd7695f03020c6"
+  },
+  "rich": {
+    "repository": "Textualize/rich",
+    "revision": "0c271d5bb67292806b8fea1c2e08f9c5a7e7f928"
+  },
+  "litestar": {
+    "repository": "litestar-org/litestar",
+    "revision": "8b742782a26247a19f06fc154834eace4400502c"
+  },
+  "hono": {
+    "repository": "honojs/hono",
+    "revision": "342ff3b52dda2d655aa5c5b649557e9d6f247909"
+  },
+  "zod": {
+    "repository": "colinhacks/zod",
+    "revision": "5bfc8f269a81d9edc283e7920868161e4129fb23"
+  },
+  "axios": {
+    "repository": "axios/axios",
+    "revision": "8092aee7240220aa7913d163187b7fba8d9e5a51"
+  },
+  "fastify": {
+    "repository": "fastify/fastify",
+    "revision": "012c24919679444313cf20d6be084cb9d22165e6"
+  },
+  "clap": {
+    "repository": "clap-rs/clap",
+    "revision": "8d87e70789ed7832aa93473779d248090712d66b"
+  },
+  "fd": {
+    "repository": "sharkdp/fd",
+    "revision": "8661ac473c5b6c1c5197742cff5ce8284d13a920"
+  },
+  "bat": {
+    "repository": "sharkdp/bat",
+    "revision": "1e4a4b765f4a1cad74f3a4204112268f3b303f2f"
+  },
+  "gin": {
+    "repository": "gin-gonic/gin",
+    "revision": "ecb3f7b5e2f3915bf1db240ed5eee572f8dbea36"
+  },
+  "chi": {
+    "repository": "go-chi/chi",
+    "revision": "de0d16e6d23092aeef0b6e78f146799369160651"
+  },
+  "fiber": {
+    "repository": "gofiber/fiber",
+    "revision": "5caa478c02c5eb6cd1c251ddc634ec0600e66a7b"
+  },
+  "mockito": {
+    "repository": "mockito/mockito",
+    "revision": "04a6e9f88ccc6c29e77b95a8e0b617319bcee234"
+  },
+  "caffeine": {
+    "repository": "ben-manes/caffeine",
+    "revision": "cc5425aa2dca829276b583c5f7669e16d88d8403"
+  },
+  "detekt": {
+    "repository": "detekt/detekt",
+    "revision": "3b440a6fac5709cd07f45dbfde231e475b1ec604"
+  },
+  "coroutines": {
+    "repository": "Kotlin/kotlinx.coroutines",
+    "revision": "ebad55576fd4c6f7ea6ca4d5672bc29153256c67"
+  },
+  "spdlog": {
+    "repository": "gabime/spdlog",
+    "revision": "8806ca6509f037cf7612ea292338e3b222209dc1"
+  },
+  "fmt": {
+    "repository": "fmtlib/fmt",
+    "revision": "a731c73fd5dae3bb942fbf57cb63762b2b998c29"
+  },
+  "npgsql": {
+    "repository": "npgsql/npgsql",
+    "revision": "98f28f354ea28ec6c0ea7f07b9e3a9810d08c1ac"
+  },
+  "quartznet": {
+    "repository": "quartznet/quartznet",
+    "revision": "2158050e936509a3555a08b33d4eec9d6565b1be"
+  },
+  "cockroach": {
+    "repository": "cockroachdb/cockroach",
+    "revision": "47a00e3ec37edcbb3ce718a94bb57729c07453f8"
+  }
+}

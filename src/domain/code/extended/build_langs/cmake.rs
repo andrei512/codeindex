@@ -1,3 +1,4 @@
+use crate::domain::code::lexer::cmake_bracket as bracket;
 use super::{Facts, simple, span, target};
 use crate::domain::code::Analysis;
 
@@ -13,22 +14,6 @@ enum Form {
 struct Arg<'a> {
     text: &'a str,
     form: Form,
-}
-
-fn bracket(s: &str) -> Option<(usize, usize)> {
-    let tail = s.strip_prefix('[')?;
-    let equals = tail.bytes().take_while(|&c| c == b'=').count();
-    if tail.as_bytes().get(equals) != Some(&b'[') {
-        return None;
-    }
-    let open = equals + 2;
-    let end = format!("]{}]", "=".repeat(equals));
-    Some((
-        open,
-        s[open..]
-            .find(&end)
-            .map_or(s.len(), |i| open + i + end.len()),
-    ))
 }
 
 fn tokens(mut s: &str) -> Vec<Arg<'_>> {

@@ -10,7 +10,7 @@ mod extract;
 mod tests;
 use binding::Resolver;
 pub(super) use binding::resolve;
-pub(super) use extract::analyze;
+pub(super) use extract::{analyze, analyze_paired};
 mod generics;
 mod identity;
 mod members;
@@ -161,7 +161,7 @@ fn declaration(
     id
 }
 
-fn matches(t: &[Token]) -> Vec<usize> {
+pub(super) fn matches(t: &[Token]) -> Vec<usize> {
     let mut pairs = vec![usize::MAX; t.len()];
     let mut stack = Vec::new();
     for (i, token) in t.iter().enumerate() {

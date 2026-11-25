@@ -9,6 +9,10 @@ Owns the input manifest, extent directory, version compatibility, the cross-proc
 
 ## Topics
 
+### Reading and refreshing
+
+- [How a reader survives an edit](reading.md) follows the old and new versions of one document through publication.
+
 ### Storage
 
 - [Generation format and publication](contract.md) defines the manifest, extent references, pin lifetime and crash guarantees.

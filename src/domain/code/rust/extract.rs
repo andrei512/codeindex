@@ -1,7 +1,13 @@
 use super::*;
 
 pub(in crate::domain::code) fn analyze(t: &[Token], text_len: usize) -> Analysis {
-    let pairs = matches(t);
+    analyze_paired(t, text_len, &matches(t))
+}
+pub(in crate::domain::code) fn analyze_paired(
+    t: &[Token],
+    text_len: usize,
+    pairs: &[usize],
+) -> Analysis {
     let mut a = Analysis::default();
     let mut e = Evidence {
         conditional_crate: false,

@@ -17,7 +17,11 @@ use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
+pub(super) use syntax::angle_end;
 use syntax::*;
+pub(super) fn paired_for_score(t: &[Token]) -> Vec<usize> {
+    paired(t)
+}
 
 #[derive(Default)]
 struct Scope {
@@ -101,6 +105,9 @@ pub(super) struct Evidence {
     self_params: HashMap<usize, usize>,
 }
 impl Evidence {
+    pub(super) fn has_method_receiver(&self, declaration: usize) -> bool {
+        self.functions.get(&declaration).is_some_and(|&scope| self.scopes[scope].receiver.is_some())
+    }
     fn binding(&self, mut scope: usize, name: &str) -> Option<&Binding> {
         let mut nonlocal = false;
         loop {
@@ -254,11 +261,14 @@ fn add_use(
     e.uses.push(lookup);
 }
 pub(super) fn analyze(lang: Language, source: &str, t: &[Token]) -> Analysis {
+    analyze_paired(lang, source, t, &paired(t))
+}
+pub(super) fn analyze_paired(lang: Language, source: &str, t: &[Token], end: &[usize]) -> Analysis {
     let python = lang == Language::Python;
     let mut a = Analysis::default();
     let mut e = Evidence::default();
     e.scopes.push(Scope::default());
-    let end = paired(t);
+
     let markup = if python {
         jsx::Markup::default()
     } else {

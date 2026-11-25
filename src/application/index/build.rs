@@ -24,6 +24,7 @@ mod source;
 use source::{Pool, Source};
 pub(crate) struct Local {
     pub(crate) code: Analysis,
+    pub(crate) score: code::score::Saved,
     pub(crate) markdown: Option<Parsed>,
     pub(crate) lf: Vec<usize>,
     pub(crate) partial_line: bool,
@@ -32,15 +33,28 @@ fn analyze(path: &str, body: Option<&str>) -> Local {
     analyze_with_project(path, body, None)
 }
 fn analyze_with_project(path: &str, body: Option<&str>, project: Option<&code::CProject>) -> Local {
-    analyze_products(path, body, project, true, true)
+    analyze_products(path, body, project, true, true, true)
 }
-fn analyze_products(path: &str, body: Option<&str>, project: Option<&code::CProject>, code_needed: bool, markdown_needed: bool) -> Local {
+fn analyze_products(
+    path: &str,
+    body: Option<&str>,
+    project: Option<&code::CProject>,
+    code_needed: bool,
+    markdown_needed: bool,
+    score_needed: bool,
+) -> Local {
     let text = body.unwrap_or("");
-    let code = Language::for_path(path)
+    let (code, mut score) = Language::for_path(path)
         .filter(|_| code_needed && body.is_some())
-        .map_or_else(Analysis::default, |l| match project {
-            Some(p) if matches!(l, Language::C | Language::Cpp) => p.analyze(l, path, text),
-            _ => code::analyze(l, text),
+        .map_or_else(Default::default, |l| {
+            if score_needed {
+                return code::scored(l, text, path, project);
+            }
+            let facts = match project {
+                Some(p) if matches!(l, Language::C | Language::Cpp) => p.analyze(l, path, text),
+                _ => code::analyze(l, text),
+            };
+            (facts, None)
         });
     let markdown =
         (markdown_needed && body.is_some() && markdown::is_markdown(path)).then(|| Parsed::parse(path, text));
@@ -49,8 +63,12 @@ fn analyze_products(path: &str, body: Option<&str>, project: Option<&code::CProj
     if partial_line {
         lf.push(text.len());
     }
+    if score_needed && let Some(doc) = &markdown {
+        score = code::score::markdown(text, doc);
+    }
     Local {
         code,
+        score,
         markdown,
         lf,
         partial_line,
@@ -454,6 +472,7 @@ fn build_with_allowance(
             };
             files.push(Entry {
                 blob: blobs[id],
+                score: locals[id].score.clone(),
                 catalog_row: 0..0,
                 original_stamp: None,
                 observation: Observation {

@@ -82,7 +82,7 @@ const RULES: &[Rule] = &[
     revised(34, CODE),
     rule(35, CODE),
     rule(36, CODE),
-    repaired_profile(37),
+    Rule { revision: 4, from: &[1, 2, 3], ..rule(37, CODE) }, // Leading BOM in PowerShell commands.
     repaired_profile(38),
     repaired_profile(39),
     // Earlier C evidence lacks external-header receipts. Rebuild before decoding.
@@ -93,6 +93,7 @@ const RULES: &[Rule] = &[
     revised(44, CODE),
     revised(45, CODE), // SQL dollar-quoted bodies
     repaired_profile(46), // Additional native language profiles and their evidence.
+    Rule { revision: 5, from: &[1, 2, 3, 4], ..rule(47, bit(FILES)) }, // File-local score semantics.
 ];
 const _: () = assert!(N == 8 && SOURCE == 2);
 
@@ -142,12 +143,16 @@ fn plan(bytes: &[u8], registry: &[Rule]) -> io::Result<Migration> {
     }
     // Protocols 1–3 originally ended at rule 45. The following loop still
     // verifies every historical ID and revision before recognizing this edge.
-    let predates_profiles = count + 1 == registry.len()
-        && registry.last().is_some_and(|rule| rule.id == 46);
-    if count != registry.len() && !predates_profiles {
+    let missing = registry
+        .get(count..)
+        .ok_or_else(|| incompatible("unsupported checkpoint contract set"))?;
+    if !matches!(
+        missing,
+        [] | [Rule { id: 47, .. }] | [Rule { id: 46, .. }, Rule { id: 47, .. }]
+    ) {
         return Err(incompatible("unsupported checkpoint contract set"));
     }
-    let mut rebuild = if predates_profiles { CODE } else { 0 };
+    let mut rebuild = missing.iter().fold(0, |mask, rule| mask | rule.products);
     let mut previous = 0;
     for (raw, rule) in bytes[28..].chunks_exact(4).zip(registry) {
         let id = u16::from_le_bytes([raw[0], raw[1]]);
@@ -266,8 +271,8 @@ mod tests {
     fn snapshots_before_the_new_parsers_require_new_evidence_and_bindings() {
         let mut old = write_contracts();
         let len = old.len();
-        old.truncate(len - 4);
-        old[26..28].copy_from_slice(&((RULES.len() - 1) as u16).to_le_bytes());
+        old.truncate(len - 8);
+        old[26..28].copy_from_slice(&((RULES.len() - 2) as u16).to_le_bytes());
         assert_eq!(check_contracts(&old).unwrap().rebuild, CODE);
         old[28] = 0;
         assert!(check_contracts(&old).is_err());
@@ -275,13 +280,23 @@ mod tests {
 
     #[test]
     fn previous_conformance_rules_invalidate_cached_parser_facts_and_edges() {
-        for id in [8u16, 33, 34, 37, 38, 39, 40, 41, 44, 46] {
+        for id in [8u16, 33, 34, 37, 38, 39, 40, 41, 44, 46, 47] {
             let mut old = write_contracts();
             let row = old[28..].chunks_exact_mut(4)
                 .find(|row| row[..2] == id.to_le_bytes()).unwrap();
             row[2..].copy_from_slice(&1u16.to_le_bytes());
-            let expected = if id == 8 { bit(SYMBOLS) | bit(REL) } else { CODE };
+            let expected = match id { 8 => bit(SYMBOLS) | bit(REL), 47 => bit(FILES), _ => CODE };
             assert_eq!(check_contracts(&old).unwrap().rebuild, expected, "rule {id}");
+        }
+    }
+
+    #[test]
+    fn prior_score_revision_invalidates_file_measurements() {
+        for revision in 1u16..5 {
+            let mut old = write_contracts();
+            let row = old[28..].chunks_exact_mut(4).find(|row| row[..2] == 47u16.to_le_bytes()).unwrap();
+            row[2..].copy_from_slice(&revision.to_le_bytes());
+            assert_eq!(check_contracts(&old).unwrap().rebuild, bit(FILES));
         }
     }
 

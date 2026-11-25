@@ -9,6 +9,7 @@ mod extended;
 mod lexer;
 mod markup;
 mod rust;
+pub(crate) mod score;
 mod script;
 use lexer::{Kind, Token};
 use std::{collections::HashMap, ops::Range, path::Path};
@@ -192,6 +193,40 @@ fn indentation(text: &str, start: usize) -> usize {
         .count()
 }
 
+pub(crate) fn scored(
+    lang: Language,
+    text: &str,
+    path: &str,
+    project: Option<&CProject>,
+) -> (Analysis, score::Saved) {
+    if let Some(result) = extended::scored(lang, text) {
+        return result;
+    }
+    let tokens = lexer::tokens(text, lang);
+    if matches!(lang, Language::Rust | Language::Python | Language::Js) {
+        let pairs = if lang == Language::Rust {
+            rust::matches(&tokens)
+        } else {
+            script::paired_for_score(&tokens)
+        };
+        let facts = if lang == Language::Rust {
+            rust::analyze_paired(&tokens, text.len(), &pairs)
+        } else {
+            script::analyze_paired(lang, text, &tokens, &pairs)
+        };
+        let score = score::with_pairs(lang, text, &tokens, &pairs, &facts);
+        return (facts, score);
+    }
+    let facts = match project {
+        Some(p) if matches!(lang, Language::C | Language::Cpp) => p.analyze(lang, path, text),
+        _ if lang.extended_name().is_some() || matches!(lang, Language::Html | Language::Shell) => {
+            analyze(lang, text)
+        }
+        _ => analyze_tokens(lang, text, &tokens),
+    };
+    let score = score::with_tokens(lang, text, &tokens, &facts);
+    (facts, score)
+}
 pub fn analyze(lang: Language, text: &str) -> Analysis {
     if let Some(facts) = extended::analyze(lang, text) { return facts; }
     if lang == Language::Html {
@@ -200,7 +235,9 @@ pub fn analyze(lang: Language, text: &str) -> Analysis {
     if lang == Language::Shell {
         return direct::analyze_shell(text);
     }
-    let t = lexer::tokens(text, lang);
+    analyze_tokens(lang, text, &lexer::tokens(text, lang))
+}
+fn analyze_tokens(lang:Language,text:&str,t:&[Token])->Analysis {
     if lang == Language::Powershell { return direct::powershell::analyze(text, &t); }
     if lang == Language::Proto {
         return direct::analyze_proto(&t);
