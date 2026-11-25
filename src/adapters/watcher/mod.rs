@@ -307,9 +307,9 @@ fn process(
         match result {
             Ok(mut text) => {
                 if !text.is_empty() && !is_lines {
-                    text.push('\n');
+                    text.push(b'\n');
                 }
-                let _ = wire::reply(&mut socket, 5 + outcome.code, text.as_bytes())
+                let _ = wire::reply(&mut socket, 5 + outcome.code, &text)
                     .and_then(|_| {
                         socket.write_all(&(outcome.diagnostics.len() as u64).to_le_bytes())
                     })

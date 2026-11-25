@@ -5,7 +5,7 @@ use super::{
 };
 use std::{
     collections::VecDeque,
-    fmt::Write,
+    io::Write,
     ops::Range,
     time::{Duration, Instant},
 };
@@ -43,7 +43,7 @@ impl Stats {
             ("matches", self.matches.to_string()),
         ])
     }
-    pub(super) fn summary(&self, start: Instant, out: &mut String) {
+    pub(super) fn summary(&self, start: Instant, out: &mut Vec<u8>) {
         event(
             out,
             "summary",
@@ -54,11 +54,11 @@ impl Stats {
         );
     }
 }
-fn event(out: &mut String, kind: &str, data: String) {
+fn event(out: &mut Vec<u8>, kind: &str, data: String) {
     writeln!(out, "{}", object(&[("type", quote(kind)), ("data", data)])).unwrap();
 }
 fn record(
-    out: &mut String,
+    out: &mut Vec<u8>,
     path: &str,
     body: &str,
     line: usize,
@@ -90,7 +90,7 @@ pub(super) fn search(
     q: &Lines<'_>,
     path: &str,
     source: &str,
-    out: &mut String,
+    out: &mut Vec<u8>,
     total: &mut Stats,
 ) -> bool {
     let start = Instant::now();

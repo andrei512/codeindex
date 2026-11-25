@@ -82,6 +82,13 @@ pub fn run(
             }
         };
         if let super::query::Request::Lines(lines) = &req.request {
+            if let Some(list) = lines.type_listing() {
+                return if out.write_all(list.as_bytes()).and_then(|_| out.flush()).is_ok() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                };
+            }
             use std::os::unix::fs::FileTypeExt;
             let piped = std::fs::metadata("/dev/stdin")
                 .is_ok_and(|m| m.is_file() || m.file_type().is_fifo() || m.file_type().is_socket());
@@ -92,9 +99,9 @@ pub fn run(
                     let _ = writeln!(err, "cx: {e}");
                     return ExitCode::from(2);
                 }
-                let (text, hit) = lines.stream(&String::from_utf8_lossy(&input));
+                let (text, hit) = lines.stream(&input);
                 if out
-                    .write_all(text.as_bytes())
+                    .write_all(&text)
                     .and_then(|_| out.flush())
                     .is_err()
                 {
@@ -119,7 +126,7 @@ pub fn run(
             if answer.is_empty() {
                 return Ok(ExitCode::from(result.code));
             }
-            out.write_all(answer.as_bytes())?;
+            out.write_all(&answer)?;
             if !is_lines {
                 writeln!(out)?;
             }

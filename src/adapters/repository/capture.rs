@@ -182,11 +182,21 @@ impl<'a> CaptureRoot<'a> {
     }
 
     pub fn capture(&self, path: &str, expected: [u64; 7]) -> io::Result<Option<String>> {
+        self.read(path, expected, |file| read_text(file, expected[2]))
+    }
+
+    pub fn bytes(&self, path: &str, expected: [u64; 7]) -> io::Result<Option<Vec<u8>>> {
+        self.read(path, expected, |mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        })
+    }
+
+    fn read<T>(&self, path: &str, expected: [u64; 7], reader: impl FnOnce(&File) -> io::Result<Option<T>>) -> io::Result<Option<T>> {
         let path = checked_path(path)?;
         match open_relative(&self.dir, path) {
-            Ok(file) => stable_read_open(self.root, path, expected, &file, |file| {
-                read_text(file, expected[2])
-            }),
+            Ok(file) => stable_read_open(self.root, path, expected, &file, reader),
             Err(error) => {
                 // Observed symlinks intentionally have path rows but no source.
                 let current = std::fs::symlink_metadata(self.root.join(path))?;

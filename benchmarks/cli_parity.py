@@ -41,9 +41,10 @@ def result(binary, args, root, env, stdin=None, tty=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cx", type=Path)
+    parser.add_argument("--rg", default="rg", help="ripgrep executable used as the oracle")
     args = parser.parse_args()
     cx = str(args.cx.resolve())
-    rg = shutil.which("rg")
+    rg = shutil.which(args.rg)
     if not rg:
         parser.error("install ripgrep for the test oracle")
     with tempfile.TemporaryDirectory() as temp:
@@ -72,10 +73,45 @@ def main():
         cases = [(argv, None, False) for argv in examples]
         cases.extend((argv, None, True) for argv in [["needle", "src"], ["needle", "src/a.txt"]])
         cases.extend((argv, b"no\nneedle\n", False) for argv in [["needle"], ["-n", "needle", "-"]])
+        # Use one matching file per directory query to avoid traversal-order assumptions.
+        comparisons = [(root, *case) for case in cases]
+        plain = Path(temp, "plain")
+        plain.mkdir()
+        for directory in (root, plain):
+            (directory / "filters").mkdir()
+            (directory / "filters/mod.py").write_text("flush\n")
+            (directory / "filters/empty.rs").write_text("other\n")
+            (directory / "blobs").mkdir()
+            (directory / "blobs/blob.bin").write_bytes(b"bad\0\xffsecret_word\n")
+            binary = "blobs/blob.bin"
+            commands = [
+                ["--type-list"], ["--type-add", "custom:*.abc", "--type-list"],
+                ["--type-clear=py", "--type-list"], ["--type-not=rust", "flush", "filters"],
+                ["--type-add", "custom:include:py,rust", "-tcustom", "flush", "filters"],
+                ["-tcustom", "--type-add=custom:*.py", "flush", "filters"],
+                ["--type-clear=py", "-tpy", "flush", "filters"],
+                ["-tpy", "-Tpy", "flush", "filters"], ["-Tpy", "-tpy", "flush", "filters"],
+                ["-n", "flush", "filters", "missing"],
+                ["-n", "flush", "missing", "filters"],
+                ["flush", "missing"], ["flush", "missing", "also-missing"],
+                ["-nt", "py", "flush", "filters"], ["--type=python", "flush", "filters"],
+                ["-trs", "flush", "filters"], ["-tpy", "-trust", "other", "filters"],
+                ["-trs", "-g", "*.py", "flush", "filters"], ["-trs", "flush", "filters/mod.py"], ["-t", "unknown", "flush"],
+                ["--include", "*.py", "flush"], ["secret_word", "blobs"],
+                ["-n", "secret_word", binary], ["-H", "secret_word", binary],
+                ["-l", "secret_word", binary], ["absent", binary],
+                ["-a", "secret_word", binary], ["--text", "secret_word", "blobs"],
+                ["-na", "secret_word", binary], ["-ao", "--column", "secret_word", binary],
+                ["-a", "--color=always", "secret_word", binary], ["-a", "secret_word", "blobs", "missing"],
+            ]
+            comparisons.extend((directory, argv, None, False) for argv in commands)
         failures = 0
-        for argv, data, tty in cases:
-            expected = result(rg, argv, root, env, data, tty)
-            actual = result(cx, argv, root, env, data, tty)
+        for directory, argv, data, tty in comparisons:
+            expected = result(rg, argv, directory, env, data, tty)
+            actual = result(cx, argv, directory, env, data, tty)
+            # Each executable identifies itself in diagnostics.
+            expected = (*expected[:2], b"".join(b"cx: " + line[4:] if line.startswith(b"rg: ") else line
+                                                for line in expected[2].splitlines(keepends=True)))
             if "--json" in argv:
                 def json_events(result):
                     status, stdout, stderr = result
@@ -88,8 +124,8 @@ def main():
                 expected, actual = json_events(expected), json_events(actual)
             if actual != expected:
                 failures += 1
-                print(f"{argv} tty={tty} stdin={data!r}\n  rg {expected!r}\n  cx {actual!r}")
-        print(f"{len(cases) - failures}/{len(cases)} cases matched {subprocess.check_output([rg, '--version'], text=True).splitlines()[0]}")
+                print(f"{directory.name} {argv} tty={tty} stdin={data!r}\n  rg {expected!r}\n  cx {actual!r}")
+        print(f"{len(comparisons) - failures}/{len(comparisons)} cases matched {subprocess.check_output([rg, '--version'], text=True).splitlines()[0]}")
         return bool(failures)
 
 

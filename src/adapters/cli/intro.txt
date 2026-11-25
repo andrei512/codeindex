@@ -1,5 +1,6 @@
 Use cx to search the repository.
 cx -n 'PATTERN' [PATH...]   File text: print lines matching a regex. Add -F for literal text.
+Use -g GLOB or -t TYPE to filter files, -l for paths, -i to ignore case, -C N for context, and -a to search binary data as text.
 cx -k 'KEYWORDS'            BM25 index: rank code and documentation passages by keyword match.
 cx --symbol NAME            Code declaration index: find functions, methods, classes, and types declared with that exact name.
 cx --reference NAME         Code reference index: find source lines where cx resolved a use of the named declaration.

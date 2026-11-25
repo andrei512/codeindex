@@ -1,7 +1,13 @@
-mod plain;
 mod events;
+mod operands;
+mod plain;
+mod types;
 use super::{CONTENT, Pin, Regex, candidates};
-use std::{collections::BTreeSet, fmt::Write, io, path::Path};
+use std::{
+    collections::BTreeSet,
+    io::{self, Write},
+    path::Path,
+};
 use std::{ops::Range, time::Instant};
 
 enum Pattern<'a> {
@@ -26,6 +32,8 @@ pub struct Lines<'a> {
     only: bool,
     json: bool,
     hidden: bool,
+    text: bool,
+    types: types::Types,
     color: Option<bool>,
     terminal_color: bool,
     files: bool,
@@ -43,6 +51,9 @@ impl<'a> Lines<'a> {
         let mut args = input.iter().copied();
         let (mut fixed, mut fold, mut smart, mut flags) = (false, false, false, true);
         let mut patterns = Vec::new();
+        let mut edits = Vec::new();
+        let mut selections = Vec::new();
+        let mut list_types = false;
         while let Some(arg) = args.next() {
             if !flags || !arg.starts_with('-') || arg == "-" {
                 q.paths.push(arg);
@@ -123,11 +134,22 @@ impl<'a> Lines<'a> {
                 "--max-count" => "m",
                 "--regexp" => "e",
                 "--glob" => "g",
-                s if s.starts_with("--") => return Err(format!("unsupported option {s}")),
+                "--type" => "t",
+                "--type-not" => "T",
+                "--type-list" => { list_types = true; continue; }
+                "--type-add" | "--type-clear" => {
+                    let value = inline.or_else(|| args.next()).ok_or_else(|| format!("missing argument for {arg}"))?;
+                    edits.push(if name == "--type-add" { types::Edit::Add(value) } else { types::Edit::Clear(value) });
+                    continue;
+                }
+                "--text" => "a",
+                "--include" => return Err("unrecognized flag --include\n\nsimilar flags that are available: --include-zero".into()),
+                s if s.starts_with("--") => return Err(format!("unrecognized flag {s}")),
                 _ => &arg[1..],
             };
             for (i, opt) in short.char_indices() {
                 match opt {
+                    'a' => q.text = true,
                     'w' => q.word = true,
                     'x' => q.whole = true,
                     'o' => q.only = true,
@@ -149,7 +171,7 @@ impl<'a> Lines<'a> {
                     'l' => q.list = true,
                     'v' => q.invert = true,
                     'q' => q.quiet = true,
-                    'A' | 'B' | 'C' | 'm' | 'e' | 'g' => {
+                    'A' | 'B' | 'C' | 'm' | 'e' | 'g' | 't' | 'T' => {
                         let tail = &short[i + 1..];
                         let v = if !tail.is_empty() {
                             tail
@@ -160,6 +182,8 @@ impl<'a> Lines<'a> {
                         };
                         if opt == 'e' {
                             patterns.push(v);
+                        } else if matches!(opt, 't' | 'T') {
+                            selections.push((opt == 't', v));
                         } else if opt == 'g' {
                             let pat = v.strip_prefix('!').unwrap_or(v);
                             q.globs
@@ -178,9 +202,13 @@ impl<'a> Lines<'a> {
                         }
                         break;
                     }
-                    _ => return Err(format!("unsupported option -{opt}")),
+                    _ => return Err(format!("unrecognized flag -{opt}")),
                 }
             }
+        }
+        q.types = types::Types::build(edits, selections, list_types)?;
+        if list_types {
+            return Ok(q);
         }
         if patterns.is_empty() && !q.files {
             if q.paths.is_empty() {
@@ -251,17 +279,20 @@ impl<'a> Lines<'a> {
         });
         ranges
     }
+    pub fn type_listing(&self) -> Option<&str> {
+        self.types.listing.as_deref()
+    }
     pub fn stdin_only(&self) -> bool {
         self.paths.as_slice() == ["-"] || self.paths.is_empty() && !self.files
     }
     pub fn explicit_stdin(&self) -> bool {
         self.paths.as_slice() == ["-"]
     }
-    pub fn stream(&self, text: &str) -> (String, bool) {
-        let mut out = String::new();
+    pub fn stream(&self, text: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
         let start = Instant::now();
         let mut stats = events::Stats::default();
-        let hit = self.scan("<stdin>", text, false, &mut out, &mut stats);
+        let hit = self.scan_bytes("<stdin>", text, false, &mut out, &mut stats);
         if self.json && !self.quiet {
             stats.summary(start, &mut out);
         }
@@ -270,13 +301,13 @@ impl<'a> Lines<'a> {
     fn scan(
         &self,
         path: &str,
-        text: &str,
+        text: &[u8],
         show_path: bool,
-        out: &mut String,
+        out: &mut Vec<u8>,
         stats: &mut events::Stats,
     ) -> bool {
         if self.json && !self.quiet {
-            return events::search(self, path, text, out, stats);
+            return events::search(self, path, &String::from_utf8_lossy(text), out, stats);
         }
         let color = self.color.unwrap_or(self.terminal_color);
         let paint = |style: &str, value: &str| format!("\x1b[0m{style}{value}\x1b[0m");
@@ -295,7 +326,10 @@ impl<'a> Lines<'a> {
         let mut emitted = 0;
         let mut previous = std::collections::VecDeque::new();
         let start = out.len();
-        for (index, body) in text.split_terminator('\n').enumerate() {
+        for (index, raw) in text.split_inclusive(|&b| b == b'\n').enumerate() {
+            let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+            let decoded = String::from_utf8_lossy(raw);
+            let body = decoded.as_ref();
             let line = index + 1;
             let hay = if self.crlf {
                 body.strip_suffix('\r').unwrap_or(body)
@@ -321,17 +355,17 @@ impl<'a> Lines<'a> {
             if self.count {
                 continue;
             }
-            let mut emit = |n: usize, s: &str, col: Option<usize>| {
+            let mut emit = |n: usize, s: &[u8], col: Option<usize>| {
                 if emitted == 0 && heading {
                     if start > 0 {
-                        out.push('\n');
+                        out.push(b'\n');
                     }
                     writeln!(out, "{path}").unwrap();
                 }
                 if (self.before != 0 || self.after != 0)
                     && (emitted != 0 && n > emitted + 1 || emitted == 0 && start > 0 && !heading)
                 {
-                    out.push_str("--\n");
+                    out.extend_from_slice(b"--\n");
                 }
                 let sep = if col.is_some() { ':' } else { '-' };
                 if show_path && !heading {
@@ -353,43 +387,59 @@ impl<'a> Lines<'a> {
                         write!(out, "{c}:").unwrap();
                     }
                 }
-                writeln!(out, "{s}").unwrap();
+                out.extend_from_slice(s);
+                out.push(b'\n');
                 emitted = n;
             };
             if hit {
                 for (n, s) in previous.drain(..) {
                     emit(n, s, None);
                 }
-                if self.only {
-                    for r in ranges.unwrap().into_iter().filter(|r| !r.is_empty()) {
-                        let value = &body[r.clone()];
-                        if color {
-                            emit(line, &paint("\x1b[1m\x1b[31m", value), Some(r.start + 1));
-                        } else {
-                            emit(line, value, Some(r.start + 1));
-                        }
-                    }
-                } else if let Some(ranges) = ranges {
-                    let mut styled = String::new();
+                // Regex offsets refer to the decoded line. Columns and emitted slices
+                // refer to the original bytes, including malformed UTF-8 under -a.
+                let byte_offset = |offset| match decoded {
+                    std::borrow::Cow::Borrowed(_) => offset,
+                    std::borrow::Cow::Owned(_) => original_offset(raw, offset),
+                };
+                if let Some(ranges) = ranges {
+                    let mut styled = Vec::new();
                     let mut at = 0;
-                    for r in ranges.into_iter().filter(|r| !r.is_empty()) {
-                        styled.push_str(&body[at..r.start]);
-                        styled.push_str(&paint("\x1b[1m\x1b[31m", &body[r.clone()]));
-                        at = r.end;
+                    for range in ranges.into_iter().filter(|r| !r.is_empty()) {
+                        let start = byte_offset(range.start);
+                        let end = byte_offset(range.end);
+                        if color {
+                            if !self.only {
+                                styled.extend_from_slice(&raw[at..start]);
+                            }
+                            styled.extend_from_slice(b"\x1b[0m\x1b[1m\x1b[31m");
+                            styled.extend_from_slice(&raw[start..end]);
+                            styled.extend_from_slice(b"\x1b[0m");
+                        }
+                        if self.only {
+                            emit(
+                                line,
+                                if color { &styled } else { &raw[start..end] },
+                                Some(start + 1),
+                            );
+                            styled.clear();
+                        }
+                        at = end;
                     }
-                    styled.push_str(&body[at..]);
-                    emit(line, &styled, Some(pos.unwrap_or(0) + 1));
+                    if !self.only {
+                        styled.extend_from_slice(&raw[at..]);
+                        emit(line, &styled, Some(byte_offset(pos.unwrap_or(0)) + 1));
+                    }
                 } else {
-                    emit(line, body, Some(pos.unwrap_or(0) + 1));
+                    emit(line, raw, Some(byte_offset(pos.unwrap_or(0)) + 1));
                 }
                 after_end = line.saturating_add(self.after);
             } else if line <= after_end {
-                emit(line, body, None);
+                emit(line, raw, None);
             } else if self.before > 0 {
                 if previous.len() == self.before {
                     previous.pop_front();
                 }
-                previous.push_back((line, body));
+                previous.push_back((line, raw));
             }
             if hits == self.max.unwrap_or(usize::MAX) && line >= after_end {
                 break;
@@ -405,20 +455,19 @@ impl<'a> Lines<'a> {
     }
     fn includes(&self, name: &str) -> bool {
         let basename = name.rsplit('/').next().unwrap_or(name);
-        let mut include = !self.globs.iter().any(|g| g.0);
-        for (value, full, g) in &self.globs {
+        for (value, full, g) in self.globs.iter().rev() {
             if g.is_match(if *full { name } else { basename }) {
-                include = *value;
+                return *value;
             }
         }
-        include
+        !self.globs.iter().any(|g| g.0) && self.types.accepts(basename)
     }
     pub(super) fn run(
         &self,
         pin: &Pin,
         cwd: &Path,
         outcome: &mut super::Outcome,
-    ) -> io::Result<String> {
+    ) -> io::Result<Vec<u8>> {
         let start = Instant::now();
         let mut stats = events::Stats::default();
         let mut ids = BTreeSet::new();
@@ -433,40 +482,59 @@ impl<'a> Lines<'a> {
                 ids.extend(candidates(pin, CONTENT, key)?);
             }
         }
-        let mut out = String::new();
+        if self.text {
+            ids.extend(
+                pin.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.bytes.is_none())
+                    .map(|(id, _)| id),
+            );
+        }
+        let mut out = Vec::new();
         let mut matched = false;
         let paths = if self.paths.is_empty() {
             &["."][..]
         } else {
             self.paths.as_slice()
         };
+        let mut capture = None;
         for operand in paths {
-            let absolute = cwd.join(operand).canonicalize()?;
+            let Some(absolute) = self.operand(cwd, operand, outcome) else {
+                continue;
+            };
             let file = absolute.is_file();
             let show_path = !file || paths.len() > 1;
             let scope = absolute
                 .strip_prefix(&pin.root)
                 .map_err(|_| io::Error::other("path outside repository"))?;
-            if file
-                && pin
+            if file {
+                let entry = pin
                     .files
-                    .binary_search_by(|f| f.path().cmp(scope.to_str().unwrap_or("")))
-                    .is_err()
-            {
+                    .binary_search_by(|f| f.path().cmp(scope.to_str().unwrap_or("")));
                 if self.files {
-                    writeln!(out, "{operand}").unwrap();
+                    writeln!(out, "{operand}")?;
                     matched = true;
-                } else {
-                    let text = std::fs::read(&absolute)?;
-                    if !text.contains(&0) {
+                } else if let Ok(id) = entry
+                    && pin.files[id].bytes.is_some()
+                {
+                    if ids.contains(&id) {
                         matched |= self.scan(
                             operand,
-                            &String::from_utf8_lossy(&text),
+                            pin.source(id)?.as_bytes(),
                             show_path,
                             &mut out,
                             &mut stats,
                         );
                     }
+                } else {
+                    matched |= self.scan_bytes(
+                        operand,
+                        &std::fs::read(&absolute)?,
+                        show_path,
+                        &mut out,
+                        &mut stats,
+                    );
                 }
                 continue;
             }
@@ -475,17 +543,14 @@ impl<'a> Lines<'a> {
                 let Ok(suffix) = Path::new(entry.path()).strip_prefix(scope) else {
                     continue;
                 };
-                if !file
-                    && !self.hidden
+                if !self.hidden
                     && suffix
                         .components()
                         .any(|c| c.as_os_str().as_encoded_bytes().starts_with(b"."))
                 {
                     continue;
                 }
-                let name = if file {
-                    Path::new(operand).to_owned()
-                } else if self.paths.is_empty() {
+                let name = if self.paths.is_empty() {
                     suffix.to_owned()
                 } else {
                     Path::new(operand).join(suffix)
@@ -499,10 +564,26 @@ impl<'a> Lines<'a> {
                     matched = true;
                     continue;
                 }
-                if entry.bytes.is_none() {
-                    continue;
+                if entry.bytes.is_some() {
+                    matched |= self.scan(
+                        &name,
+                        pin.source(id)?.as_bytes(),
+                        show_path,
+                        &mut out,
+                        &mut stats,
+                    );
+                } else if self.text {
+                    if capture.is_none() {
+                        capture = Some(crate::adapters::repository::CaptureRoot::new(&pin.root)?);
+                    }
+                    if let Some(bytes) = capture
+                        .as_ref()
+                        .unwrap()
+                        .bytes(entry.path(), entry.stamp())?
+                    {
+                        matched |= self.scan(&name, &bytes, show_path, &mut out, &mut stats);
+                    }
                 }
-                matched |= self.scan(&name, &pin.source(id)?, show_path, &mut out, &mut stats);
                 if self.quiet && matched {
                     break;
                 }
@@ -511,7 +592,21 @@ impl<'a> Lines<'a> {
         if self.json && !self.files && !self.quiet {
             stats.summary(start, &mut out);
         }
-        outcome.code = u8::from(!matched);
+        self.finish(outcome, matched);
         Ok(out)
     }
+}
+
+fn original_offset(bytes: &[u8], decoded_offset: usize) -> usize {
+    let mut remaining = decoded_offset;
+    let mut original = 0;
+    for chunk in bytes.utf8_chunks() {
+        let valid = chunk.valid().len();
+        if remaining <= valid {
+            return original + remaining;
+        }
+        remaining -= valid + char::REPLACEMENT_CHARACTER.len_utf8();
+        original += valid + chunk.invalid().len();
+    }
+    original
 }

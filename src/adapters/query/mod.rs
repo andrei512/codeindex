@@ -170,7 +170,7 @@ impl<'a> Invocation<'a> {
         })
     }
 }
-pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<String> {
+pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<Vec<u8>> {
     use crate::application::index::build::MemoryQuery;
     let needs = match &invocation.request {
         Request::Score(..) => MemoryQuery::Score,
@@ -189,7 +189,14 @@ pub fn evaluate(
     invocation: Invocation<'_>,
     cwd: &Path,
     outcome: &mut Outcome,
-) -> io::Result<String> {
+) -> io::Result<Vec<u8>> {
+    if let Request::Lines(lines) = invocation.request {
+        return lines.run(pin, cwd, outcome);
+    }
+    evaluate_indexed(pin, invocation, cwd, outcome).map(String::into_bytes)
+}
+
+fn evaluate_indexed(pin: &Pin, invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<String> {
     let Invocation {
         request: req,
         mut mode,
@@ -202,7 +209,7 @@ pub fn evaluate(
     let mut md = None;
     match req {
         Request::Score(path, json) => return score::query(pin, cwd, path, json, outcome),
-        Request::Lines(lines) => return lines.run(pin, cwd, outcome),
+        Request::Lines(_) => unreachable!("line search returns raw bytes"),
         Request::NamedRelationship(op, name) => {
             return relationships::query(
                 pin,
