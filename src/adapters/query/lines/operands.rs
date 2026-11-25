@@ -6,7 +6,66 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(super) fn separator(value: &str) -> Result<Option<u8>, String> {
+    let mut bytes = value.bytes().peekable();
+    let mut decoded = Vec::new();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        let escaped = match bytes.peek() {
+            Some(b'n') => b'\n',
+            Some(b'r') => b'\r',
+            Some(b't') => b'\t',
+            Some(b'0') => 0,
+            Some(b'\\') => b'\\',
+            Some(b'x') => {
+                let mut hex = bytes.clone();
+                hex.next();
+                if let (Some(hi), Some(lo)) = (hex.next(), hex.next())
+                    && let (Some(hi), Some(lo)) =
+                        ((hi as char).to_digit(16), (lo as char).to_digit(16))
+                {
+                    decoded.push((hi * 16 + lo) as u8);
+                    bytes = hex;
+                    continue;
+                }
+                decoded.push(byte);
+                continue;
+            }
+            _ => {
+                decoded.push(byte);
+                continue;
+            }
+        };
+        bytes.next();
+        decoded.push(escaped);
+    }
+    match decoded.as_slice() {
+        [] => Ok(None),
+        [byte] => Ok(Some(*byte)),
+        _ => Err(format!(
+            "error parsing flag --path-separator: A path separator must be exactly one byte, but the given separator is {} bytes: {value}\nIn some shells on Windows '/' is automatically expanded. Use '//' instead.",
+            decoded.len()
+        )),
+    }
+}
+
 impl Lines<'_> {
+    pub(super) fn print_path(&self, out: &mut Vec<u8>, path: &str, suffix: &[u8]) {
+        let start = out.len();
+        out.extend_from_slice(path.as_bytes());
+        if let Some(separator) = self.path_separator.filter(|&c| c != b'/') {
+            for byte in &mut out[start..] {
+                if *byte == b'/' {
+                    *byte = separator;
+                }
+            }
+        }
+        out.extend_from_slice(suffix);
+    }
+
     pub(super) fn operand(&self, cwd: &Path, name: &str, outcome: &mut Outcome) -> Option<PathBuf> {
         match cwd.join(name).canonicalize() {
             Ok(path) => Some(path),
@@ -69,7 +128,7 @@ impl Lines<'_> {
                 });
         if hit {
             if self.filename.unwrap_or(show_path) {
-                write!(out, "{name}: ").unwrap();
+                self.print_path(out, name, b": ");
             }
             writeln!(
                 out,

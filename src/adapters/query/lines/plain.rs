@@ -1,10 +1,6 @@
 use super::{Lines, events};
 use crate::adapters::{query::Outcome, repository};
-use std::{
-    io::{self, Write},
-    path::Path,
-    time::Instant,
-};
+use std::{io, path::Path, time::Instant};
 
 impl Lines<'_> {
     pub(crate) fn plain(&self, cwd: &Path, outcome: &mut Outcome) -> io::Result<Vec<u8>> {
@@ -25,7 +21,7 @@ impl Lines<'_> {
             let show_path = !file || operands.len() > 1;
             if file {
                 if self.files {
-                    writeln!(out, "{operand}")?;
+                    self.print_path(&mut out, &operand, b"\n");
                     matched = true;
                 } else {
                     matched |= self.scan_bytes(
@@ -49,7 +45,7 @@ impl Lines<'_> {
                         continue;
                     }
                     if self.files {
-                        writeln!(out, "{name}")?;
+                        self.print_path(&mut out, &name, b"\n");
                         matched = true;
                     } else if self.text {
                         if let Some(bytes) = capture.bytes(&entry.path, entry.stamp)? {

@@ -23,6 +23,7 @@ pub struct Lines<'a> {
     after: usize,
     numbered: Option<bool>,
     filename: Option<bool>,
+    path_separator: Option<u8>,
     column: bool,
     terminal: bool,
     heading: Option<bool>,
@@ -69,6 +70,11 @@ impl<'a> Lines<'a> {
             let short = match name {
                 "--cx-terminal-color" => {
                     q.terminal_color = true;
+                    continue;
+                }
+                "--path-separator" => {
+                    let value = inline.or_else(|| args.next()).ok_or("missing argument for --path-separator")?;
+                    q.path_separator = operands::separator(value)?;
                     continue;
                 }
                 "--color" => {
@@ -348,7 +354,7 @@ impl<'a> Lines<'a> {
                     return true;
                 }
                 if self.list {
-                    writeln!(out, "{path}").unwrap();
+                    self.print_path(out, path, b"\n");
                     return true;
                 }
             }
@@ -360,7 +366,7 @@ impl<'a> Lines<'a> {
                     if start > 0 {
                         out.push(b'\n');
                     }
-                    writeln!(out, "{path}").unwrap();
+                    self.print_path(out, path, b"\n");
                 }
                 if (self.before != 0 || self.after != 0)
                     && (emitted != 0 && n > emitted + 1 || emitted == 0 && start > 0 && !heading)
@@ -369,7 +375,7 @@ impl<'a> Lines<'a> {
                 }
                 let sep = if col.is_some() { ':' } else { '-' };
                 if show_path && !heading {
-                    write!(out, "{path}{sep}").unwrap();
+                    self.print_path(out, path, &[sep as u8]);
                 }
                 if numbered {
                     if color {
@@ -447,7 +453,7 @@ impl<'a> Lines<'a> {
         }
         if self.count && hits > 0 {
             if show_path {
-                write!(out, "{path}:").unwrap();
+                self.print_path(out, path, b":");
             }
             writeln!(out, "{hits}").unwrap();
         }
@@ -513,7 +519,7 @@ impl<'a> Lines<'a> {
                     .files
                     .binary_search_by(|f| f.path().cmp(scope.to_str().unwrap_or("")));
                 if self.files {
-                    writeln!(out, "{operand}")?;
+                    self.print_path(&mut out, &operand, b"\n");
                     matched = true;
                 } else if let Ok(id) = entry
                     && pin.files[id].bytes.is_some()
@@ -560,7 +566,7 @@ impl<'a> Lines<'a> {
                     continue;
                 }
                 if self.files {
-                    writeln!(out, "{name}").unwrap();
+                    self.print_path(&mut out, &name, b"\n");
                     matched = true;
                     continue;
                 }

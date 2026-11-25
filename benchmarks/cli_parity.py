@@ -85,6 +85,10 @@ def main():
             (directory / "blobs/blob.bin").write_bytes(b"bad\0\xffsecret_word\n")
             binary = "blobs/blob.bin"
             commands = [
+                ["--path-separator", "Z", "-n", "flush", "filters"],
+                ["--path-separator", r"\xFF", "-l", "flush", "filters"],
+                ["--path-separator", "abc", "flush", "filters"],
+                ["--path-separator=", "flush", "filters"],
                 ["--type-list"], ["--type-add", "custom:*.abc", "--type-list"],
                 ["--type-clear=py", "--type-list"], ["--type-not=rust", "flush", "filters"],
                 ["--type-add", "custom:include:py,rust", "-tcustom", "flush", "filters"],
