@@ -1,0 +1,2 @@
+{"language":"cmake","repository":"Cockatrice/Cockatrice","revision":"08d44d2983a1a70302221376808fc8515a507545","path":"tests/CMakeLists.txt","sha256":"ea2cf26bb486f5d7ee32d755a20985accdda64d18b4ab03e212c2126bdb6d4be","split":"test","labels":[],"context":true}
+{"language":"cmake","repository":"madler/zlib","revision":"617e19a81f38c15ff04de9f86882f42ad8a8ffd1","path":"test/CMakeLists.txt","sha256":"3b13e313615b0daf14d92fe8e1a465675a8c3430eb21a4a8e0e2dafe40328e86","split":"test","labels":[],"context":true}

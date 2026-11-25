@@ -2,6 +2,10 @@
 
 The Django findings below were reproduced on SWE-bench Verified case `django__django-15629` at testbed commit `9b70bb1938e97614e57443bbade13b71730f813e` (the public Django base commit for the conformance fixture is `694cf458f16b8d340a3195244196980b2dec34fd`). Correctness fixes have a specific expected result. Quality decisions require agreement on what answer an agent should receive.
 
+## Test classification
+
+All 71 disagreements in the published role benchmark have been reviewed. The classifier recovered 66 against the original labels. The other five have documented Java label corrections. These cases are regression coverage for the supported profiles. Accuracy on unseen repositories requires a fresh evaluation. [Results and reproduction](benchmarks/test_roles/README.md)
+
 ## Repair results
 
 The integrated comparison used release binaries, pinned source revisions and the public CLI. Across 137 cases covering 34 profiles, all 1,960 required fixture checks passed. Of those, 206 were failures on the identical baseline questions. The remaining ten original failures used incorrect Perl expectations. The fixture now asserts both the real call locations and the unresolved assignment variables at all three original positions. All 39 named-reference failures and all 78 required failures across the compiled, script and format sweeps recovered. No previously passing baseline question regressed.

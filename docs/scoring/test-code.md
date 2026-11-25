@@ -3,14 +3,30 @@ page-type: concept
 ---
 # Recognizing test code
 
-A runnable test, a helper used to construct its fixture, and the production function under test have different roles. They can share a file. Establishing those roles is a separate research question from deciding whether repeated setup or a long assertion sequence deserves a warning.
+A file can contain production code, a runnable test, and the helper that constructs its fixture. Use `cx --score --roles FILE` to see which role Codeindex assigns to each part and the evidence for that assignment. A directory argument shows the same breakdown for its text files.
 
-## What cx knows today
+## Reading a result
 
-The scorer applies its language rules to each recognized unit. The numeric evaluation harness also groups paths such as `tests/checkout.py` under a test-path label. Other paths go into a separate bucket. These are evaluation statistics. The index does not currently assign test roles or apply role-specific score penalties. In particular, a Rust module can contain both a public function and its unit tests, and a Python test file can contain a helper with its own substantial control flow.
+For a Rust library with a test module, the output can look like this:
 
-## What the public labels establish
+```text
+src/lib.rs: production (ordinary source path)
+src/lib.rs:3-7: test-support (test-only compilation)
+src/lib.rs:5-6: test (test attribute)
+```
 
-[TestRoutes](https://doi.org/10.5281/zenodo.3741674) identifies selected Java test cases, their helpers and the production methods on their execution routes. It can check method roles, including the difference between setup and the code being tested. Its annotations cover selected routes. Treating every unlisted method as production would create false labels.
+The first line supplies the default. A region overrides it. Here the helper in the module inherits `test-support` and the function with `#[test]` gets `test`. A call from that function into production code leaves the callee's role unchanged. Add `--json` for one-based inclusive line ranges and zero-based byte offsets with an exclusive end. At a byte covered by several regions, use the last matching region. Byte offsets distinguish neighboring declarations on the same line.
 
-[AromaLIA](https://github.com/publiosilva/aroma-lia-evaluation-rp/tree/main/single-language-analysis/dataset-sheets/ground-truth) instead labels ten test patterns. Its five language versions include translations of the same originals. It can check consistency of a finding across languages. Recognizing a pattern does not establish that a developer should refactor it. These datasets support different evaluations. Evidence for recognizing test code across every supported language is still open.
+## What counts as evidence
+
+Every code-language profile and Markdown uses path conventions to identify test trees, fixture files, and ordinary sources. The classifier can return `unknown` for ambiguous example paths and unrecognized file types. An ordinary path is a default inference. It cannot prove that a file ships in a release.
+
+Language rules refine that default where Codeindex recognizes a test declaration, framework registration, or test-only scope. JavaScript can follow a runner through local imports and wrappers. Java and Swift use the class that owns the method to distinguish a discovered test from a helper. C and C++ can use macro definitions and CMake test registrations. Declarative evidence also includes Starlark suite lists, web-platform HTML test registrations, Make test recipes and PostgreSQL regression targets. Assets consumed by tests, such as a CSS file or Dockerfile, can be test support without containing a runnable test. An empty region list means the file default applies throughout the result. Custom runners, generated registrations, and helpers whose only evidence comes from another build target can require project information beyond the signals available to the classifier.
+
+Role queries use the captured source for the current generation. In a plain folder they use an in-memory capture. Classification runs on request. The numeric maintainability score continues to use the same rules for all roles. Deciding which findings are actionable in tests needs its own evaluation.
+
+## How to check it
+
+The role eval compares predictions at labelled source locations against real runner discovery, manually reviewed public repositories, and published Java method labels. It reports each language separately and compares against filename conventions. The original evaluation split by repository. Both published splits now serve as regression cases after their disagreements were inspected. The harness reports original labels and independently reviewed corrections separately. Run `python3 benchmarks/test_roles/eval.py --split dev` from the checkout to reproduce the development comparison. [TestRoutes dataset](https://doi.org/10.5281/zenodo.3741674)
+
+AromaLIA labels ten test patterns across five language versions, including translations of the same originals. Those labels are relevant to a future evaluation of test-specific findings. [AromaLIA data](https://github.com/publiosilva/aroma-lia-evaluation-rp/tree/main/single-language-analysis/dataset-sheets/ground-truth)

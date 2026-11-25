@@ -1,0 +1,73 @@
+{
+  "scope": "All 757 mapped method anchors from the four pinned TestRoutes systems were checked for test- versus production-source-set conflicts. All eight raw cx disagreements were inspected individually. Three anonymous helper methods were classifier errors and retain their labels. Unmapped and unlisted methods are outside this review.",
+  "runner_verification": {
+    "project": "jfree/jfreechart@b3f5f21ba0fe32a8f7eccb6760a79df30628be3e",
+    "engine": "Bundled lib/junit-4.11.jar",
+    "method": "Compiled pinned source and test classes with javac --release 8 -encoding UTF-8 -proc:none, bundled lib/* on classpath, and source:tests on sourcepath. Enumerated each org.junit.runner.Request.aClass(cls).getRunner().getDescription().getChildren() without invoking test methods.",
+    "discovered": {
+      "org.jfree.data.general.DefaultKeyedValuesDatasetTest": [
+        "testCloning"
+      ],
+      "org.jfree.data.general.DefaultKeyedValues2DDatasetTest": [
+        "testCloning"
+      ]
+    }
+  },
+  "adjudications": [
+    {
+      "dataset": "TestRoutes MSR 2020",
+      "id": "GS-000020",
+      "repository": "google/gson",
+      "revision": "e9ead40302b3466f557a82f924907de59462deb9",
+      "path": "gson/src/test/java/com/google/gson/common/MoreAsserts.java",
+      "line": 65,
+      "original_role": "production",
+      "reviewed_role": "test-support",
+      "reason": "The public static assertion helper is shipped in the Gson test source set. Its body verifies equality and hashCode via JUnit assertions; it supplies test assertions to callers."
+    },
+    {
+      "dataset": "TestRoutes MSR 2020",
+      "id": "JF-000146",
+      "repository": "jfree/jfreechart",
+      "revision": "b3f5f21ba0fe32a8f7eccb6760a79df30628be3e",
+      "path": "tests/org/jfree/chart/GanttChartTest.java",
+      "line": 163,
+      "original_role": "production",
+      "reviewed_role": "test-support",
+      "reason": "This private static factory builds the Gantt chart consumed by the test class. It delegates production behavior to ChartFactory.createGanttChart."
+    },
+    {
+      "dataset": "TestRoutes MSR 2020",
+      "id": "JF-000147",
+      "repository": "jfree/jfreechart",
+      "revision": "b3f5f21ba0fe32a8f7eccb6760a79df30628be3e",
+      "path": "tests/org/jfree/chart/GanttChartTest.java",
+      "line": 180,
+      "original_role": "production",
+      "reviewed_role": "test-support",
+      "reason": "This method assembles a fixed sample TaskSeriesCollection for the Gantt chart tests; it is in the test source set."
+    },
+    {
+      "dataset": "TestRoutes MSR 2020",
+      "id": "JF-000165",
+      "repository": "jfree/jfreechart",
+      "revision": "b3f5f21ba0fe32a8f7eccb6760a79df30628be3e",
+      "path": "tests/org/jfree/data/general/DefaultKeyedValues2DDatasetTest.java",
+      "line": 72,
+      "original_role": "test",
+      "reviewed_role": "test-support",
+      "reason": "This method contains a serialization check but the pinned JUnit 4.11 runner discovers only testCloning on this class. It has no @Test annotation, no JUnit 3 TestCase base and no suite registration."
+    },
+    {
+      "dataset": "TestRoutes MSR 2020",
+      "id": "JF-000125",
+      "repository": "jfree/jfreechart",
+      "revision": "b3f5f21ba0fe32a8f7eccb6760a79df30628be3e",
+      "path": "tests/org/jfree/data/general/DefaultKeyedValuesDatasetTest.java",
+      "line": 71,
+      "original_role": "test",
+      "reviewed_role": "test-support",
+      "reason": "This method contains a serialization check but the pinned JUnit 4.11 runner discovers only testCloning on this class. It has no @Test annotation, no JUnit 3 TestCase base and no suite registration."
+    }
+  ]
+}

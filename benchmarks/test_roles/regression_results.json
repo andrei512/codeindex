@@ -1,0 +1,51 @@
+{
+  "dev": {
+    "repositories": 54,
+    "profiles": 35,
+    "locations": 1590,
+    "before": 1583,
+    "original_labels_correct": 1589,
+    "reviewed_labels_correct": 1590,
+    "recovered_original_labels": 6,
+    "new_regressions": 0,
+    "reviewed_label_ids": [
+      "GS-000020"
+    ],
+    "binary_sha256": "83055be31997a9ab98799c469289fd4d83d64dcc2a1bdb197cf86da95a814c26",
+    "manifest_sha256": {
+      "public.jsonl": "cde98fd9a3c56ade305eb9fab2adf5c5376487e5e8123fd6e813757b715ccfe1",
+      "assets.jsonl": "48499d8fa8be766535260ffc5c8b9a8a4696b0585b22d5ef8c3053a44c8c2398",
+      "runner.jsonl": "ddc560f8a6c33fcb80a39cd51efbfa132d75fda162765df2840130208a908666",
+      "asset_context.jsonl": "3954ace90a66db7a0129dbdcf75494c5d0d580580570282f7b3c121ea1b96853",
+      "build_context.jsonl": "89fd5e0a5fd099362cec2feada376b6a4def3000b9380299e9960110b70a4ea9",
+      "class_context.jsonl": "0f73c1af36dd086885771358f7aef13aa568b69f1eeb65d87ed97d62c73a615a",
+      "framework_context.jsonl": "a57b4486806dcd2a9d995872ad903c186cd521a8291bbf9853723c1b734ce729"
+    }
+  },
+  "test": {
+    "repositories": 68,
+    "profiles": 35,
+    "locations": 877,
+    "before": 813,
+    "original_labels_correct": 873,
+    "reviewed_labels_correct": 877,
+    "recovered_original_labels": 60,
+    "new_regressions": 0,
+    "reviewed_label_ids": [
+      "JF-000125",
+      "JF-000146",
+      "JF-000147",
+      "JF-000165"
+    ],
+    "binary_sha256": "83055be31997a9ab98799c469289fd4d83d64dcc2a1bdb197cf86da95a814c26",
+    "manifest_sha256": {
+      "public.jsonl": "cde98fd9a3c56ade305eb9fab2adf5c5376487e5e8123fd6e813757b715ccfe1",
+      "assets.jsonl": "48499d8fa8be766535260ffc5c8b9a8a4696b0585b22d5ef8c3053a44c8c2398",
+      "runner.jsonl": "ddc560f8a6c33fcb80a39cd51efbfa132d75fda162765df2840130208a908666",
+      "asset_context.jsonl": "3954ace90a66db7a0129dbdcf75494c5d0d580580570282f7b3c121ea1b96853",
+      "build_context.jsonl": "89fd5e0a5fd099362cec2feada376b6a4def3000b9380299e9960110b70a4ea9",
+      "class_context.jsonl": "0f73c1af36dd086885771358f7aef13aa568b69f1eeb65d87ed97d62c73a615a",
+      "framework_context.jsonl": "a57b4486806dcd2a9d995872ad903c186cd521a8291bbf9853723c1b734ce729"
+    }
+  }
+}

@@ -572,3 +572,22 @@ fn score_roundtrips_updates_and_matches_plain_folder() {
             .success()
     );
 }
+
+#[test]
+fn roles_follow_edits_and_work_in_plain_folders() {
+    let repo=Repo::new();
+    let args=["--score","--roles","checks.rs","--json"];
+    let run=|cwd:&Path|{let o=repo.invoke(cwd,&args).unwrap(); assert!(o.status.success(),"{:?}",o.stderr); String::from_utf8(o.stdout).unwrap()};
+    let initial="pub fn ordinary() {}\n#[test]\nfn verifies() { assert!(true); }\n";
+    repo.write("checks.rs",initial);
+    let git=run(&repo.root);
+    assert!(git.contains("\"default_role\":\"production\""));
+    assert!(git.contains("\"start_line\":2,\"end_line\":3"));
+    assert!(git.contains("\"role\":\"test\""));
+    let plain=repo.dir.join("plain");
+    fs::create_dir(&plain).unwrap();
+    fs::write(plain.join("checks.rs"),initial).unwrap();
+    assert_eq!(git,run(&plain));
+    repo.write("checks.rs","pub fn verifies() {}\n");
+    assert!(run(&repo.root).contains("\"regions\":[]"));
+}

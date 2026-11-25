@@ -18,6 +18,10 @@ For an offline run or individual errors, use `python3 benchmarks/score.py --data
 
 Counting Python control suites separately from indentation inside expressions, and including short-circuit decisions and comprehension loops, reduced mean absolute error from 0.295 to 0.229 points on the ten-point scale. Of the 5,000 files, 4,169 scored within half a point (previously 4,044) and 1,834 matched within 1e-9 (previously 871). The largest error fell from 2.774 to 2.326 in that iteration. Accounting for Python method receivers and multiline conditions subsequently brought mean absolute error to 0.227 (1,854 exact matches and 4,173 within half a point). The similar-body detector matched 28 of 299 reference high-duplication findings at the expected line. These results measure Python only.
 
+### Test-code identification
+
+Run `python3 benchmarks/test_roles/eval.py` after a release build. This separate eval checks the role at labelled locations in public repositories against a filename-only baseline. [Dataset, splits and reproduction](test_roles/README.md).
+
 ### Multilingual score evaluation
 
 Run `python3 benchmarks/score_eval.py prepare` to download pinned public inputs, verify their checksums and build the local corpus under `target/score-eval/`. Run `python3 benchmarks/score_eval.py coverage` for the frozen split counts and `python3 benchmarks/score_eval.py run --split dev` to evaluate the release binary. The same command accepts `train` and `test`. Reserve the test split for release evaluation. Raw source and generated reports stay local.

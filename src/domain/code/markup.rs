@@ -3,8 +3,29 @@ use super::{Analysis, Call, Declaration, Kind, Language, Token};
 /// Attribute values are source spans. Skip raw-text elements so JavaScript and
 /// CSS string literals that happen to contain an ID do not create HTML symbols.
 pub(super) fn html(text: &str) -> Analysis {
-    let b = text.as_bytes();
     let mut a = Analysis::default();
+    html_parts(text, |part| match part {
+        HtmlPart::Id(span) => a.declarations.push(Declaration {
+            span,
+            kind: "attribute",
+        }),
+        HtmlPart::Inline { body, script } => {
+            embedded(&mut a, &text[body.clone()], body.start, script)
+        }
+        HtmlPart::ScriptSrc(_) => {}
+    });
+    a
+}
+pub(super) enum HtmlPart<'a> {
+    Id(std::ops::Range<usize>),
+    Inline {
+        body: std::ops::Range<usize>,
+        script: bool,
+    },
+    ScriptSrc(&'a str),
+}
+pub(super) fn html_parts<'a>(text: &'a str, mut visit: impl FnMut(HtmlPart<'a>)) {
+    let b = text.as_bytes();
     let mut i = 0;
     while let Some(delta) = b[i..].iter().position(|&x| x == b'<') {
         i += delta + 1;
@@ -24,7 +45,7 @@ pub(super) fn html(text: &str) -> Analysis {
         }
         let tag = &text[start..i];
         let mut mime = "";
-        let mut external = false;
+        let mut external = None;
         while i < b.len() {
             while b.get(i).is_some_and(u8::is_ascii_whitespace) {
                 i += 1;
@@ -49,7 +70,9 @@ pub(super) fn html(text: &str) -> Analysis {
             }
             let name = &b[attr..i];
             let is_id = name.eq_ignore_ascii_case(b"id");
-            external |= name.eq_ignore_ascii_case(b"src");
+            if name.eq_ignore_ascii_case(b"src") {
+                external = Some("");
+            }
             while b.get(i).is_some_and(u8::is_ascii_whitespace) {
                 i += 1;
             }
@@ -73,10 +96,10 @@ pub(super) fn html(text: &str) -> Analysis {
                 mime = &text[val..i];
             }
             if is_id && i > val {
-                a.declarations.push(Declaration {
-                    span: val..i,
-                    kind: "attribute",
-                });
+                visit(HtmlPart::Id(val..i));
+            }
+            if name.eq_ignore_ascii_case(b"src") {
+                external = Some(&text[val..i]);
             }
             i += usize::from(quote.is_some() && i < b.len());
         }
@@ -100,7 +123,6 @@ pub(super) fn html(text: &str) -> Analysis {
                 }
             };
             let script = tag.eq_ignore_ascii_case("script")
-                && !external
                 && [
                     "",
                     "module",
@@ -114,12 +136,16 @@ pub(super) fn html(text: &str) -> Analysis {
                 .any(|v| mime.trim().eq_ignore_ascii_case(v));
             let style = tag.eq_ignore_ascii_case("style")
                 && (mime.trim().is_empty() || mime.trim().eq_ignore_ascii_case("text/css"));
-            if script || style {
-                embedded(&mut a, &text[body_start..body_end], body_start, script);
+            if script && let Some(src) = external {
+                visit(HtmlPart::ScriptSrc(src));
+            } else if script || style {
+                visit(HtmlPart::Inline {
+                    body: body_start..body_end,
+                    script,
+                });
             }
         }
     }
-    a
 }
 
 // Analyze an embedded region against its own source slice and project its

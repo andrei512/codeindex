@@ -10,6 +10,7 @@ mod lexer;
 mod markup;
 mod rust;
 pub(crate) mod score;
+pub(crate) mod roles;
 mod script;
 use lexer::{Kind, Token};
 use std::{collections::HashMap, ops::Range, path::Path};

@@ -1,0 +1,473 @@
+{
+  "dev": {
+    "repositories": 54,
+    "languages": 35,
+    "labels": 1590,
+    "binary_sha256": "b47e0e7a1c42af8142ccef10965ca95b35758514311a220803beb0376ab33ea9",
+    "manifest_sha256": {
+      "public.jsonl": "cde98fd9a3c56ade305eb9fab2adf5c5376487e5e8123fd6e813757b715ccfe1",
+      "assets.jsonl": "48499d8fa8be766535260ffc5c8b9a8a4696b0585b22d5ef8c3053a44c8c2398",
+      "runner.jsonl": "ddc560f8a6c33fcb80a39cd51efbfa132d75fda162765df2840130208a908666"
+    },
+    "testroutes_exclusions": 94,
+    "ambiguous_line_anchors": 57,
+    "language_macro_accuracy": {
+      "cx": 0.97489,
+      "baseline": 0.65889
+    },
+    "cx": {
+      "role_correct": 1583,
+      "test_vs_production_correct": 1589,
+      "abstained": 0,
+      "production_labelled_test": 1,
+      "confusion": {
+        "production": {
+          "production": 254,
+          "test-support": 1
+        },
+        "test": {
+          "test": 1231,
+          "test-support": 6
+        },
+        "test-support": {
+          "test-support": 98
+        }
+      }
+    },
+    "baseline": {
+      "role_correct": 1476,
+      "test_vs_production_correct": 1559,
+      "abstained": 0,
+      "production_labelled_test": 7,
+      "confusion": {
+        "production": {
+          "production": 248,
+          "test": 7
+        },
+        "test": {
+          "production": 9,
+          "test": 1228
+        },
+        "test-support": {
+          "production": 15,
+          "test": 83
+        }
+      }
+    },
+    "profiles": {
+      "assembly": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 4
+      },
+      "batchfile": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 1
+      },
+      "c": {
+        "n": 490,
+        "correct": 490,
+        "path_correct": 486
+      },
+      "cmake": {
+        "n": 8,
+        "correct": 5,
+        "path_correct": 5
+      },
+      "cpp": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 6
+      },
+      "csharp": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 6
+      },
+      "css": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 3
+      },
+      "dart": {
+        "n": 3,
+        "correct": 3,
+        "path_correct": 3
+      },
+      "dockerfile": {
+        "n": 9,
+        "correct": 9,
+        "path_correct": 3
+      },
+      "go": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 6
+      },
+      "hack": {
+        "n": 8,
+        "correct": 8,
+        "path_correct": 5
+      },
+      "hcl": {
+        "n": 8,
+        "correct": 8,
+        "path_correct": 4
+      },
+      "html": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 4
+      },
+      "java": {
+        "n": 258,
+        "correct": 257,
+        "path_correct": 240
+      },
+      "js": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 6
+      },
+      "kotlin": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 6
+      },
+      "lua": {
+        "n": 5,
+        "correct": 5,
+        "path_correct": 4
+      },
+      "makefile": {
+        "n": 5,
+        "correct": 5,
+        "path_correct": 3
+      },
+      "mako": {
+        "n": 8,
+        "correct": 8,
+        "path_correct": 4
+      },
+      "markdown": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 3
+      },
+      "nix": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 3
+      },
+      "objectivec": {
+        "n": 8,
+        "correct": 8,
+        "path_correct": 6
+      },
+      "perl": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 0
+      },
+      "php": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 3
+      },
+      "plpgsql": {
+        "n": 9,
+        "correct": 9,
+        "path_correct": 4
+      },
+      "powershell": {
+        "n": 5,
+        "correct": 5,
+        "path_correct": 5
+      },
+      "procfile": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 2
+      },
+      "proto": {
+        "n": 7,
+        "correct": 7,
+        "path_correct": 3
+      },
+      "python": {
+        "n": 625,
+        "correct": 625,
+        "path_correct": 619
+      },
+      "ruby": {
+        "n": 8,
+        "correct": 8,
+        "path_correct": 6
+      },
+      "rust": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 4
+      },
+      "shell": {
+        "n": 3,
+        "correct": 3,
+        "path_correct": 2
+      },
+      "sql": {
+        "n": 6,
+        "correct": 3,
+        "path_correct": 6
+      },
+      "starlark": {
+        "n": 6,
+        "correct": 6,
+        "path_correct": 5
+      },
+      "swift": {
+        "n": 9,
+        "correct": 9,
+        "path_correct": 6
+      }
+    }
+  },
+  "test": {
+    "repositories": 68,
+    "languages": 35,
+    "labels": 877,
+    "binary_sha256": "b47e0e7a1c42af8142ccef10965ca95b35758514311a220803beb0376ab33ea9",
+    "manifest_sha256": {
+      "public.jsonl": "cde98fd9a3c56ade305eb9fab2adf5c5376487e5e8123fd6e813757b715ccfe1",
+      "assets.jsonl": "48499d8fa8be766535260ffc5c8b9a8a4696b0585b22d5ef8c3053a44c8c2398",
+      "runner.jsonl": "ddc560f8a6c33fcb80a39cd51efbfa132d75fda162765df2840130208a908666"
+    },
+    "testroutes_exclusions": 33,
+    "ambiguous_line_anchors": 67,
+    "language_macro_accuracy": {
+      "cx": 0.84913,
+      "baseline": 0.67067
+    },
+    "cx": {
+      "role_correct": 813,
+      "test_vs_production_correct": 852,
+      "abstained": 8,
+      "production_labelled_test": 7,
+      "confusion": {
+        "production": {
+          "production": 434,
+          "test-support": 7,
+          "unknown": 4
+        },
+        "test": {
+          "production": 2,
+          "test": 187,
+          "test-support": 36
+        },
+        "test-support": {
+          "production": 8,
+          "test": 3,
+          "test-support": 192,
+          "unknown": 4
+        }
+      }
+    },
+    "baseline": {
+      "role_correct": 656,
+      "test_vs_production_correct": 824,
+      "abstained": 0,
+      "production_labelled_test": 7,
+      "confusion": {
+        "production": {
+          "production": 438,
+          "test": 7
+        },
+        "test": {
+          "production": 7,
+          "test": 218
+        },
+        "test-support": {
+          "production": 39,
+          "test": 168
+        }
+      }
+    },
+    "profiles": {
+      "assembly": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 6
+      },
+      "batchfile": {
+        "n": 11,
+        "correct": 9,
+        "path_correct": 5
+      },
+      "c": {
+        "n": 11,
+        "correct": 9,
+        "path_correct": 6
+      },
+      "cmake": {
+        "n": 11,
+        "correct": 6,
+        "path_correct": 10
+      },
+      "cpp": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 9
+      },
+      "csharp": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 9
+      },
+      "css": {
+        "n": 12,
+        "correct": 12,
+        "path_correct": 6
+      },
+      "dart": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 10
+      },
+      "dockerfile": {
+        "n": 10,
+        "correct": 8,
+        "path_correct": 5
+      },
+      "go": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 10
+      },
+      "hack": {
+        "n": 11,
+        "correct": 10,
+        "path_correct": 9
+      },
+      "hcl": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 6
+      },
+      "html": {
+        "n": 12,
+        "correct": 10,
+        "path_correct": 4
+      },
+      "java": {
+        "n": 515,
+        "correct": 508,
+        "path_correct": 416
+      },
+      "js": {
+        "n": 11,
+        "correct": 8,
+        "path_correct": 11
+      },
+      "kotlin": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 5
+      },
+      "lua": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 9
+      },
+      "makefile": {
+        "n": 12,
+        "correct": 11,
+        "path_correct": 6
+      },
+      "mako": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 4
+      },
+      "markdown": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 4
+      },
+      "nix": {
+        "n": 10,
+        "correct": 5,
+        "path_correct": 10
+      },
+      "objectivec": {
+        "n": 11,
+        "correct": 11,
+        "path_correct": 10
+      },
+      "perl": {
+        "n": 11,
+        "correct": 9,
+        "path_correct": 5
+      },
+      "php": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 8
+      },
+      "plpgsql": {
+        "n": 11,
+        "correct": 9,
+        "path_correct": 4
+      },
+      "powershell": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 8
+      },
+      "procfile": {
+        "n": 10,
+        "correct": 6,
+        "path_correct": 4
+      },
+      "proto": {
+        "n": 10,
+        "correct": 7,
+        "path_correct": 5
+      },
+      "python": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 6
+      },
+      "ruby": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 6
+      },
+      "rust": {
+        "n": 10,
+        "correct": 10,
+        "path_correct": 10
+      },
+      "shell": {
+        "n": 10,
+        "correct": 5,
+        "path_correct": 4
+      },
+      "sql": {
+        "n": 14,
+        "correct": 6,
+        "path_correct": 10
+      },
+      "starlark": {
+        "n": 10,
+        "correct": 4,
+        "path_correct": 9
+      },
+      "swift": {
+        "n": 10,
+        "correct": 6,
+        "path_correct": 7
+      }
+    }
+  }
+}

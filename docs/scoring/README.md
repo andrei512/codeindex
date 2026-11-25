@@ -22,4 +22,4 @@ flowchart LR
 ### Understanding a result
 
 - [From a finding to a score](interpretation.md) follows a five-parameter function through collection, aggregation and validation.
-- [Recognizing test code](test-code.md) describes what the current evaluation can distinguish and which published evidence covers mixed roles.
+- [Recognizing test code](test-code.md) explains how to use `cx --score --roles` to distinguish runnable tests, helpers and production code in one file.

@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryQuery {
     Score,
+    Source,
     Paths,
     Content,
     Markdown,
@@ -51,6 +52,7 @@ pub(crate) fn memory_index(
     }
     let mut dir = Directory::default();
     dir.0[SOURCE - 1] = 0..source.len() as u64;
+    if query == MemoryQuery::Source {return Ok((files, dir, source.into_bytes()));}
     let text = |entry: &Entry| {
         entry
             .bytes

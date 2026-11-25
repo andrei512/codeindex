@@ -136,3 +136,89 @@ fn findings(output: &mut String, path: &str, score: &Score) {
         .unwrap();
     }
 }
+
+pub(super) fn roles(
+    pin: &Pin,
+    cwd: &Path,
+    path: Option<&str>,
+    json: bool,
+    outcome: &mut Outcome,
+) -> io::Result<String> {
+    use crate::domain::code::roles::{Context, classify_with, needs_source};
+    let mut context = Context::new(pin.files.iter().map(|f| f.path()));
+    let scope = path
+        .map(|p| relationships::relative(&pin.root, cwd, p))
+        .transpose()?
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut window = pin.source_window();
+    let first = pin.files.partition_point(|f| f.path() < scope.as_str());
+    for (i, f) in pin
+        .files
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take_while(|(_, f)| f.path().starts_with(&scope))
+    {
+        if !Path::new(f.path()).starts_with(&scope) || f.bytes.is_none() {
+            continue;
+        }
+        let text = if needs_source(f.path()) {
+            window.get(i)?
+        } else {
+            ""
+        };
+        let roles = classify_with(f.path(), text, &mut context, |header| {
+            let Some(header) = header.to_str() else {
+                return Ok(None);
+            };
+            match pin.files.binary_search_by(|f| f.path().cmp(header)) {
+                Ok(id) if pin.files[id].bytes.is_some() => pin.source(id).map(Some),
+                _ => Ok(None),
+            }
+        })?;
+        if json {
+            rows.push(object(&[
+                ("path", quote(f.path())),
+                ("default_role", quote(roles.base.0.label())),
+                ("reason", quote(roles.base.1)),
+                (
+                    "regions",
+                    array(roles.regions.iter().map(|r| {
+                        object(&[
+                            ("start_line", r.first.to_string()),
+                            ("end_line", r.last.to_string()),
+                            ("start_byte", r.start.to_string()),
+                            ("end_byte", r.end.to_string()),
+                            ("role", quote(r.evidence.0.label())),
+                            ("reason", quote(r.evidence.1)),
+                        ])
+                    })),
+                ),
+            ]));
+        } else {
+            let mut row = format!("{}: {} ({})", f.path(), roles.base.0.label(), roles.base.1);
+            for r in roles.regions {
+                write!(
+                    row,
+                    "\n{}:{}-{}: {} ({})",
+                    f.path(),
+                    r.first,
+                    r.last,
+                    r.evidence.0.label(),
+                    r.evidence.1
+                )
+                .unwrap();
+            }
+            rows.push(row);
+        }
+    }
+    if rows.is_empty() {
+        outcome.code = 1;
+    }
+    Ok(if json {
+        object(&[("files", array(rows))])
+    } else {
+        rows.join("\n")
+    })
+}
