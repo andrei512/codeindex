@@ -5,41 +5,205 @@ pub(super) struct Members {
     pub initializers: HashMap<usize, (usize, Projection)>,
     pub arguments: HashMap<usize, (usize, Vec<type_hints::Argument>)>,
     pub definitions: Vec<(usize, usize)>, // nominal declaration, member declaration
-    pub simple_impls: HashMap<usize, Option<String>>,
+    simple_impls: HashMap<usize, Option<String>>,
     pub plain_types: HashSet<usize>,
     pub trait_scopes: HashMap<usize, usize>,
-    pub impls: HashMap<usize, (Vec<String>, bool)>, // scope → type path, inherent
+    impls: HashMap<usize, (Vec<String>, bool)>, // scope → type path, inherent
     pub types: HashMap<usize, (usize, Vec<String>)>, // declaration → lexical scope and written type
     pub uses: HashMap<usize, Receiver>,
 }
+#[derive(Clone, Copy)]
+enum ImplIdentity<'a> {
+    SimpleInherent,
+    SimpleTrait(&'a str),
+    Inherent,
+    Trait,
+}
+
+struct ImplHeader<'a> {
+    scope: usize,
+    target: &'a [String],
+    identity: ImplIdentity<'a>,
+}
+
+pub(super) struct SimpleImpl<'a> {
+    pub scope: usize,
+    pub target: &'a str,
+    pub trait_name: Option<&'a str>,
+}
+
+impl<'a> ImplHeader<'a> {
+    fn simple(self) -> Option<SimpleImpl<'a>> {
+        let trait_name = match self.identity {
+            ImplIdentity::SimpleInherent => None,
+            ImplIdentity::SimpleTrait(name) => Some(name),
+            ImplIdentity::Inherent | ImplIdentity::Trait => return None,
+        };
+        Some(SimpleImpl {
+            scope: self.scope,
+            target: self.target.first()?.as_str(),
+            trait_name,
+        })
+    }
+}
+
+// Only these two written forms have a stable simple impl identity.
+fn simple_header<'a>(header: &[Token<'a>]) -> Option<(&'a str, Option<&'a str>)> {
+    let (ty, trait_name) = match header {
+        [ty] => (ty, None),
+        [tr, delimiter, ty] if delimiter.text == "for" && ident(tr.text) => (ty, Some(tr.text)),
+        _ => return None,
+    };
+    ident(ty.text).then(|| (name(ty.text), trait_name))
+}
+
 impl Members {
-    pub fn note_arguments(&mut self, id: usize, scope: usize, t: &[Token], at: usize) {
-        let arguments = type_hints::arguments(t, at);
+    // These columns retain the historical checkpoint representation. Lookup and
+    // identity consume different projections of the same impl header.
+    fn impl_headers(&self) -> impl Iterator<Item = ImplHeader<'_>> {
+        self.impls.iter().map(|(&scope, (target, inherent))| {
+            let identity = match (self.simple_impls.get(&scope), inherent) {
+                (Some(None), true) => ImplIdentity::SimpleInherent,
+                (Some(Some(name)), false) => ImplIdentity::SimpleTrait(name),
+                (_, true) => ImplIdentity::Inherent,
+                (_, false) => ImplIdentity::Trait,
+            };
+            ImplHeader {
+                scope,
+                target,
+                identity,
+            }
+        })
+    }
+
+    pub(super) fn simple_impls(&self) -> impl Iterator<Item = SimpleImpl<'_>> {
+        self.impl_headers().filter_map(ImplHeader::simple)
+    }
+
+    fn trait_bounds(&self, path: &[String], offset: usize) -> Option<&[Vec<String>]> {
+        let [parameter] = path else { return None };
+        let (_, traits) = self
+            .bounds
+            .get(parameter)?
+            .iter()
+            .rev()
+            .find(|(range, _)| range.contains(&offset))?;
+        Some(traits)
+    }
+
+    pub(super) fn record_impl(&mut self, child: usize, t: &[Token], start: usize, end: usize) {
+        let (ty, inherent) = if let Some((ty, spelling)) = simple_header(&t[start..end]) {
+            self.simple_impls.insert(child, spelling.map(str::to_owned));
+            (vec![ty.to_owned()], spelling.is_none())
+        } else {
+            impl_path(t, start, end)
+        };
+        if !ty.is_empty() {
+            self.impls.insert(child, (ty, inherent));
+        }
+    }
+
+    pub fn record_type(&mut self, id: usize, scope: usize, t: &[Token], at: usize) {
+        let ty = self.annotated_path(id, scope, t, at);
+        if !ty.is_empty() {
+            self.types.insert(id, (scope, ty));
+        }
+    }
+
+    pub fn record_self(&mut self, id: usize, scope: usize, t: &[Token], at: usize) {
+        if word(t, at + 1) == ":" {
+            self.annotated_path(id, scope, t, at + 2);
+        }
+        self.types.insert(id, (scope, vec!["Self".into()]));
+    }
+
+    fn annotated_path(&mut self, id: usize, scope: usize, t: &[Token], at: usize) -> Vec<String> {
+        let (written, path) = written_path(t, at);
+        let arguments = type_hints::arguments(t, written, &path);
         if !arguments.is_empty() {
             self.arguments.insert(id, (scope, arguments));
         }
+        path
     }
 }
+enum TypeDependency {
+    Alias(Site),
+    Initializer(Site),
+}
+
+enum WrittenTypes {
+    Known(Vec<Site>),
+    Declared(Vec<Site>),
+}
+
+impl WrittenTypes {
+    // Keep nominal declarations in source order. Return their original allocation
+    // when value inference encounters no aliases.
+    fn project(
+        self,
+        projection: Projection,
+        alias: impl Fn(Site) -> bool,
+        mut resolve: impl FnMut(Site) -> Option<Vec<Site>>,
+    ) -> Option<Vec<Site>> {
+        let declared = match self {
+            Self::Known(sites) => return Some(sites),
+            Self::Declared(sites) => sites,
+        };
+        let aliases = declared.iter().enumerate().filter(|(_, site)| alias(**site));
+        let mut projected = Vec::new();
+        if projection != Projection::Value {
+            for (_, &ty) in aliases {
+                projected.extend(resolve(ty)?);
+            }
+            return Some(projected);
+        }
+        let mut start = 0;
+        for (index, &ty) in aliases {
+            projected.extend_from_slice(&declared[start..index]);
+            projected.extend(resolve(ty)?);
+            start = index + 1;
+        }
+        if start == 0 {
+            return Some(declared);
+        }
+        projected.extend_from_slice(&declared[start..]);
+        Some(projected)
+    }
+}
+
 pub(super) enum Receiver {
     Previous(usize),
     Literal(Vec<String>),
 }
-pub(super) fn path(t: &[Token], mut i: usize) -> Vec<String> {
+pub(super) fn path(t: &[Token], at: usize) -> Vec<String> {
+    written_path(t, at).1
+}
+
+// The argument list begins after the written name, independent of any
+// leading references, lifetime, or trait modifiers.
+fn written_path(t: &[Token], mut i: usize) -> (std::ops::Range<usize>, Vec<String>) {
     while matches!(word(t, i), "&" | "mut" | "ref" | "dyn" | "impl") {
         i += 1;
         if word(t, i) == "'" {
             i += 2;
         }
     }
+    named_path(t, i)
+}
+
+fn named_path(t: &[Token], mut i: usize) -> (std::ops::Range<usize>, Vec<String>) {
+    let start = i;
+    let mut end = start;
     let mut path = Vec::new();
-    while ident(word(t, i)) || matches!(word(t, i), "self" | "super" | "Self" | "crate") {
+    while path_segment(word(t, i)) {
+        end = i + 1;
         path.push(name(word(t, i)).to_owned());
         if word(t, i + 1) != ":" || word(t, i + 2) != ":" {
             break;
         }
         i += 3;
     }
-    path
+    (start..end, path)
 }
 
 pub(super) fn before(t: &[Token], end: usize) -> Vec<String> {
@@ -47,224 +211,68 @@ pub(super) fn before(t: &[Token], end: usize) -> Vec<String> {
         return vec![];
     }
     let mut i = end - 1;
-    while i >= 3 && word(t, i - 1) == ":" && word(t, i - 2) == ":" {
-        i -= 3;
+    while let Some(previous) = preceding_segment(t, i) {
+        i = previous;
     }
     path(t, i)
 }
-pub(super) fn impl_path(t: &[Token], start: usize, end: usize) -> (Vec<String>, bool) {
-    let mut depth = 0usize;
-    let mut after = start;
-    let mut inherent = true;
+fn impl_path(t: &[Token], start: usize, end: usize) -> (Vec<String>, bool) {
+    let mut header = ImplTarget {
+        start,
+        target: start,
+        generics: word(t, start) == "<",
+        angles: 0,
+        inherent: true,
+    };
     for i in start..end {
-        match word(t, i) {
-            "<" => depth += 1,
-            ">" => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 && word(t, start) == "<" && after == start {
-                    after = i + 1;
-                }
+        match (word(t, i), header.angles) {
+            ("<", _) => header.angles += 1,
+            (">", _) => header.close_angles(i),
+            ("for", 0) => {
+                header.target = i + 1;
+                header.inherent = false;
             }
-            "for" if depth == 0 => {
-                after = i + 1;
-                inherent = false;
-            }
-            "where" if depth == 0 => break,
+            ("where", 0) => break,
             _ => {}
         }
     }
-    (path(t, after), inherent)
+    (path(t, header.target), header.inherent)
 }
 
-pub(super) fn fields(
-    a: &mut Analysis,
-    e: &mut Evidence,
-    t: &[Token],
-    pairs: &[usize],
-    excluded: &mut [bool],
-    scope: usize,
-    owner: usize,
-    open: usize,
-    is_enum: bool,
-) {
-    let close = pairs[open];
-    let mut i = open + 1;
-    while i < close && i < t.len() {
-        match word(t, i) {
-            "#" if word(t, i + 1) == "[" && pairs[i + 1] != usize::MAX => {
-                i = pairs[i + 1] + 1;
-                continue;
-            }
-            "pub" => {
-                i += 1;
-                if word(t, i) == "(" && pairs[i] != usize::MAX {
-                    i = pairs[i] + 1;
-                }
-                continue;
-            }
-            _ => {}
-        }
-        if ident(word(t, i)) && (is_enum || word(t, i + 1) == ":") {
-            let id = a.declarations.len();
-            a.declarations.push(Declaration {
-                span: t[i].span.clone(),
-                kind: if is_enum {
-                    "enum_variant"
-                } else {
-                    "field_declaration"
-                },
-            });
-            e.members.definitions.push((owner, id));
-            excluded[i] = true;
-            if !is_enum {
-                e.members.note_arguments(id, scope, t, i + 2);
-                let ty = path(t, i + 2);
-                if !ty.is_empty() {
-                    e.members.types.insert(id, (scope, ty));
-                }
-            }
-            if is_enum && word(t, i + 1) == "{" {
-                fields(a, e, t, pairs, excluded, scope, id, i + 1, false);
-            }
-        }
-        let mut depth = 0usize;
-        while i < close && i < t.len() {
-            if matches!(word(t, i), "(" | "[" | "{") && pairs[i] != usize::MAX {
-                i = pairs[i] + 1;
-                continue;
-            }
-            match word(t, i) {
-                "<" => depth += 1,
-                ">" => depth = depth.saturating_sub(1),
-                "," if depth == 0 => {
-                    i += 1;
-                    break;
-                }
-                _ => {}
-            }
-            i += 1;
+struct ImplTarget {
+    start: usize,
+    target: usize,
+    generics: bool,
+    angles: usize,
+    inherent: bool,
+}
+
+impl ImplTarget {
+    fn close_angles(&mut self, close: usize) {
+        self.angles = self.angles.saturating_sub(1);
+        if (self.angles, self.generics, self.target) == (0, true, self.start) {
+            self.target = close + 1;
         }
     }
 }
 
-#[derive(Default)]
-pub(super) struct Table {
-    inferred: HashMap<(Site, Projection), Vec<Site>>,
-    by_type: HashMap<Site, HashMap<String, Vec<Site>>>,
-    impl_types: HashMap<Address, Site>,
-    trait_overrides: HashMap<Site, HashMap<String, Vec<(Site, Site)>>>,
+mod table;
+pub(super) use table::{Access, Table};
+
+pub(super) struct PathLookup<'a> {
+    pub at: Address,
+    pub offset: usize,
+    pub namespace: Namespace,
+    pub spelling: (&'a str, &'a [String]),
 }
-impl Table {
-    pub fn build(r: &Resolver) -> Self {
-        let mut table = Self::default();
-        for (f, u) in r.units.iter().enumerate() {
-            let Some(e) = &u.analysis.rust else {
-                continue;
-            };
-            for &(owner, member) in &e.members.definitions {
-                table.add(
-                    r,
-                    Site {
-                        file: f,
-                        local: owner,
-                    },
-                    Site {
-                        file: f,
-                        local: member,
-                    },
-                );
-            }
-            for (&scope, &trait_id) in &e.members.trait_scopes {
-                for b in e.scopes[scope].names.values().flatten() {
-                    table.add(
-                        r,
-                        Site {
-                            file: f,
-                            local: trait_id,
-                        },
-                        Site {
-                            file: f,
-                            local: b.decl,
-                        },
-                    );
-                }
-            }
-            for (&scope, (path, inherent)) in &e.members.impls {
-                let origin = (f, e.scopes[scope].parent.unwrap_or(0));
-                let found = r.lookup(
-                    origin,
-                    &path[0],
-                    &path[1..],
-                    usize::MAX,
-                    Namespace::Type,
-                    &mut vec![],
-                );
-                let [ty] = found.as_slice() else {
-                    continue;
-                };
-                table.impl_types.insert((f, scope), *ty);
-                if let Some(Some(trait_name)) = e.members.simple_impls.get(&scope) {
-                    let traits = r.lookup(
-                        origin,
-                        trait_name,
-                        &[],
-                        usize::MAX,
-                        Namespace::Type,
-                        &mut vec![],
-                    );
-                    if let [trait_site] = traits.as_slice()
-                        && r.units[trait_site.file].analysis.declarations[trait_site.local].kind
-                            == "trait_item"
-                        && r.evidence(ty.file).members.plain_types.contains(&ty.local)
-                    {
-                        for (key, bindings) in &e.scopes[scope].names {
-                            for b in bindings {
-                                let decl = &u.analysis.declarations[b.decl];
-                                if decl.kind == "function_item" && r.active(f, decl.span.start) {
-                                    table
-                                        .trait_overrides
-                                        .entry(*ty)
-                                        .or_default()
-                                        .entry(key.clone())
-                                        .or_default()
-                                        .push((
-                                            *trait_site,
-                                            Site {
-                                                file: f,
-                                                local: b.decl,
-                                            },
-                                        ));
-                                }
-                            }
-                        }
-                    }
-                }
-                if *inherent {
-                    for b in e.scopes[scope].names.values().flatten() {
-                        table.add(
-                            r,
-                            *ty,
-                            Site {
-                                file: f,
-                                local: b.decl,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        table
-    }
-    fn add(&mut self, r: &Resolver, ty: Site, member: Site) {
-        let u = &r.units[member.file];
-        let d = &u.analysis.declarations[member.local];
-        self.by_type
-            .entry(ty)
-            .or_default()
-            .entry(name(&u.text[d.span.clone()]).to_owned())
-            .or_default()
-            .push(member);
-    }
+
+#[derive(Clone, Copy)]
+struct TypeLookup {
+    site: Site,
+    projection: Projection,
+}
+
+impl Table<'_> {
     fn self_type(&self, r: &Resolver, mut at: Address) -> Option<Site> {
         loop {
             if let Some(&ty) = self.impl_types.get(&at) {
@@ -273,229 +281,233 @@ impl Table {
             at.1 = r.evidence(at.0).scopes[at.1].parent?;
         }
     }
-    pub fn path(
-        &self,
-        r: &Resolver,
-        at: Address,
-        head: &str,
-        tail: &[String],
-        offset: usize,
-        ns: Namespace,
-    ) -> Vec<Site> {
-        let bare = if head == "Self" {
-            self.self_type(r, at).into_iter().collect()
-        } else {
-            r.lookup(at, head, tail, offset, ns, &mut vec![])
-        };
-        if tail.is_empty() || head != "Self" && !bare.is_empty() {
+    pub fn path(&self, r: &Resolver, lookup: PathLookup<'_>) -> Vec<Site> {
+        let PathLookup {
+            at,
+            offset,
+            namespace,
+            spelling: (head, tail),
+        } = lookup;
+        if head == "Self" {
+            let owners = self.self_type(r, at).into_iter().collect();
+            return self.follow(owners, tail);
+        }
+        let bare = r.lookup(at, (head, tail), offset, namespace);
+        if tail.is_empty() || !bare.is_empty() {
             return bare;
         }
-        // Resolve the longest written module/type prefix with a proven nominal type,
-        // then walk only its declared fields, variants and inherent items.
-        for n in (0..tail.len()).rev() {
-            let mut owners = if head == "Self" {
-                if n > 0 {
-                    continue;
-                }
-                bare.clone()
-            } else {
-                r.lookup(at, head, &tail[..n], offset, Namespace::Type, &mut vec![])
-            };
-            for member in &tail[n..] {
-                owners = owners
-                    .into_iter()
-                    .flat_map(|ty| {
-                        self.by_type
-                            .get(&ty)
-                            .and_then(|m| m.get(member))
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                    })
-                    .collect();
-                if owners.is_empty() {
-                    break;
-                }
-            }
-            if !owners.is_empty() {
-                return owners;
-            }
+        // Try the longest written module/type prefix first, then follow only
+        // declared fields, variants and inherent items.
+        // Every remaining component must occur as a member somewhere before
+        // any owner can match it. Stop before retrying impossible prefixes.
+        for n in (0..tail.len()).rev().take_while(|&n| {
+            self.by_name
+                .get(tail[n].as_str())
+                .is_some_and(|m| m.has_declarations)
+        }) {
+            let owners = r.lookup(at, (head, &tail[..n]), offset, Namespace::Type);
+            let found = self.follow(owners, &tail[n..]);
+            if !found.is_empty() { return found; }
         }
         vec![]
     }
-    fn written(&self, r: &Resolver, site: Site, projection: Projection) -> (Vec<Site>, bool) {
-        let evidence = &r.evidence(site.file).members;
-        let mut types = Vec::new();
-        if let Some((scope, arguments)) = evidence.arguments.get(&site.local) {
-            let at = (site.file, *scope);
-            for arg in arguments {
-                if type_hints::permits(r, at, arg, projection) {
-                    types.extend(self.path(
-                        r,
-                        at,
-                        &arg.inner[0],
-                        &arg.inner[1..],
-                        usize::MAX,
-                        Namespace::Type,
-                    ));
+
+    fn follow(&self, mut owners: Vec<Site>, path: &[String]) -> Vec<Site> {
+        let mut next = Vec::new();
+        for member in path {
+            let members = self.by_name.get(member.as_str());
+            let children =
+                |owner: &Site| members.map_or(&[][..], |candidates| candidates.declared(owner));
+            match owners.as_mut_slice() {
+                [] => break,
+                [owner] => {
+                    let sites = children(owner);
+                    owners.clear();
+                    owners.extend(sites.iter().map(|m| m.site));
+                }
+                many => {
+                    for owner in many {
+                        next.extend(children(owner).iter().map(|m| m.site));
+                    }
+                    std::mem::swap(&mut owners, &mut next);
+                    next.clear();
                 }
             }
         }
-        if types.is_empty()
-            && let Some((scope, path)) = evidence.types.get(&site.local)
-        {
-            let offset = r.units[site.file].analysis.declarations[site.local]
-                .span
-                .start;
-            let bound = (path.len() == 1)
-                .then(|| evidence.bounds.get(&path[0]))
-                .flatten()
-                .and_then(|entries| {
-                    entries
-                        .iter()
-                        .rev()
-                        .find(|(range, _)| range.contains(&offset))
-                });
-            let at = (site.file, *scope);
-            let declared = if let Some((_, traits)) = bound {
-                traits
-                    .iter()
-                    .flat_map(|p| {
-                        r.lookup(at, &p[0], &p[1..], offset, Namespace::Type, &mut vec![])
-                    })
-                    .filter(|t| r.units[t.file].analysis.declarations[t.local].kind == "trait_item")
-                    .collect()
-            } else {
-                self.path(r, at, &path[0], &path[1..], usize::MAX, Namespace::Type)
-            };
-            return (declared, true);
-        }
-        (types, false)
+        owners
     }
 
-    // Initializer rows and alias recursion depend on the ordered inference cache.
-    // Only a terminal declaration can be resolved by a path preparation worker.
-    pub(super) fn terminal(&self, r: &Resolver, site: Site) -> Option<Vec<Site>> {
-        let (mut types, expand) = self.written(r, site, Projection::Value);
-        if expand && types.iter().any(|&ty| ty != site &&
-            r.units[ty.file].analysis.declarations[ty.local].kind == "type_item") {
-            return None;
+    fn follows_alias(r: &Resolver, site: Site, ty: Site) -> bool {
+        ty != site && r.units[ty.file].analysis.declarations[ty.local].kind == "type_item"
+    }
+
+    fn include_struct(r: &Resolver, site: Site, projection: Projection, types: &mut Vec<Site>) {
+        if types.is_empty()
+            && projection == Projection::Value
+            && r.units[site.file].analysis.declarations[site.local].kind == "struct_item"
+        {
+            types.push(site);
         }
-        if types.is_empty() {
-            if r.evidence(site.file).members.initializers.contains_key(&site.local) {
-                return None;
-            }
-            if r.units[site.file].analysis.declarations[site.local].kind == "struct_item" {
-                types.push(site);
+    }
+
+    fn declared_types(&self, r: &Resolver, at: Address, path: &[String]) -> Vec<Site> {
+        self.path(
+            r,
+            PathLookup {
+                at,
+                offset: usize::MAX,
+                namespace: Namespace::Type,
+                spelling: (&path[0], &path[1..]),
+            },
+        )
+    }
+
+    fn written(&self, r: &Resolver, site: Site, projection: Projection) -> WrittenTypes {
+        let evidence = &r.evidence(site.file).members;
+        if let Some((scope, arguments)) = evidence.arguments.get(&site.local)
+            && let Some(path) = type_hints::selected(r, (site.file, *scope), arguments, projection)
+        {
+            let types = self.declared_types(r, (site.file, *scope), path);
+            if !types.is_empty() {
+                return WrittenTypes::Known(types);
             }
         }
+        let Some((scope, path)) = evidence.types.get(&site.local) else {
+            return WrittenTypes::Known(Vec::new());
+        };
+        let offset = r.units[site.file].analysis.declarations[site.local]
+            .span
+            .start;
+        let at = (site.file, *scope);
+        let declared = match evidence.trait_bounds(path, offset) {
+            Some(traits) => traits
+                .iter()
+                .flat_map(|p| r.lookup(at, (&p[0], &p[1..]), offset, Namespace::Type))
+                .filter(|t| r.units[t.file].analysis.declarations[t.local].kind == "trait_item")
+                .collect(),
+            None => self.declared_types(r, at, path),
+        };
+        WrittenTypes::Declared(declared)
+    }
+
+    // The parallel preparer can finish a written type until it encounters an
+    // alias or initializer row. Ordered inference supplies those dependencies.
+    fn resolve_type(
+        r: &Resolver,
+        lookup: TypeLookup,
+        written: WrittenTypes,
+        mut resolve: impl FnMut(TypeDependency, Projection) -> Option<Vec<Site>>,
+    ) -> Option<Vec<Site>> {
+        let TypeLookup { site, projection } = lookup;
+        let mut types = written.project(projection, |ty| Self::follows_alias(r, site, ty), |alias| {
+            resolve(TypeDependency::Alias(alias), projection)
+        })?;
+        if types.is_empty()
+            && let Some(&(local, op)) = r.evidence(site.file).members.initializers.get(&site.local)
+        {
+            let row = Site { file: site.file, local };
+            types = resolve(TypeDependency::Initializer(row), projection.through(op)?)?;
+        }
+        Self::include_struct(r, site, projection, &mut types);
         Some(types)
+    }
+
+    pub(super) fn terminal(&self, r: &Resolver, site: Site) -> Option<Vec<Site>> {
+        let written = self.written(r, site, Projection::Value);
+        Self::resolve_type(
+            r,
+            TypeLookup {
+                site,
+                projection: Projection::Value,
+            },
+            written,
+            |_, _| None,
+        )
     }
     fn inferred(
         &mut self,
         r: &Resolver,
         names: &ForwardNames,
-        site: Site,
-        projection: Projection,
+        lookup: TypeLookup,
         depth: usize,
     ) -> Vec<Site> {
+        let TypeLookup { site, projection } = lookup;
         if depth >= 32 {
             return Vec::new();
         }
         if let Some(types) = self.inferred.get(&(site, projection)) {
             return types.clone();
         }
-        let evidence = &r.evidence(site.file).members;
-        let (mut types, expand) = self.written(r, site, projection);
-        if expand {
-            let declared = std::mem::take(&mut types);
-            for ty in declared {
-                if r.units[ty.file].analysis.declarations[ty.local].kind == "type_item"
-                    && ty != site
-                {
-                    types.extend(self.inferred(r, names, ty, projection, depth + 1));
-                } else if projection == Projection::Value {
-                    types.push(ty);
-                }
+        let written = self.written(r, site, projection);
+        let types = Self::resolve_type(r, lookup, written, |dependency, projection| {
+            match dependency {
+                TypeDependency::Alias(alias) => Some(self.inferred(r, names, TypeLookup { site: alias, projection }, depth + 1)),
+                TypeDependency::Initializer(row) => Some(names.row(row).iter().flat_map(|&source| {
+                    self.inferred(r, names, TypeLookup { site: source, projection }, depth + 1)
+                }).collect()),
             }
-        }
-        if types.is_empty()
-            && let Some(&(local, op)) = evidence.initializers.get(&site.local)
-        {
-            let next = if projection == Projection::Value {
-                op
-            } else if op == Projection::Value {
-                projection
-            } else {
-                return types;
-            };
-            for &s in names.row(Site {
-                    file: site.file,
-                    local,
-                })
-            {
-                types.extend(self.inferred(r, names, s, next, depth + 1));
-            }
-        }
-        let kind = r.units[site.file].analysis.declarations[site.local].kind;
-        if types.is_empty() && projection == Projection::Value && kind == "struct_item" {
-            types.push(site);
-        }
+        });
+        let Some(types) = types else { return Vec::new() };
         self.inferred.insert((site, projection), types.clone());
         types
     }
-    pub fn receiver(
+    // Preparation defers a reference only when its preceding receiver use
+    // requires ordered type inference. Literal receiver types resolve up front.
+    pub(super) fn previous_members(
         &mut self,
         r: &Resolver,
         names: &ForwardNames,
-        at: Address,
-        receiver: &Receiver,
-        key: &str,
-        offset: usize,
+        source: Site,
+        previous: usize,
     ) -> Vec<Site> {
-        let types = match receiver {
-            Receiver::Literal(path) => {
-                self.path(r, at, &path[0], &path[1..], offset, Namespace::Type)
-            }
-            Receiver::Previous(prev) => {
-                let mut types = Vec::new();
-                for site in names.row(Site {
-                        file: at.0,
-                        local: *prev,
-                    })
-                {
-                    types.extend(self.inferred(r, names, *site, Projection::Value, 0));
-                }
-                types
-            }
-        };
-        self.select(r, at, key, offset, &types)
-    }
-    pub(super) fn select(
-        &self, r: &Resolver, at: Address, key: &str, offset: usize, types: &[Site],
-    ) -> Vec<Site> {
-        let mut found = Vec::new();
-        for &ty in types {
-            if let Some(items) = self.by_type.get(&ty).and_then(|m| m.get(key)) {
-                found.extend_from_slice(items);
-                continue;
-            }
-            if let Some(overrides) = self.trait_overrides.get(&ty).and_then(|m| m.get(key)) {
-                for &(trait_site, item) in overrides {
-                    let unit = &r.units[trait_site.file];
-                    let decl = &unit.analysis.declarations[trait_site.local];
-                    let spelling = name(&unit.text[decl.span.clone()]);
-                    if r.lookup(at, spelling, &[], offset, Namespace::Type, &mut vec![])
-                        .as_slice()
-                        == [trait_site]
-                    {
-                        found.push(item);
-                    }
-                }
-            }
+        let mut types = Vec::new();
+        for &site in names.row(Site {
+            file: source.file,
+            local: previous,
+        }) {
+            types.extend(self.inferred(
+                r,
+                names,
+                TypeLookup {
+                    site,
+                    projection: Projection::Value,
+                },
+                0,
+            ));
         }
-        found
+        self.select(
+            r,
+            source,
+            &types,
+            &Receiver::Previous(previous),
+        )
     }
+
+    pub(super) fn select(
+        &self,
+        r: &Resolver,
+        source: Site,
+        types: &[Site],
+        receiver: &Receiver,
+    ) -> Vec<Site> {
+        let u = &r.units[source.file];
+        let evidence = r.evidence(source.file);
+        let lookup = &evidence.uses[source.local];
+        let call = &u.analysis.calls[source.local];
+        let (key, _) = lookup.spelling(&u.text[call.span.clone()]);
+        let at = (source.file, lookup.scope);
+        let offset = call.span.start;
+        let access = Access::for_call(call.is_call && matches!(receiver, Receiver::Previous(_)));
+        let Some(candidates) = self.by_name.get(key) else {
+            return Vec::new();
+        };
+        candidates.select(types, access, |item| trait_visible(r, at, offset, item))
+    }
+}
+
+fn trait_visible(r: &Resolver, at: Address, offset: usize, candidate: &table::Override) -> bool {
+    let sites = r.lookup(at, (candidate.spelling, &[]), offset, Namespace::Type);
+    sites.as_slice() == [candidate.trait_site]
 }
 
 /// The use carrying the written result of an unadorned call or field.
@@ -505,37 +517,108 @@ pub fn operand(t: &[Token], pairs: &[usize], mut i: usize) -> Option<usize> {
     }
     (i < t.len() && (ident(word(t, i)) || word(t, i) == "self")).then_some(i)
 }
-pub fn simple_expression(t: &[Token], pairs: &[usize], mut i: usize, end: usize) -> Option<usize> {
-    while matches!(word(t, i), "&" | "mut") {
-        i += 1;
-    }
-    let mut result = None;
-    while i < end {
-        if !(ident(word(t, i)) || matches!(word(t, i), "Self" | "self" | "crate" | "super")) {
-            return None;
-        }
-        result = Some(i);
-        i += 1;
-        if word(t, i) == "(" {
-            if pairs[i] == usize::MAX {
-                return None;
+/// A grouping parenthesis contributes no type projection when its matching
+/// close bounds exactly this expression. A comma still makes a tuple, and is
+/// rejected by the path reader below.
+pub(super) fn ungroup(
+    t: &[Token],
+    pairs: &[usize],
+    mut rhs: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    while !rhs.is_empty() {
+        match word(t, rhs.start) {
+            "&" | "mut" => rhs.start += 1,
+            "(" if pairs[rhs.start] == rhs.end - 1 => {
+                rhs.start += 1;
+                rhs.end -= 1;
             }
-            i = pairs[i] + 1;
-        }
-        if i == end {
-            break;
-        }
-        if word(t, i) == "." {
-            i += 1;
-        } else if word(t, i) == ":" && word(t, i + 1) == ":" {
-            i += 2;
-        } else {
-            return None;
+            _ => break,
         }
     }
-    result
+    rhs
 }
 
+pub(super) fn literal_type(
+    t: &[Token],
+    pairs: &[usize],
+    rhs: std::ops::Range<usize>,
+) -> Option<Vec<String>> {
+    let close = rhs.end.checked_sub(1)?;
+    if word(t, close) != "}" {
+        return None;
+    }
+    let (written, ty) = named_path(t, rhs.start);
+    (!ty.is_empty() && expression_arguments(t, pairs, written.end) == pairs[close]).then_some(ty)
+}
+
+pub(super) fn terminal_operand(
+    t: &[Token],
+    pairs: &[usize],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let expression = t.get(..end)?;
+    let mut segment = OperandSegment::read(expression, pairs, start)?;
+    while let OperandSuffix::Next(next) = segment.suffix {
+        segment = OperandSegment::read(expression, pairs, next)?;
+    }
+    Some(segment.at)
+}
+
+struct OperandSegment {
+    at: usize,
+    suffix: OperandSuffix,
+}
+
+impl OperandSegment {
+    fn read(expression: &[Token], pairs: &[usize], at: usize) -> Option<Self> {
+        if !path_segment(expression.get(at)?.text) {
+            return None;
+        }
+        let after_args = expression_arguments(expression, pairs, at + 1);
+        let suffix = OperandSuffix::read(expression, pairs, after_args)?;
+        Some(Self { at, suffix })
+    }
+}
+
+enum OperandSuffix {
+    Terminal,
+    Next(usize),
+}
+
+impl OperandSuffix {
+    fn read(expression: &[Token], pairs: &[usize], at: usize) -> Option<Self> {
+        let after_call = if word(expression, at) == "(" {
+            pairs[at].checked_add(1)?
+        } else {
+            at
+        };
+        match expression.get(after_call..)? {
+            [] => Some(Self::Terminal),
+            [dot, ..] if dot.text == "." => Some(Self::Next(after_call + 1)),
+            [left, right, ..] if (left.text, right.text) == (":", ":") => {
+                Some(Self::Next(after_call + 2))
+            }
+            _ => None,
+        }
+    }
+}
+
+pub fn initializer(
+    t: &[Token],
+    pairs: &[usize],
+    rhs: std::ops::Range<usize>,
+    expected: Projection,
+) -> Option<(usize, Projection)> {
+    let (end, suffix) = result_suffix(t, rhs.end);
+    let projection = expected.through(suffix)?;
+    let end = if projection == Projection::Element && iteration(t, end) {
+        end - 4
+    } else {
+        end
+    };
+    Some((terminal_operand(t, pairs, rhs.start, end)?, projection))
+}
 /// Recognize a single element argument of a direct standard collection iterator.
 pub fn closure_element(t: &[Token], pairs: &[usize], bar: usize) -> Option<usize> {
     let call = bar.checked_sub(1 + usize::from(bar > 0 && word(t, bar - 1) == "move"))?;
@@ -557,50 +640,58 @@ pub fn closure_element(t: &[Token], pairs: &[usize], bar: usize) -> Option<usize
                 | "take_while"
                 | "skip_while"
         )
-        || word(t, method - 2) != ")"
-        || word(t, method - 3) != "("
-        || !matches!(word(t, method - 4), "iter" | "iter_mut" | "into_iter")
-        || word(t, method - 5) != "."
+        || !iteration(t, method - 1)
     {
         return None;
     }
     operand(t, pairs, method - 6)
 }
 
-pub fn strip_iteration(t: &[Token], end: usize, projection: Projection) -> usize {
-    if projection == Projection::Element
-        && end >= 4
-        && word(t, end - 4) == "."
-        && matches!(word(t, end - 3), "iter" | "iter_mut" | "into_iter")
-        && word(t, end - 2) == "("
-        && word(t, end - 1) == ")"
-    {
-        end - 4
-    } else {
-        end
+fn nullary_method<'a>(t: &[Token<'a>], end: usize) -> Option<&'a str> {
+    let suffix = t.get(end.checked_sub(4)?..end)?;
+    match suffix {
+        [dot, name, open, close] if (dot.text, open.text, close.text) == (".", "(", ")") => Some(name.text),
+        _ => None,
     }
 }
-pub fn result_suffix(t: &[Token], mut end: usize) -> (usize, Projection) {
+fn iteration(t: &[Token], end: usize) -> bool {
+    matches!(nullary_method(t, end), Some("iter" | "iter_mut" | "into_iter"))
+}
+fn result_suffix(t: &[Token], mut end: usize) -> (usize, Projection) {
     let mut projection = Projection::Value;
     if end > 0 && word(t, end - 1) == "?" {
         projection = Projection::Unwrap;
         end -= 1;
     }
-    if end >= 4
-        && word(t, end - 4) == "."
-        && word(t, end - 3) == "unwrap"
-        && word(t, end - 2) == "("
-        && word(t, end - 1) == ")"
-    {
+    if nullary_method(t, end) == Some("unwrap") {
         projection = Projection::Unwrap;
         end -= 4;
     }
-    if end >= 2 && word(t, end - 2) == "." && word(t, end - 1) == "await" {
-        end -= 2;
-    }
-    (end, projection)
+    (before_await(t, end), projection)
 }
 
-crate::domain::code::cache::record!(Members { bounds, initializers, arguments, definitions, simple_impls, plain_types, trait_scopes, impls, types, uses });
+fn before_await(tokens: &[Token], end: usize) -> usize {
+    let Some(at) = end.checked_sub(2) else { return end };
+    if (word(tokens, at), word(tokens, at + 1)) == (".", "await") {
+        return at;
+    }
+    end
+}
 
-impl crate::domain::code::cache::Wire for Receiver{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Previous(a)=>{ w.push(0); a.save(w);},Self::Literal(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Previous(Wire::load(r)?)),1=>Ok(Self::Literal(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+crate::domain::code::cache::record!(Members {
+    bounds,
+    initializers,
+    arguments,
+    definitions,
+    simple_impls,
+    plain_types,
+    trait_scopes,
+    impls,
+    types,
+    uses
+});
+
+crate::domain::code::cache::tagged!(Receiver {
+    0 => Previous(row),
+    1 => Literal(name),
+});

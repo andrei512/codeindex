@@ -10,31 +10,62 @@ struct Jobs {
     stopped: bool,
 }
 
+struct Queue {
+    jobs: Mutex<Jobs>,
+    wake: Condvar,
+}
+
+impl Queue {
+    fn next(&self) -> Option<Directory> {
+        let state = self.jobs.lock().unwrap();
+        let mut state = self
+            .wake
+            .wait_while(state, |state| {
+                !state.stopped && state.ready.is_empty() && state.active != 0
+            })
+            .unwrap();
+        if state.stopped {
+            return None;
+        }
+        let dir = state.ready.pop()?;
+        state.active += 1;
+        Some(dir)
+    }
+
+    fn finish(&self, result: io::Result<()>, children: &mut Vec<Directory>) -> io::Result<()> {
+        let mut state = self.jobs.lock().unwrap();
+        state.active -= 1;
+        if let Err(error) = result {
+            state.stopped = true;
+            self.wake.notify_all();
+            return Err(error);
+        }
+        let added = !children.is_empty();
+        state.ready.append(children);
+        if added || state.active == 0 {
+            self.wake.notify_all();
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn collect(
     tree: &Tree,
     ready: Vec<Directory>,
     workers: usize,
 ) -> io::Result<Vec<ObservedPath>> {
-    let jobs = Mutex::new(Jobs {
-        ready,
-        active: 0,
-        stopped: false,
-    });
-    let wake = Condvar::new();
+    let queue = Queue {
+        jobs: Mutex::new(Jobs {
+            ready,
+            active: 0,
+            stopped: false,
+        }),
+        wake: Condvar::new(),
+    };
     let run = || -> io::Result<Vec<ObservedPath>> {
         let mut found = Vec::new();
         let mut children = Vec::new();
-        loop {
-            let mut state = jobs.lock().unwrap();
-            while state.ready.is_empty() && state.active != 0 && !state.stopped {
-                state = wake.wait(state).unwrap();
-            }
-            if state.stopped {
-                break;
-            }
-            let Some(dir) = state.ready.pop() else { break };
-            state.active += 1;
-            drop(state);
+        while let Some(dir) = queue.next() {
             let mut walk = Walk {
                 tree,
                 rules: dir.rules,
@@ -48,18 +79,7 @@ pub(super) fn collect(
             }))
             .unwrap_or_else(|_| Err(io::Error::other("directory worker panicked")));
             found = walk.found;
-            let mut state = jobs.lock().unwrap();
-            state.active -= 1;
-            if let Err(e) = result {
-                state.stopped = true;
-                wake.notify_all();
-                return Err(e);
-            }
-            let added = children.len();
-            state.ready.append(&mut children);
-            if added != 0 || state.active == 0 {
-                wake.notify_all();
-            }
+            queue.finish(result, &mut children)?;
         }
         Ok(found)
     };

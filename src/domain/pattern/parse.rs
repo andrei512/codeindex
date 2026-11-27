@@ -1,65 +1,185 @@
-use super::{Assertion, Boundary, Class, Expr, Member};
-use super::{
-    sets::{Op, Set},
-    unicode,
-};
+mod ascii;
+mod classes;
+mod escapes;
+use super::{Anchor, Assertion, Boundary, Class, Expr, Member};
+use super::{sets::Set, unicode};
+
+/// A written capture affects regex validation even when the caller needs no registers.
+enum Group {
+    Scope,
+    Capture(Option<usize>),
+}
+
+impl Group {
+    fn wrap(self, body: Expr, check_newline: bool) -> Expr {
+        match self {
+            Self::Capture(Some(id)) => Expr::Capture(Some(id), Box::new(body)),
+            Self::Capture(None) if check_newline && body.singleton_class().is_some() => {
+                Expr::Capture(None, Box::new(body))
+            }
+            _ => body,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
-struct Flags {
-    fold: bool,
-    multiline: bool,
-    dot_all: bool,
-    ungreedy: bool,
-    unicode: bool,
-    verbose: bool,
-    crlf: bool,
+struct Flags(u8);
+
+#[derive(Clone, Copy)]
+enum Flag {
+    Fold,
+    Multiline,
+    DotAll,
+    Ungreedy,
+    Crlf,
+    Verbose,
+    Unicode,
 }
-struct Parser {
-    chars: Vec<char>,
+
+impl Flag {
+    const SPELLINGS: [(char, Self); 7] = [
+        ('i', Self::Fold),
+        ('m', Self::Multiline),
+        ('s', Self::DotAll),
+        ('U', Self::Ungreedy),
+        ('R', Self::Crlf),
+        ('x', Self::Verbose),
+        ('u', Self::Unicode),
+    ];
+
+    fn read(letter: char) -> Option<Self> {
+        Self::SPELLINGS.iter().find_map(|&(key, flag)| (key == letter).then_some(flag))
+    }
+
+    fn bit(self) -> u8 { 1 << self as u8 }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseFold {
+    Exact,
+    Ascii,
+    Unicode,
+}
+
+impl Flags {
+    fn case_fold(self) -> CaseFold {
+        match (self.has(Flag::Fold), self.has(Flag::Unicode)) {
+            (false, _) => CaseFold::Exact,
+            (true, false) => CaseFold::Ascii,
+            (true, true) => CaseFold::Unicode,
+        }
+    }
+
+    fn has(self, flag: Flag) -> bool {
+        self.0 & flag.bit() != 0
+    }
+
+    fn set(&mut self, flag: Flag, enabled: bool) {
+        self.0 &= !flag.bit();
+        self.0 |= flag.bit() * u8::from(enabled);
+    }
+
+    fn anchor(self, start: bool) -> Assertion {
+        let mode = match (self.has(Flag::Multiline), self.has(Flag::Crlf)) {
+            (false, _) => Anchor::Text,
+            (true, false) => Anchor::Line,
+            (true, true) => Anchor::Crlf,
+        };
+        if start { Assertion::Start(mode) } else { Assertion::End(mode) }
+    }
+
+    fn dot(self) -> Expr {
+        let class = match (self.has(Flag::DotAll), self.has(Flag::Crlf)) {
+            (true, _) => Class::Any,
+            (false, true) => Class::ExceptCrlf,
+            (false, false) => Class::ExceptLf,
+        };
+        Expr::Class(class)
+    }
+}
+
+fn admit_flag(seen: u8, flag: Flag) -> Result<u8> {
+    if seen & flag.bit() != 0 {
+        return Err("duplicate regex flag".into());
+    }
+    Ok(seen | flag.bit())
+}
+
+struct Parser<'a> {
+    source: &'a str,
     cursor: usize,
     flags: Flags,
-    names: std::collections::HashSet<String>,
+    names: std::collections::HashSet<&'a str>,
     captures: Option<Vec<Option<String>>>,
-    byte_input:bool,
+    check_newline: bool,
+    possible_newline: bool,
+    byte_input: Option<&'a mut bool>,
 }
 type Result<T> = std::result::Result<T, String>;
-pub(super) fn parse(pattern: &str, fold: bool) -> Result<Expr> {
-    parse_groups(pattern, fold, false,false).map(|(expr,_)|expr)
-}
-pub(super) fn parse_groups(pattern: &str, fold:bool, save:bool, byte_input:bool) -> Result<(Expr,Vec<Option<String>>)> {
+pub(super) fn parse_groups<'a>(
+    pattern: &'a str,
+    options: &super::CompileOptions,
+    byte_input: Option<&'a mut bool>,
+) -> Result<(Expr, Vec<Option<String>>)> {
     if pattern.len() > 128 * 1024 {
         return Err("pattern too long".into());
     }
+    let mut flags = Flags(Flag::Unicode.bit());
+    flags.set(Flag::Fold, options.fold);
     let mut p = Parser {
-        chars: pattern.chars().collect(),
+        source: pattern,
         cursor: 0,
-        flags: Flags {
-            fold,
-            unicode: true,
-            ..Flags::default()
-        },
+        flags,
         names: Default::default(),
-        captures: save.then(Vec::new),
+        captures: options.capture.then(Vec::new),
+        check_newline: options.exclude_newline,
+        possible_newline: false,
         byte_input,
     };
     let body = p.expression(0)?;
     if p.peek().is_some() {
         return Err("unexpected closing parenthesis".into());
     }
-    Ok((body,p.captures.unwrap_or_default()))
+    if p.rejects_newline(&body) {
+        return Err(super::Regex::LITERAL_NEWLINE_ERROR.into());
+    }
+    Ok((body, p.captures.unwrap_or_default()))
 }
-impl Parser {
+impl<'a> Parser<'a> {
+    fn rejects_newline(&self, body: &Expr) -> bool {
+        let possible = self.check_newline && self.possible_newline;
+        possible && body.line_policy().prohibits_lf()
+    }
+
+    fn require_bytes(&mut self, message: &'static str) -> Result<()> {
+        let detected = self.byte_input.as_deref_mut().ok_or(message)?;
+        *detected = true;
+        Ok(())
+    }
+
+    fn remaining(&self) -> &'a str {
+        &self.source[self.cursor..]
+    }
+
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.cursor).copied()
+        self.remaining().chars().next()
     }
     fn pop(&mut self) -> Result<char> {
         let c = self.peek().ok_or("unexpected end of pattern")?;
-        self.cursor += 1;
+        self.cursor += c.len_utf8();
         Ok(c)
     }
     fn eat(&mut self, c: char) -> bool {
-        if self.peek() == Some(c) {
-            self.cursor += 1;
+        if self.remaining().starts_with(c) {
+            self.cursor += c.len_utf8();
+            true
+        } else {
+            false
+        }
+    }
+    fn eat_prefix(&mut self, prefix: &str) -> bool {
+        if self.remaining().starts_with(prefix) {
+            self.cursor += prefix.len();
             true
         } else {
             false
@@ -69,461 +189,202 @@ impl Parser {
         if self.eat(c) {
             Ok(())
         } else {
-            Err(format!("expected '{c}' at character {}", self.cursor))
+            Err(format!(
+                "expected '{c}' at character {}",
+                self.source[..self.cursor].chars().count()
+            ))
         }
     }
+    fn take_while(&mut self, predicate: impl Fn(char) -> bool) -> &'a str {
+        let rest = self.remaining();
+        let len = rest.find(|c| !predicate(c)).unwrap_or(rest.len());
+        self.cursor += len;
+        &rest[..len]
+    }
+
+    fn braced_value(&mut self) -> Result<&'a str> {
+        let rest = self.remaining();
+        let len = rest.find('}').ok_or("unexpected end of pattern")?;
+        self.cursor += len + 1;
+        Ok(&rest[..len])
+    }
+
     fn spaces(&mut self) {
-        if !self.flags.verbose {
-            return;
-        }
-        loop {
-            while self.peek().is_some_and(char::is_whitespace) {
-                self.cursor += 1
-            }
-            if !self.eat('#') {
-                break;
-            }
-            while self.peek().is_some_and(|c| c != '\n') {
-                self.cursor += 1
+        if self.flags.has(Flag::Verbose) {
+            loop {
+                self.take_while(char::is_whitespace);
+                if !self.eat('#') {
+                    break;
+                }
+                let rest = self.remaining();
+                self.cursor += rest.find('\n').unwrap_or(rest.len());
             }
         }
     }
-    fn capture_name(&mut self) -> Result<String> {
-        let start = self.cursor;
+    fn capture_name(&mut self) -> Result<&'a str> {
         if !self.peek().is_some_and(|c| c == '_' || c.is_alphabetic()) {
             return Err("invalid capture name".into());
         }
-        while self
-            .peek()
-            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'))
-        {
-            self.cursor += 1
-        }
-        let name:String = self.chars[start..self.cursor].iter().collect();
+        let name = self.take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'));
         self.expect('>')?;
-        if !self.names.insert(name.clone()) {
+        if !self.names.insert(name) {
             return Err("duplicate capture name".into());
         }
         Ok(name)
     }
-    fn capture(&mut self,name:Option<String>)->Option<usize>{
-        let names=self.captures.as_mut()?; names.push(name); Some(names.len())
+    fn capture(&mut self, name: Option<&str>) -> Option<usize> {
+        let names = self.captures.as_mut()?;
+        names.push(name.map(str::to_owned));
+        Some(names.len())
     }
     fn expression(&mut self, depth: usize) -> Result<Expr> {
         if depth > 100 {
             return Err("pattern nesting limit exceeded".into());
         }
-        let mut alternatives = vec![];
+        let first = self.sequence(depth)?;
+        if !self.eat('|') {
+            return Ok(first);
+        }
+        let mut alternatives = vec![first];
         loop {
-            let mut sequence = vec![];
-            self.spaces();
-            while !matches!(self.peek(), None | Some(')' | '|')) {
-                let mut atom = self.atom(depth)?;
-                self.spaces();
-                let mut quantifiers = 0;
-                while matches!(self.peek(), Some('*' | '+' | '?' | '{')) {
-                    quantifiers += 1;
-                    if depth + quantifiers > 100 {
-                        return Err("pattern nesting limit exceeded".into());
-                    }
-                    atom = self.quantify(atom)?;
-                    self.spaces();
-                }
-                if !matches!(atom, Expr::Empty) {
-                    sequence.push(atom);
-                }
-            }
-            alternatives.push(match sequence.len() {
-                0 => Expr::Empty,
-                1 => sequence.pop().unwrap(),
-                _ => Expr::Sequence(sequence),
-            });
+            alternatives.push(self.sequence(depth)?);
             if !self.eat('|') {
-                break;
+                return Ok(Expr::Alternatives(alternatives));
             }
         }
-        Ok(if alternatives.len() == 1 {
-            alternatives.pop().unwrap()
-        } else {
-            Expr::Alternatives(alternatives)
-        })
     }
-    fn atom(&mut self, depth: usize) -> Result<Expr> {
-        let c = self.pop()?;
+
+    fn sequence(&mut self, depth: usize) -> Result<Expr> {
+        self.spaces();
+        let Some(first) = self.term(depth)? else { return Ok(Expr::empty()) };
+        let Some(second) = self.term(depth)? else { return Ok(first) };
+        let mut sequence = vec![first, second];
+        while let Some(term) = self.term(depth)? {
+            sequence.push(term);
+        }
+        Ok(Expr::Sequence(sequence))
+    }
+
+    // Scoped flags can produce an empty atom. Consume them here so a
+    // sequence only allocates after recognizing two actual terms.
+    fn term(&mut self, depth: usize) -> Result<Option<Expr>> {
+        while let Some(c) = self.peek().filter(|c| !matches!(c, ')' | '|')) {
+            self.cursor += c.len_utf8();
+            let atom = self.atom(c, depth)?;
+            let atom = self.suffixes(atom, depth)?;
+            if !atom.is_empty() {
+                return Ok(Some(atom));
+            }
+        }
+        Ok(None)
+    }
+    fn suffixes(&mut self, mut atom: Expr, mut depth: usize) -> Result<Expr> {
+        self.spaces();
+        while let Some(operator @ ('*' | '+' | '?' | '{')) = self.peek() {
+            depth += 1;
+            if depth > 100 {
+                return Err("pattern nesting limit exceeded".into());
+            }
+            atom = self.quantify(atom, operator)?;
+            self.spaces();
+        }
+        Ok(atom)
+    }
+
+    fn group(&mut self, depth: usize) -> Result<Expr> {
+        let saved = self.flags;
+        let Some(group) = self.group_header()? else {
+            return Ok(Expr::empty());
+        };
+        let body = self.expression(depth + 1)?;
+        self.expect(')')?;
+        self.flags = saved;
+        Ok(group.wrap(body, self.check_newline))
+    }
+
+    // A flag-only group changes the enclosing scope and consumes its own close.
+    fn group_header(&mut self) -> Result<Option<Group>> {
+        if !self.eat('?') {
+            return Ok(Some(Group::Capture(self.capture(None))));
+        }
+        if self.eat('<') || self.eat_prefix("P<") {
+            let name = self.capture_name()?;
+            return Ok(Some(Group::Capture(self.capture(Some(name)))));
+        }
+        if self.group_flags()? && self.eat(')') {
+            return Ok(None);
+        }
+        if self.eat(':') { Ok(Some(Group::Scope)) }
+        else { Err("unsupported group construct or regex flags".into()) }
+    }
+
+    fn group_flags(&mut self) -> Result<bool> {
+        let mut seen = 0u8;
+        let enabled = self.read_flags(true, &mut seen)?;
+        if !self.eat('-') {
+            return Ok(enabled);
+        }
+        let disabled = self.read_flags(false, &mut seen)?;
+        if self.peek() == Some('-') {
+            return Err("duplicate flag negation".into());
+        }
+        if !disabled {
+            return Err("expected a flag after negation".into());
+        }
+        Ok(true)
+    }
+
+    fn read_flags(&mut self, enabled: bool, seen: &mut u8) -> Result<bool> {
+        let start = self.cursor;
+        while let Some(flag) = self.peek().and_then(Flag::read) {
+            *seen = admit_flag(*seen, flag)?;
+            self.flags.set(flag, enabled);
+            self.cursor += 1;
+        }
+        Ok(self.cursor != start)
+    }
+
+    fn atom(&mut self, c: char, depth: usize) -> Result<Expr> {
+        // Only a written LF, escape, or bracket expression can produce a singleton LF.
+        self.possible_newline |= matches!(c, '\n' | '\\' | '[');
         match c {
-            '(' => {
-                let saved = self.flags;
-                let mut group=None;
-                if self.eat('?') {
-                    if self.eat('<')
-                        || (self.peek() == Some('P')
-                            && self.chars.get(self.cursor + 1) == Some(&'<')
-                            && {
-                                self.cursor += 2;
-                                true
-                            })
-                    {
-                        let name=self.capture_name()?;
-                        group=self.capture(Some(name));
-                        let e = self.expression(depth + 1)?;
-                        self.expect(')')?;
-                        self.flags = saved;
-                        return Ok(if let Some(i)=group {Expr::Capture(i,Box::new(e))} else {e});
-                    }
-                    let mut on = true;
-                    let mut modified = false;
-                    let mut seen = [false; 128];
-                    while let Some(f) = self.peek() {
-                        let slot = match f {
-                            'i' => &mut self.flags.fold,
-                            'm' => &mut self.flags.multiline,
-                            's' => &mut self.flags.dot_all,
-                            'U' => &mut self.flags.ungreedy,
-                            'R' => &mut self.flags.crlf,
-                            'x' => &mut self.flags.verbose,
-                            'u' => &mut self.flags.unicode,
-                            '-' => {
-                                if !on {
-                                    return Err("duplicate flag negation".into());
-                                }
-                                on = false;
-                                self.cursor += 1;
-                                continue;
-                            }
-                            _ => break,
-                        };
-                        if seen[f as usize] {
-                            return Err("duplicate regex flag".into());
-                        }
-                        seen[f as usize] = true;
-                        *slot = on;
-                        modified = true;
-                        self.cursor += 1;
-                    }
-                    if modified && self.eat(')') {
-                        return Ok(Expr::Empty);
-                    }
-                    if !self.eat(':') {
-                        return Err("unsupported group construct or regex flags".into());
-                    }
-                } else {group=self.capture(None);}
-                let e = self.expression(depth + 1)?;
-                self.expect(')')?;
-                self.flags = saved;
-                Ok(if let Some(i)=group {Expr::Capture(i,Box::new(e))} else {e})
-            }
+            '(' => self.group(depth),
             '[' => self.bracket(),
-            '.' if !self.flags.unicode && !self.byte_input => Err("byte-mode dot can match invalid UTF-8".into()),
-            '.' => Ok(Expr::Class(Class {
-                members: if self.flags.dot_all {
-                    vec![]
-                } else if self.flags.crlf {
-                    vec![Member::Range('\r', '\r'), Member::Range('\n', '\n')]
-                } else {
-                    vec![Member::Range('\n', '\n')]
-                }
-                .into(),
-                negated: true,
-                fold: false,
-            })),
-            '^' if self.flags.multiline && self.flags.crlf => {
-                Ok(Expr::Assert(Assertion::StartCrlf))
-            }
-            '$' if self.flags.multiline && self.flags.crlf => Ok(Expr::Assert(Assertion::EndCrlf)),
-            '^' => Ok(Expr::Assert(Assertion::Start(self.flags.multiline))),
-            '$' => Ok(Expr::Assert(Assertion::End(self.flags.multiline))),
-            '\\' => {
-                let c = self.pop()?;
-                if let Some(a) = match c {
-                    'A' => Some(Assertion::Start(false)),
-                    'z' => Some(Assertion::End(false)),
-                    'b' | 'B' | '<' | '>' => {
-                        let mut kind = match c {
-                            '<' => Boundary::Start,
-                            '>' => Boundary::End,
-                            _ => Boundary::Either(c == 'b'),
-                        };
-                        if c == 'b'
-                            && self.peek() == Some('{')
-                            && self
-                                .chars
-                                .get(self.cursor + 1)
-                                .is_some_and(|c| c.is_alphabetic())
-                        {
-                            self.cursor += 1;
-                            let start = self.cursor;
-                            while self.peek() != Some('}') {
-                                self.pop()?;
-                            }
-                            let tag = self.chars[start..self.cursor].iter().collect::<String>();
-                            self.expect('}')?;
-                            kind = match tag.as_str() {
-                                "start" => Boundary::Start,
-                                "end" => Boundary::End,
-                                "start-half" => Boundary::StartHalf,
-                                "end-half" => Boundary::EndHalf,
-                                _ => return Err("unknown word boundary".into()),
-                            }
-                        }
-                        Some(Assertion::Word(kind, !self.flags.unicode))
-                    }
-                    _ => None,
-                } {
-                    return Ok(Expr::Assert(a));
-                }
-                let m = self.escaped(c)?;
-                if !self.flags.unicode {
-                    let set = self.class_set(m);
-                    if !self.byte_input && !set.0.iter().all(|r| r.1 < 128) {
-                        return Err("byte escape can match invalid UTF-8".into());
-                    }
-                    return Ok(self.one(Member::Set(set)));
-                }
-                Ok(self.one(m))
-            }
+            '.' => self.dot(),
+            '^' | '$' => Ok(Expr::Assert(self.flags.anchor(c == '^'))),
+            '\\' => self.escape_atom(),
             '*' | '+' | '?' | '{' => Err("repetition needs an expression".into()),
-            c if !self.flags.unicode && self.flags.fold && c.is_ascii() => {
-                Ok(self.one(Member::Set(self.class_set(Member::Range(c, c)))))
-            }
-            c => Ok(self.one(Member::Range(c, c))),
+            c => Ok(self.literal(c)),
+        }
+    }
+
+    fn dot(&mut self) -> Result<Expr> {
+        if !self.flags.has(Flag::Unicode) {
+            self.require_bytes("byte-mode dot can match invalid UTF-8")?;
+        }
+        Ok(self.flags.dot())
+    }
+
+    fn literal(&self, c: char) -> Expr {
+        let range = Member::Range(c, c);
+        match self.flags.case_fold() {
+            CaseFold::Unicode => Expr::Class(Class::one(range, true)),
+            // A written scalar keeps its UTF-8 encoding beside raw byte escapes.
+            _ if !c.is_ascii() => Expr::Scalar(c),
+            CaseFold::Ascii => Expr::Class(Class::Set(ascii::literal(c))),
+            CaseFold::Exact => Expr::Class(Class::one(range, false)),
         }
     }
     fn one(&self, m: Member) -> Expr {
-        Expr::Class(Class {
-            members: vec![m].into(),
-            negated: false,
-            fold: self.flags.fold && self.flags.unicode,
-        })
-    }
-    fn escaped(&mut self, c: char) -> Result<Member> {
-        let m = match c {
-            'p' | 'P' if !self.flags.unicode => {
-                return Err("Unicode properties require Unicode mode".into());
-            }
-            'p' | 'P' => {
-                let value = if self.eat('{') {
-                    let start = self.cursor;
-                    while self.peek() != Some('}') {
-                        self.pop()?;
-                    }
-                    let s = self.chars[start..self.cursor].iter().collect();
-                    self.expect('}')?;
-                    s
-                } else {
-                    self.pop()?.to_string()
-                };
-                let mut set = unicode::property(&value)
-                    .ok_or_else(|| format!("unknown Unicode property {value}"))?;
-                if self.flags.fold {
-                    set = set.folded()
-                }
-                if c == 'P' {
-                    set = set.complement()
-                }
-                Member::Set(set)
-            }
-            'd' | 'D' => Member::Digit(c == 'd'),
-            's' | 'S' => Member::Space(c == 's'),
-            'w' | 'W' => Member::Word(c == 'w'),
-            _ => {
-                let v = match c {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'a' => '\x07',
-                    'f' => '\x0c',
-                    'v' => '\x0b',
-                    'x' | 'u' | 'U' => {
-                        let mut value = 0u32;
-                        let braced = self.eat('{');
-                        let mut count = 0;
-                        let fixed = match c {
-                            'x' => 2,
-                            'u' => 4,
-                            _ => 8,
-                        };
-                        while (braced && self.peek() != Some('}')) || (!braced && count < fixed) {
-                            let n = self
-                                .pop()?
-                                .to_digit(16)
-                                .ok_or("invalid hexadecimal escape")?;
-                            value = value
-                                .checked_mul(16)
-                                .and_then(|x| x.checked_add(n))
-                                .ok_or("invalid Unicode escape")?;
-                            count += 1;
-                        }
-                        if braced {
-                            self.expect('}')?
-                        }
-                        if count == 0 {
-                            return Err("empty Unicode escape".into());
-                        }
-                        char::from_u32(value).ok_or("invalid Unicode scalar")?
-                    }
-                    c if c.is_ascii_punctuation() || c == ' ' => c,
-                    _ => return Err(format!("unsupported escape \\{c}")),
-                };
-                Member::Range(v, v)
-            }
-        };
-        Ok(m)
-    }
-    fn class_set(&self, m: Member) -> Set {
-        let perl = matches!(&m, Member::Word(_) | Member::Space(_) | Member::Digit(_));
-        let (mut set, positive) = match m {
-            Member::Range(a, b) => (Set::chars(&[(a, b)]), true),
-            Member::Set(s) => return s,
-            Member::Word(p) => (Set::chars(unicode::perl('w')), p),
-            Member::Digit(p) => (Set::chars(unicode::perl('d')), p),
-            Member::Space(p) => (Set::chars(unicode::perl('s')), p),
-        };
-        if !self.flags.unicode {
-            if perl {
-                set = set.combine(&Set::ranges(vec![(0, 127)]), Op::Intersection);
-            }
-            if self.flags.fold {
-                let mut pairs = set.0.to_vec();
-                for c in b'A'..=b'Z' {
-                    let lo = c.to_ascii_lowercase();
-                    if set.contains(char::from(c)) || set.contains(char::from(lo)) {
-                        pairs.extend([(c as u32, c as u32), (lo as u32, lo as u32)])
-                    }
-                }
-                set = Set::ranges(pairs)
-            }
-        } else if self.flags.fold {
-            set = set.folded()
-        }
-        if positive { set } else { set.complement() }
-    }
-    fn class_item(&mut self, depth: usize) -> Result<Member> {
-        let c = self.pop()?;
-        if c == '[' {
-            if self.eat(':') {
-                let neg = self.eat('^');
-                let start = self.cursor;
-                while self.peek().is_some_and(|c| c.is_ascii_lowercase()) {
-                    self.cursor += 1
-                }
-                let key: String = self.chars[start..self.cursor].iter().collect();
-                self.expect(':')?;
-                self.expect(']')?;
-                let mut ranges = vec![];
-                for n in 0u8..128 {
-                    let yes = match key.as_str() {
-                        "alnum" => n.is_ascii_alphanumeric(),
-                        "alpha" => n.is_ascii_alphabetic(),
-                        "ascii" => true,
-                        "blank" => matches!(n, b' ' | b'\t'),
-                        "cntrl" => n.is_ascii_control(),
-                        "digit" => n.is_ascii_digit(),
-                        "graph" => n.is_ascii_graphic(),
-                        "lower" => n.is_ascii_lowercase(),
-                        "print" => n.is_ascii_graphic() || n == b' ',
-                        "punct" => n.is_ascii_punctuation(),
-                        "space" => matches!(n, 9..=13 | 32),
-                        "upper" => n.is_ascii_uppercase(),
-                        "word" => n.is_ascii_alphanumeric() || n == b'_',
-                        "xdigit" => n.is_ascii_hexdigit(),
-                        _ => return Err("invalid POSIX class".into()),
-                    };
-                    if yes {
-                        ranges.push((n as u32, n as u32))
-                    }
-                }
-                let mut set = Set::ranges(ranges);
-                if self.flags.fold {
-                    set = set.folded()
-                }
-                if neg {
-                    set = set.complement()
-                }
-                return Ok(Member::Set(set));
-            }
-            return self.bracket_set(depth + 1).map(Member::Set);
-        }
-        if c == '\\' {
-            let escaped = self.pop()?;
-            self.escaped(escaped)
-        } else {
-            Ok(Member::Range(c, c))
-        }
-    }
-    fn operator(&self) -> Option<Op> {
-        match self.chars.get(self.cursor..self.cursor + 2)? {
-            ['&', '&'] => Some(Op::Intersection),
-            ['-', '-'] => Some(Op::Difference),
-            ['~', '~'] => Some(Op::Xor),
-            _ => None,
-        }
-    }
-    fn bracket_set(&mut self, depth: usize) -> Result<Set> {
-        if depth > 100 {
-            return Err("class nesting limit exceeded".into());
-        }
-        self.spaces();
-        let negated = self.eat('^');
-        let mut pending = None;
-        let mut operation = Op::Union;
-        let mut ranges = vec![];
-        let mut first = true;
-        self.spaces();
-        while self.eat('-') {
-            ranges.push((45, 45));
-            first = false;
-            self.spaces();
-        }
-        loop {
-            self.spaces();
-            if !first && (self.peek() == Some(']') || self.operator().is_some()) {
-                let union = Set::ranges(std::mem::take(&mut ranges));
-                pending = Some(match pending {
-                    None => union,
-                    Some(ref lhs) => Set::combine(lhs, &union, operation),
-                });
-                if self.eat(']') {
-                    break;
-                }
-                operation = self.operator().unwrap();
-                self.cursor += 2;
-                continue;
-            }
-            let mut item = self.class_item(depth)?;
-            self.spaces();
-            if self.peek() == Some('-')
-                && self.operator().is_none()
-                && self.chars.get(self.cursor + 1).is_some_and(|&c| c != ']')
-            {
-                self.cursor += 1;
-                let (Member::Range(a, _), Member::Range(b, _)) = (item, self.class_item(depth)?)
-                else {
-                    return Err("invalid character range".into());
-                };
-                if b < a {
-                    return Err("descending character range".into());
-                }
-                item = Member::Range(a, b);
-            }
-            let set = self.class_set(item);
-            ranges.extend(set.0.iter().copied());
-            first = false;
-        }
-        let result = pending.unwrap();
-        Ok(if negated { result.complement() } else { result })
-    }
-    fn bracket(&mut self) -> Result<Expr> {
-        let set = self.bracket_set(0)?;
-        if !self.byte_input && !self.flags.unicode && set.0.iter().any(|r| r.1 > 127) {
-            return Err("byte class can match invalid UTF-8".into());
-        }
-        Ok(self.one(Member::Set(set)))
+        Expr::Class(Class::one(m, self.flags.case_fold() == CaseFold::Unicode))
     }
     fn number(&mut self) -> Result<usize> {
         let start = self.cursor;
         let mut n = 0usize;
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            n = n * 10 + self.pop()?.to_digit(10).unwrap() as usize;
+        while let Some(byte @ b'0'..=b'9') = self.source.as_bytes().get(self.cursor).copied() {
+            n = n * 10 + usize::from(byte - b'0');
+            self.cursor += 1;
+            self.spaces();
             if n > 65_536 {
                 return Err("repetition limit exceeded".into());
             }
@@ -534,50 +395,52 @@ impl Parser {
             Ok(n)
         }
     }
-    fn quantify(&mut self, body: Expr) -> Result<Expr> {
-        let (min, max) = match self.peek() {
-            Some('*') => {
-                self.cursor += 1;
-                (0, None)
-            }
-            Some('+') => {
-                self.cursor += 1;
-                (1, None)
-            }
-            Some('?') => {
-                self.cursor += 1;
-                (0, Some(1))
-            }
-            Some('{') => {
-                self.cursor += 1;
-                let min = self.number()?;
-                let max = if self.eat(',') {
-                    if self.peek() == Some('}') {
-                        None
-                    } else {
-                        Some(self.number()?)
-                    }
-                } else {
-                    Some(min)
-                };
-                self.expect('}')?;
-                if max.is_some_and(|n| n < min) {
-                    return Err("invalid repetition bounds".into());
-                }
-                (min, max)
-            }
-            _ => return Ok(body),
+    fn bound_separator(&mut self) {
+        self.take_while(char::is_whitespace);
+        self.spaces();
+    }
+
+    fn repetition_bounds(&mut self) -> Result<(usize, Option<usize>)> {
+        self.bound_separator();
+        let min = self.number()?;
+        self.bound_separator();
+        let max = if self.eat(',') { self.upper_bound()? } else { Some(min) };
+        self.bound_separator();
+        self.expect('}')?;
+        if max.is_some_and(|n| n < min) {
+            return Err("invalid repetition bounds".into());
+        }
+        Ok((min, max))
+    }
+
+    fn upper_bound(&mut self) -> Result<Option<usize>> {
+        self.spaces();
+        if self.peek() == Some('}') {
+            return Ok(None);
+        }
+        self.bound_separator();
+        self.number().map(Some)
+    }
+
+    fn quantify(&mut self, body: Expr, operator: char) -> Result<Expr> {
+        self.cursor += 1; // All quantifier operators are one ASCII byte.
+        let (min, max) = match operator {
+            '*' => (0, None),
+            '+' => (1, None),
+            '?' => (0, Some(1)),
+            '{' => self.repetition_bounds()?,
+            _ => unreachable!("quantifier selected by sequence"),
         };
         self.spaces();
-        let greedy = self.eat('?') == self.flags.ungreedy;
-        if max == Some(0) || matches!(body, Expr::Empty) {
-            return Ok(Expr::Empty);
+        let greedy = self.eat('?') == self.flags.has(Flag::Ungreedy);
+        if max == Some(0) || body.is_empty() {
+            return Ok(Expr::empty());
         }
-        Ok(Expr::Repeat {
+        Ok(Expr::Repeat(super::Repetition {
             body: Box::new(body),
             min,
             max,
             greedy,
-        })
+        }))
     }
 }

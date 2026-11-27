@@ -1,7 +1,7 @@
 //! Payload of the checkpoint table. The enclosing snapshot supplies integrity checks.
 //! Dense catalog ordinals address stamp rows. Only fully consumed files have blob rows.
 use crate::adapters::repository::BlobId;
-use std::io::{self, Write};
+use std::io;
 
 const DENSE: &[u8; 8] = b"CIXCHK01";
 const SPARSE: &[u8; 8] = b"CIXCHK02";
@@ -35,101 +35,190 @@ fn count(bytes: &mut &[u8]) -> io::Result<usize> {
     usize::try_from(u64::from_le_bytes(take(bytes, 8)?.try_into().unwrap())).map_err(|_| invalid())
 }
 
+impl Row {
+    fn append_blob(&self, out: &mut Vec<u8>, ordinal: usize, width: usize) -> io::Result<bool> {
+        self.validate_identity(width)?;
+        let Some(blob) = self.blob else {
+            return Ok(false);
+        };
+        if blob.bytes[width..].iter().any(|&b| b != 0) {
+            return Err(invalid());
+        }
+        out.extend_from_slice(&(ordinal as u64).to_le_bytes());
+        out.push(u8::from(self.committed));
+        out.extend_from_slice(blob.as_bytes());
+        Ok(true)
+    }
+    fn validate_identity(&self, width: usize) -> io::Result<()> {
+        let valid = match self.blob {
+            Some(id) => usize::from(id.len) == width,
+            None => !self.committed,
+        };
+        if valid { Ok(()) } else { Err(invalid()) }
+    }
+}
+
+/// Sparse stamps encode only changed fields, in ascending bit order.
+struct StampFields(u8);
+impl StampFields {
+    fn between(stamp: &[u64; 7], base: &[u64; 7]) -> Self {
+        let mut mask = 0;
+        for (i, (value, original)) in stamp.iter().zip(base).enumerate() {
+            mask |= u8::from(value != original) << i;
+        }
+        Self(mask)
+    }
+}
+impl Iterator for StampFields {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let next = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(next)
+    }
+}
+fn stamp_override(out: &mut Vec<u8>, ordinal: usize, stamp: &[u64; 7], original: &[u64; 7]) {
+    let fields = StampFields::between(stamp, original);
+    out.extend_from_slice(&(ordinal as u64).to_le_bytes());
+    out.push(fields.0);
+    for i in fields {
+        out.extend_from_slice(&stamp[i].to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CatalogBlobs {
+    Matching,
+    Mismatch,
+    Missing,
+}
+
+impl CatalogBlobs {
+    fn observe(&mut self, unhashed: bool, catalog: Option<BlobId>, checkpoint: Option<BlobId>) {
+        if unhashed {
+            *self = Self::Missing;
+        } else if matches!(self, Self::Matching) && catalog != checkpoint {
+            *self = Self::Mismatch;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HashFormat {
+    Sha1,
+    Sha256,
+}
+impl HashFormat {
+    fn for_checkpoint(sha256: bool) -> Self {
+        if sha256 { Self::Sha256 } else { Self::Sha1 }
+    }
+    fn read(bytes: &mut &[u8]) -> io::Result<Self> {
+        match take(bytes, 1)?[0] {
+            1 => Ok(Self::Sha1),
+            2 => Ok(Self::Sha256),
+            _ => Err(invalid()),
+        }
+    }
+    fn tag(self) -> u8 {
+        match self {
+            Self::Sha1 => 1,
+            Self::Sha256 => 2,
+        }
+    }
+    fn width(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+}
 impl Checkpoint {
     pub(super) fn encode_catalog(
         &self,
-        w: &mut impl Write,
+        out: &mut Vec<u8>,
         files: &[crate::application::index::Entry],
     ) -> io::Result<()> {
-        let base = files.iter().map(|f| f.catalog_stamp());
-        // A metadata-only migration can keep an old, unhashed catalog alive.
-        if files.iter().any(|f| f.bytes.is_some() && f.blob.is_none()) {
-            return self.encode(w, base);
-        }
-        if self
-            .rows
-            .iter()
-            .zip(files)
-            .any(|(row, file)| row.blob != file.blob)
-        {
-            return Err(invalid());
-        }
-        self.write(w, base, true)
+        self.append(
+            out,
+            files.iter().map(|file| {
+                (
+                    file.catalog_stamp(),
+                    file.blob,
+                    file.bytes.is_some() && file.blob.is_none(),
+                )
+            }),
+        )
     }
 
-    pub fn encode(
+    fn append(
         &self,
-        w: &mut impl Write,
-        base: impl ExactSizeIterator<Item = [u64; 7]>,
-    ) -> io::Result<()> {
-        self.write(w, base, false)
-    }
-    fn write(
-        &self,
-        w: &mut impl Write,
-        base: impl ExactSizeIterator<Item = [u64; 7]>,
-        compact: bool,
+        out: &mut Vec<u8>,
+        base: impl ExactSizeIterator<Item = ([u64; 7], Option<BlobId>, bool)>,
     ) -> io::Result<()> {
         if base.len() != self.rows.len() {
             return Err(invalid());
         }
-        let width = if self.sha256 { 32 } else { 20 };
-        w.write_all(if compact { CATALOG } else { SPARSE })?;
-        w.write_all(&[if self.sha256 { 2 } else { 1 }])?;
-        w.write_all(&(self.rows.len() as u64).to_le_bytes())?;
+        let header = out.len();
+        out.extend_from_slice(CATALOG);
+        let hash = HashFormat::for_checkpoint(self.sha256);
+        out.push(hash.tag());
+        out.extend_from_slice(&(self.rows.len() as u64).to_le_bytes());
         let mut overrides = 0u64;
-        for (ordinal, (row, original)) in self.rows.iter().zip(base).enumerate() {
-            if row.stamp == original {
-                continue;
+        let mut catalog_blobs = CatalogBlobs::Matching;
+        for (ordinal, (row, (stamp, blob, unhashed))) in self.rows.iter().zip(base).enumerate() {
+            catalog_blobs.observe(unhashed, blob, row.blob);
+            if row.stamp != stamp {
+                stamp_override(out, ordinal, &row.stamp, &stamp);
+                overrides += 1;
             }
-            let mut mask = 0u8;
-            for i in 0..7 {
-                if row.stamp[i] != original[i] {
-                    mask |= 1 << i;
-                }
-            }
-            w.write_all(&(ordinal as u64).to_le_bytes())?;
-            w.write_all(&[mask])?;
-            for (i, field) in row.stamp.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    w.write_all(&field.to_le_bytes())?;
-                }
-            }
-            overrides += 1;
         }
-        if compact {
-            for group in self.rows.chunks(8) {
-                let mut flags = 0u8;
-                for (bit, row) in group.iter().enumerate() {
-                    if row.blob.is_some_and(|id| id.len as usize != width)
-                        || row.committed && row.blob.is_none()
-                    {
-                        return Err(invalid());
-                    }
-                    flags |= u8::from(row.committed) << bit;
-                }
-                w.write_all(&[flags])?;
+        let width = hash.width();
+        // Old catalogs can lack hashes. Their checkpoint owns all blob identities.
+        match catalog_blobs {
+            CatalogBlobs::Missing => {
+                out[header..header + SPARSE.len()].copy_from_slice(SPARSE);
+                let blobs = self.append_blobs(out, width)?;
+                out.extend_from_slice(&overrides.to_le_bytes());
+                out.extend_from_slice(&blobs.to_le_bytes());
             }
-            return w.write_all(&overrides.to_le_bytes());
+            CatalogBlobs::Mismatch => return Err(invalid()),
+            CatalogBlobs::Matching => {
+                self.append_flags(out, width)?;
+                out.extend_from_slice(&overrides.to_le_bytes());
+            }
         }
-        let mut blobs = 0u64;
+        Ok(())
+    }
+
+    fn append_flags(&self, out: &mut Vec<u8>, width: usize) -> io::Result<()> {
+        for group in self.rows.chunks(8) {
+            let mut flags = 0u8;
+            for (bit, row) in group.iter().enumerate() {
+                row.validate_identity(width)?;
+                flags |= u8::from(row.committed) << bit;
+            }
+            out.push(flags);
+        }
+        Ok(())
+    }
+
+    fn append_blobs(&self, out: &mut Vec<u8>, width: usize) -> io::Result<u64> {
+        let mut blobs = 0;
         for (ordinal, row) in self.rows.iter().enumerate() {
-            let Some(blob) = row.blob else {
-                if row.committed {
-                    return Err(invalid());
-                }
-                continue;
-            };
-            if usize::from(blob.len) != width || blob.bytes[width..].iter().any(|&b| b != 0) {
-                return Err(invalid());
-            }
-            w.write_all(&(ordinal as u64).to_le_bytes())?;
-            w.write_all(&[u8::from(row.committed)])?;
-            w.write_all(blob.as_bytes())?;
-            blobs += 1;
+            blobs += u64::from(row.append_blob(out, ordinal, width)?);
         }
-        w.write_all(&overrides.to_le_bytes())?;
-        w.write_all(&blobs.to_le_bytes())
+        Ok(blobs)
+    }
+    #[cfg(test)]
+    fn encode(
+        &self,
+        out: &mut Vec<u8>,
+        base: impl ExactSizeIterator<Item = [u64; 7]>,
+    ) -> io::Result<()> {
+        self.append(out, base.map(|stamp| (stamp, None, true)))
     }
 
     #[cfg(test)]
@@ -140,120 +229,167 @@ impl Checkpoint {
         mut bytes: &[u8],
         base: impl ExactSizeIterator<Item = ([u64; 7], Option<BlobId>)>,
     ) -> io::Result<Self> {
-        let compact = bytes.starts_with(CATALOG);
-        let sparse = match take(&mut bytes, 8)? {
-            magic if magic == SPARSE || magic == CATALOG => true,
-            magic if magic == DENSE => false,
-            _ => return Err(invalid()),
-        };
-        let sha256 = match take(&mut bytes, 1)?[0] {
-            1 => false,
-            2 => true,
-            _ => return Err(invalid()),
-        };
-        let width = if sha256 { 32 } else { 20 };
+        let format = take(&mut bytes, 8)?;
+        let hash = HashFormat::read(&mut bytes)?;
+        let width = hash.width();
         let n = count(&mut bytes)?;
         if n != base.len() {
             return Err(invalid());
         }
-        let trailer_len = if sparse && !compact { 16 } else { 8 };
-        let (data, mut trailer) = bytes
-            .split_at_checked(bytes.len().checked_sub(trailer_len).ok_or_else(invalid)?)
-            .ok_or_else(invalid)?;
-        let overrides = if sparse { count(&mut trailer)? } else { 0 };
-        let blobs = if compact { 0 } else { count(&mut trailer)? };
-        if blobs > n || overrides > n {
-            return Err(invalid());
-        }
-        let body_end = data
-            .len()
-            .checked_sub(if compact {
-                n.div_ceil(8)
-            } else {
-                blobs.checked_mul(9 + width).ok_or_else(invalid)?
-            })
-            .ok_or_else(invalid)?;
-        let (mut stamps, blob_rows) = data.split_at(body_end);
-        bytes = blob_rows;
+        let rows = match format {
+            f if f == CATALOG => catalog_rows(bytes, base, width)?,
+            f if f == DENSE || f == SPARSE => legacy_rows(bytes, base, width, f == SPARSE)?,
+            _ => return Err(invalid()),
+        };
+        Ok(Self {
+            sha256: matches!(hash, HashFormat::Sha256),
+            rows,
+        })
+    }
+}
+
+// Legacy checkpoints carry their own blob table. Dense versions also own every stamp.
+fn legacy_rows(
+    bytes: &[u8],
+    base: impl ExactSizeIterator<Item = ([u64; 7], Option<BlobId>)>,
+    width: usize,
+    sparse: bool,
+) -> io::Result<Vec<Row>> {
+    let n = base.len();
+    let (data, mut trailer) = split_tail(bytes, if sparse { 16 } else { 8 })?;
+    let overrides = if sparse { count(&mut trailer)? } else { 0 };
+    let blobs = count(&mut trailer)?;
+    if blobs > n || overrides > n {
+        return Err(invalid());
+    }
+    let (stamps, identities) = split_tail(data, blobs.checked_mul(9 + width).ok_or_else(invalid)?)?;
+    let mut rows = if sparse {
         let mut rows: Vec<_> = base
-            .map(|(stamp, id)| Row {
+            .map(|(stamp, _)| Row {
                 stamp,
-                blob: if compact { id } else { None },
+                blob: None,
                 committed: false,
             })
             .collect();
-        if sparse {
-            let mut previous = None;
-            for _ in 0..overrides {
-                let ordinal = count(&mut stamps)?;
-                if previous.is_some_and(|prior| ordinal <= prior) {
-                    return Err(invalid());
-                }
-                previous = Some(ordinal);
-                let row = rows.get_mut(ordinal).ok_or_else(invalid)?;
-                let mask = take(&mut stamps, 1)?[0];
-                if mask == 0 || mask & 0x80 != 0 {
-                    return Err(invalid());
-                }
-                for (i, field) in row.stamp.iter_mut().enumerate() {
-                    if mask & (1 << i) != 0 {
-                        let next = u64::from_le_bytes(take(&mut stamps, 8)?.try_into().unwrap());
-                        if *field == next {
-                            return Err(invalid());
-                        }
-                        *field = next;
-                    }
-                }
+        apply_overrides(stamps, overrides, &mut rows)?;
+        rows
+    } else {
+        dense_rows(stamps, n)?
+    };
+    read_blobs(identities, &mut rows, width)?;
+    Ok(rows)
+}
+
+fn dense_rows(stamps: &[u8], n: usize) -> io::Result<Vec<Row>> {
+    if n.checked_mul(STAMP_BYTES) != Some(stamps.len()) {
+        return Err(invalid());
+    }
+    Ok(stamps
+        .chunks_exact(STAMP_BYTES)
+        .map(|fields| {
+            let stamp = crate::application::index::binary::stamp(fields.try_into().unwrap());
+            Row {
+                stamp,
+                blob: None,
+                committed: false,
             }
-        } else {
-            for row in &mut rows {
-                let words = take(&mut stamps, STAMP_BYTES)?;
-                for (word, raw) in row.stamp.iter_mut().zip(words.chunks_exact(8)) {
-                    *word = u64::from_le_bytes(raw.try_into().unwrap());
-                }
-            }
-        }
-        if !stamps.is_empty() {
+        })
+        .collect())
+}
+
+// Both sparse sections address rows in strictly increasing catalog order.
+fn next_row<'a>(
+    bytes: &mut &[u8],
+    rows: &'a mut [Row],
+    first: &mut usize,
+) -> io::Result<&'a mut Row> {
+    let ordinal = count(bytes)?;
+    let row = rows.get_mut(ordinal).ok_or_else(invalid)?;
+    if ordinal < *first {
+        return Err(invalid());
+    }
+    *first = ordinal + 1;
+    Ok(row)
+}
+
+fn read_stamp_override(bytes: &mut &[u8], stamp: &mut [u64; 7]) -> io::Result<()> {
+    let mask = take(bytes, 1)?[0];
+    if mask == 0 || mask & 0x80 != 0 {
+        return Err(invalid());
+    }
+    for i in StampFields(mask) {
+        let field = &mut stamp[i];
+        let next = u64::from_le_bytes(take(bytes, 8)?.try_into().unwrap());
+        if *field == next {
             return Err(invalid());
         }
-        if compact {
-            for (&flags, group) in bytes.iter().zip(rows.chunks_mut(8)) {
-                if (flags as u16) >> group.len() != 0 {
-                    return Err(invalid());
-                }
-                for (bit, row) in group.iter_mut().enumerate() {
-                    row.committed = flags & (1 << bit) != 0;
-                    if row.blob.is_some_and(|id| id.len as usize != width)
-                        || row.committed && row.blob.is_none()
-                    {
-                        return Err(invalid());
-                    }
-                }
-            }
-            return Ok(Self { sha256, rows });
-        }
-        let mut previous = None;
-        while !bytes.is_empty() {
-            let ordinal = count(&mut bytes)?;
-            if previous.is_some_and(|prior| ordinal <= prior) {
-                return Err(invalid());
-            }
-            previous = Some(ordinal);
-            let target = rows.get_mut(ordinal).ok_or_else(invalid)?;
-            target.committed = match take(&mut bytes, 1)?[0] {
-                0 => false,
-                1 => true,
-                _ => return Err(invalid()),
-            };
-            let mut raw = [0; 32];
-            raw[..width].copy_from_slice(take(&mut bytes, width)?);
-            target.blob = Some(BlobId {
-                bytes: raw,
-                len: width as u8,
-            });
-        }
-        Ok(Self { sha256, rows })
+        *field = next;
     }
+    Ok(())
+}
+
+fn apply_overrides(mut bytes: &[u8], count: usize, rows: &mut [Row]) -> io::Result<()> {
+    let mut first = 0;
+    for _ in 0..count {
+        let row = next_row(&mut bytes, rows, &mut first)?;
+        read_stamp_override(&mut bytes, &mut row.stamp)?;
+    }
+    if bytes.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
+fn split_tail(bytes: &[u8], len: usize) -> io::Result<(&[u8], &[u8])> {
+    Ok(bytes.split_at(bytes.len().checked_sub(len).ok_or_else(invalid)?))
+}
+
+fn catalog_rows(
+    bytes: &[u8],
+    base: impl ExactSizeIterator<Item = ([u64; 7], Option<BlobId>)>,
+    width: usize,
+) -> io::Result<Vec<Row>> {
+    let n = base.len();
+    let (data, mut trailer) = split_tail(bytes, 8)?;
+    let overrides = count(&mut trailer)?;
+    if overrides > n {
+        return Err(invalid());
+    }
+    let (stamps, flags) = split_tail(data, n.div_ceil(8))?;
+    let used_bits = n % 8;
+    if used_bits != 0 && flags.last().is_some_and(|last| last >> used_bits != 0) {
+        return Err(invalid());
+    }
+    let mut rows: Vec<_> = base
+        .enumerate()
+        .map(|(i, (stamp, blob))| {
+            let committed = flags[i / 8] & (1 << (i % 8)) != 0;
+            let row = Row {
+                stamp,
+                blob,
+                committed,
+            };
+            row.validate_identity(width)?;
+            Ok::<_, io::Error>(row)
+        })
+        .collect::<io::Result<_>>()?;
+    apply_overrides(stamps, overrides, &mut rows)?;
+    Ok(rows)
+}
+
+fn read_blobs(mut bytes: &[u8], rows: &mut [Row], width: usize) -> io::Result<()> {
+    let mut first = 0;
+    while !bytes.is_empty() {
+        let target = next_row(&mut bytes, rows, &mut first)?;
+        target.committed = match take(&mut bytes, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid()),
+        };
+        target.blob = Some(BlobId::from_raw(take(&mut bytes, width)?));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -284,33 +420,36 @@ mod tests {
     }
     #[test]
     fn round_trip_and_reject_malformed_rows() {
-        for sha256 in [false, true] {
-            let point = fixture(sha256);
-            let mut bytes = vec![];
-            point
-                .encode(&mut bytes, point.rows.iter().map(|r| r.stamp))
-                .unwrap();
-            let base = || point.rows.iter().map(|r| r.stamp);
-            assert_eq!(Checkpoint::decode(&bytes, base()).unwrap(), point);
-            assert!(Checkpoint::decode(&bytes, std::iter::empty()).is_err());
-            let start = 17;
-            let stride = 9 + if sha256 { 32 } else { 20 };
-            for (i, value) in [
-                (0, 0),
-                (8, 3),
-                (9, 4),
-                (start, 3),
-                (start + 8, 2),
-                (start + stride, 0),
-            ] {
-                let mut broken = bytes.clone();
-                broken[i] = value;
-                assert!(Checkpoint::decode(&broken, base()).is_err());
-            }
-            assert!(Checkpoint::decode(&bytes[..bytes.len() - 1], base()).is_err());
-            assert!(Checkpoint::decode(&bytes[..start - 1], base()).is_err());
+        check_checkpoint_round_trip(false);
+        check_checkpoint_round_trip(true);
+    }
+
+    fn check_checkpoint_round_trip(sha256: bool) {
+        let point = fixture(sha256);
+        let mut bytes = vec![];
+        point
+            .encode(&mut bytes, point.rows.iter().map(|r| r.stamp))
+            .unwrap();
+        let base = || point.rows.iter().map(|r| r.stamp);
+        assert_eq!(Checkpoint::decode(&bytes, base()).unwrap(), point);
+        assert!(Checkpoint::decode(&bytes, std::iter::empty()).is_err());
+        let start = 17;
+        let stride = 9 + if sha256 { 32 } else { 20 };
+        assert_rejects_changes(&bytes, &point, [
+            (0, 0), (8, 3), (9, 4), (start, 3), (start + 8, 2), (start + stride, 0),
+        ]);
+        assert!(Checkpoint::decode(&bytes[..bytes.len() - 1], base()).is_err());
+        assert!(Checkpoint::decode(&bytes[..start - 1], base()).is_err());
+    }
+
+    fn assert_rejects_changes(bytes: &[u8], base: &Checkpoint, changes: [(usize, u8); 6]) {
+        for (i, value) in changes {
+            let mut broken = bytes.to_vec();
+            broken[i] = value;
+            assert!(Checkpoint::decode(&broken, base.rows.iter().map(|row| row.stamp)).is_err());
         }
     }
+
     #[test]
     fn sparse_stamp_roundtrip_and_reject_bad_masks() {
         let point = fixture(false);
@@ -348,7 +487,8 @@ mod tests {
             let mut base = p.rows.iter().map(|r| (r.stamp, r.blob)).collect::<Vec<_>>();
             base[2].0[6] = 17;
             let mut bytes = vec![];
-            p.write(&mut bytes, base.iter().map(|r| r.0), true).unwrap();
+            p.append(&mut bytes, base.iter().map(|&(s, b)| (s, b, false)))
+                .unwrap();
             // Header + one ordinal/mask/field + one byte of flags + override count.
             assert_eq!(bytes.len(), 17 + 17 + 1 + 8);
             assert_eq!(
@@ -365,6 +505,26 @@ mod tests {
             base[0].1 = None;
             assert!(Checkpoint::decode_catalog(&bytes, base.into_iter()).is_err());
         }
+    }
+    #[test]
+    fn late_unhashed_catalog_entry_keeps_checkpoint_owned_identities() {
+        let point = fixture(false);
+        let mut base: Vec<_> = point
+            .rows
+            .iter()
+            .map(|r| (r.stamp, r.blob, false))
+            .collect();
+        base[0].1 = None;
+        assert!(point.append(&mut Vec::new(), base.iter().copied()).is_err());
+        base[2].1 = None;
+        base[2].2 = true;
+        let mut bytes = b"manifest".to_vec();
+        point.append(&mut bytes, base.iter().copied()).unwrap();
+        assert_eq!(&bytes[..16], b"manifestCIXCHK02");
+        assert_eq!(
+            Checkpoint::decode(&bytes[8..], base.iter().map(|r| r.0)).unwrap(),
+            point
+        );
     }
     #[test]
     fn reject_impossible_memory_states() {

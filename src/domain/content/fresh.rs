@@ -1,7 +1,7 @@
 //! Transpose disjoint file ranges by the first two Unicode scalars. Within
 //! each row a counting pass assigns a contiguous output range to every third
 //! scalar. A second pass scatters file IDs directly into their durable order.
-use super::{SAMPLE, SCALAR_MASK, grams};
+use super::{PostingLayout, SAMPLE, SCALAR_MASK, grams};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::{self, Write},
@@ -14,17 +14,17 @@ type Row = (u64, Vec<Vec<Hit>>);
 pub(crate) struct Run {
     common: Vec<Vec<Hit>>,
     rare: HashMap<u64, Vec<Hit>>,
-    seen: Vec<u64>,
-    touched: Vec<usize>,
+    seen: super::SeenAscii,
     unicode: HashSet<u64>,
 }
 impl Run {
     pub(crate) fn new() -> Self {
+        let mut seen = super::SeenAscii::default();
+        seen.allocate();
         Self {
             common: vec![Vec::new(); ASCII * ASCII],
             rare: HashMap::new(),
-            seen: vec![0; ASCII * ASCII * ASCII / 64],
-            touched: Vec::new(),
+            seen,
             unicode: HashSet::new(),
         }
     }
@@ -33,49 +33,52 @@ impl Run {
     fn ascii(&mut self, a: usize, b: usize, c: usize, file: u32) {
         let prefix = a * ASCII + b;
         let gram = prefix * ASCII + c;
-        let word = gram / 64;
-        let bit = 1 << (gram % 64);
-        let old = self.seen[word];
-        if old & bit == 0 {
-            if old == 0 {
-                self.touched.push(word);
-            }
-            self.seen[word] = old | bit;
+        if self.seen.insert(gram) {
             self.common[prefix].push((c as u32, file));
         }
     }
 
+    fn add_scalar_trigram(&mut self, key: u64, file: u32) {
+        let a = (key >> 42) as usize;
+        let b = ((key >> 21) & SCALAR_MASK) as usize;
+        let c = (key & SCALAR_MASK) as usize;
+        if (a | b | c) < ASCII {
+            self.ascii(a, b, c, file);
+            return;
+        }
+        if self.unicode.insert(key) {
+            self.scalar_row(a, b, key >> 21).push((c as u32, file));
+        }
+    }
+
+    fn scalar_row(&mut self, a: usize, b: usize, prefix: u64) -> &mut Vec<Hit> {
+        if (a | b) < ASCII {
+            &mut self.common[a * ASCII + b]
+        } else {
+            self.rare.entry(prefix).or_default()
+        }
+    }
+
+    fn ascii_text(&mut self, text: &str, file: u32) {
+        for [a, b, c] in super::ascii_grams(text) {
+            self.ascii(a.into(), b.into(), c.into(), file);
+        }
+    }
+
+    fn scalar_text(&mut self, text: &str, file: u32) {
+        for key in grams(text) {
+            self.add_scalar_trigram(key, file);
+        }
+        self.unicode.clear();
+    }
+
     pub(crate) fn add(&mut self, file: u32, text: &str) {
         if text.is_ascii() {
-            for triple in text.as_bytes().windows(3) {
-                self.ascii(
-                    triple[0] as usize,
-                    triple[1] as usize,
-                    triple[2] as usize,
-                    file,
-                );
-            }
+            self.ascii_text(text, file);
         } else {
-            for key in grams(text) {
-                let a = (key >> 42) as usize;
-                let b = ((key >> 21) & SCALAR_MASK) as usize;
-                let c = (key & SCALAR_MASK) as usize;
-                if (a | b | c) < ASCII {
-                    self.ascii(a, b, c, file);
-                } else if self.unicode.insert(key) {
-                    let row = if (a | b) < ASCII {
-                        &mut self.common[a * ASCII + b]
-                    } else {
-                        self.rare.entry(key >> 21).or_default()
-                    };
-                    row.push((c as u32, file));
-                }
-            }
-            self.unicode.clear();
+            self.scalar_text(text, file);
         }
-        for word in self.touched.drain(..) {
-            self.seen[word] = 0;
-        }
+        self.seen.clear();
     }
 }
 
@@ -85,42 +88,60 @@ struct Part {
     lengths: Vec<u64>,
     ids: Vec<[u8; 8]>,
 }
+struct ThirdScalars {
+    ascii: [usize; ASCII],
+    rare: BTreeMap<u32, usize>,
+}
+
+impl ThirdScalars {
+    fn collect(runs: &[Vec<Hit>]) -> Self {
+        let mut scalars = Self { ascii: [0; ASCII], rare: BTreeMap::new() };
+        for &(scalar, _) in runs.iter().flatten() {
+            *scalars.count(scalar) += 1;
+        }
+        scalars
+    }
+
+    fn count(&mut self, scalar: u32) -> &mut usize {
+        match self.ascii.get_mut(scalar as usize) {
+            Some(count) => count,
+            None => self.rare.entry(scalar).or_default(),
+        }
+    }
+
+    fn offset(&mut self, scalar: u32) -> &mut usize {
+        match self.ascii.get_mut(scalar as usize) {
+            Some(offset) => offset,
+            None => self.rare.get_mut(&scalar).unwrap(),
+        }
+    }
+
+    fn assign(&mut self, mut emit: impl FnMut(u32, &mut usize)) {
+        for (index, count) in self.ascii.iter_mut().enumerate() {
+            emit(index as u32, count);
+        }
+        for (&scalar, count) in &mut self.rare {
+            emit(scalar, count);
+        }
+    }
+}
+
 impl Part {
     fn row(&mut self, prefix: u64, runs: Vec<Vec<Hit>>) {
-        let mut ascii = [0usize; ASCII];
-        let mut rare = BTreeMap::<u32, usize>::new();
-        for &(c, _) in runs.iter().flatten() {
-            if let Some(n) = ascii.get_mut(c as usize) {
-                *n += 1;
-            } else {
-                *rare.entry(c).or_default() += 1;
-            }
-        }
+        let mut scalars = ThirdScalars::collect(&runs);
         let mut end = self.ids.len();
-        let mut assign = |c: u32, value: &mut usize| {
-            let n = *value;
-            if n != 0 {
-                for scalar in [(prefix >> 21) as u32, (prefix & SCALAR_MASK) as u32, c] {
-                    self.keys.extend_from_slice(&scalar.to_le_bytes());
-                }
-                self.lengths.push(n as u64);
+        scalars.assign(|scalar, value| {
+            let count = *value;
+            if count != 0 {
+                self.keys.extend_from_slice(&super::encoded_key((prefix << 21) | u64::from(scalar)));
+                self.lengths.push(count as u64);
                 *value = end;
-                end += n;
+                end += count;
             }
-        };
-        for (c, value) in ascii.iter_mut().enumerate() {
-            assign(c as u32, value);
-        }
-        for (&c, value) in &mut rare {
-            assign(c, value);
-        }
+        });
         self.ids.resize(end, [0; 8]);
         for (c, file) in runs.into_iter().flatten() {
-            let offset = if let Some(offset) = ascii.get_mut(c as usize) {
-                offset
-            } else {
-                rare.get_mut(&c).unwrap()
-            };
+            let offset = scalars.offset(c);
             self.ids[*offset] = u64::from(file).to_le_bytes();
             *offset += 1;
         }
@@ -129,48 +150,61 @@ impl Part {
 
 pub(crate) struct Product(Vec<Part>);
 
+fn collect_rows(runs: Vec<Run>) -> Vec<Row> {
+    let mut rare = BTreeMap::<u64, Vec<Vec<Hit>>>::new();
+    let mut common: Vec<_> = runs
+        .into_iter()
+        .map(|run| {
+            for (prefix, hits) in run.rare {
+                rare.entry(prefix).or_default().push(hits);
+            }
+            run.common.into_iter()
+        })
+        .collect();
+    let mut rows: Vec<Row> = rare.into_iter().collect();
+    for i in 0..ASCII * ASCII {
+        let lists: Vec<_> = common
+            .iter_mut()
+            .filter_map(|run| {
+                let hits = run.next().unwrap();
+                (!hits.is_empty()).then_some(hits)
+            })
+            .collect();
+        if !lists.is_empty() {
+            rows.push((((i / ASCII) as u64) << 21 | (i % ASCII) as u64, lists));
+        }
+    }
+    rows.sort_unstable_by_key(|r| r.0);
+    rows
+}
+
+fn row_size(row: &Row) -> usize {
+    row.1.iter().map(Vec::len).sum()
+}
+
+fn next_part(rows: &mut impl Iterator<Item = Row>, target: usize) -> (usize, Vec<Row>) {
+    let mut part = Vec::new();
+    let mut hits = 0;
+    for row in rows {
+        hits += row_size(&row);
+        part.push(row);
+        if hits >= target {
+            break;
+        }
+    }
+    (hits, part)
+}
+
 impl Product {
     pub(crate) fn transpose(runs: Vec<Run>) -> io::Result<Self> {
         let width = runs.len();
-        let mut rare = BTreeMap::<u64, Vec<Vec<Hit>>>::new();
-        let mut common: Vec<_> = runs
-            .into_iter()
-            .map(|run| {
-                for (prefix, hits) in run.rare {
-                    rare.entry(prefix).or_default().push(hits);
-                }
-                run.common.into_iter()
-            })
-            .collect();
-        let mut rows: Vec<Row> = rare.into_iter().collect();
-        for i in 0..ASCII * ASCII {
-            let lists: Vec<_> = common
-                .iter_mut()
-                .filter_map(|run| {
-                    let hits = run.next().unwrap();
-                    (!hits.is_empty()).then_some(hits)
-                })
-                .collect();
-            if !lists.is_empty() {
-                rows.push((((i / ASCII) as u64) << 21 | (i % ASCII) as u64, lists));
-            }
-        }
-        rows.sort_unstable_by_key(|r| r.0);
-        let size = |row: &Row| row.1.iter().map(Vec::len).sum::<usize>();
-        let target = rows.iter().map(size).sum::<usize>().div_ceil(width);
+        let rows = collect_rows(runs);
+        let target = rows.iter().map(row_size).sum::<usize>().div_ceil(width);
         std::thread::scope(|scope| {
             let mut jobs = Vec::new();
             let mut rows = rows.into_iter().peekable();
             while rows.peek().is_some() {
-                let mut part = Vec::new();
-                let mut hits = 0;
-                for row in rows.by_ref() {
-                    hits += size(&row);
-                    part.push(row);
-                    if hits >= target {
-                        break;
-                    }
-                }
+                let (hits, part) = next_part(&mut rows, target);
                 jobs.push(scope.spawn(move || {
                     let mut output = Part {
                         ids: Vec::with_capacity(hits),
@@ -194,7 +228,7 @@ impl Product {
 
     pub(crate) fn seal(self, mut out: impl Write) -> io::Result<()> {
         let count = self.0.iter().map(|p| p.lengths.len()).sum::<usize>() as u64;
-        out.write_all(&[2])?;
+        out.write_all(&PostingLayout::Sampled.tag())?;
         out.write_all(&count.to_le_bytes())?;
         for p in &self.0 {
             out.write_all(&p.keys)?;

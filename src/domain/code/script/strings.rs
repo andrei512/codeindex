@@ -1,107 +1,129 @@
 //! Visit executable interpolation ranges. Escaped delimiters remain literal.
-use super::{Analysis, Evidence, Kind, Language, Lookup, Token, add_use, keyword, word};
+use super::{Analysis, Evidence, Language, reference_chain::References, syntax::paired};
 use crate::domain::code::lexer;
-fn closing(bytes: &[u8], mut p: usize, python: bool) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut stop = None;
-    let mut quote = 0;
-    while p < bytes.len() {
-        let c = bytes[p];
-        if quote != 0 {
-            if c == b'\\' {
-                p += 2;
-                continue;
-            }
-            if c == quote {
-                quote = 0;
-            }
-        } else {
-            match c {
-                b'\'' | b'"' | b'`' => quote = c,
-                b'(' | b'[' | b'{' => depth += 1,
-                b'}' if depth == 0 => return Some((stop.unwrap_or(p), p + 1)),
-                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-                b':' | b'!' if python && depth == 0 && bytes.get(p + 1) != Some(&b'=') => {
-                    stop.get_or_insert(p);
-                }
-                _ => {}
-            }
+fn expression(bytes: &[u8], start: usize, python: bool) -> Option<(std::ops::Range<usize>, usize)> {
+    let mut cursor = Expression {
+        bytes,
+        python,
+        depth: 0,
+        suffix: None,
+    };
+    let mut p = start;
+    while let Some(&c) = bytes.get(p) {
+        if c == b'}' && cursor.depth == 0 {
+            return Some((start..cursor.suffix.unwrap_or(p), p + 1));
         }
-        p += 1;
+        p = cursor.advance(p, c);
     }
     None
 }
+
+struct Expression<'a> {
+    bytes: &'a [u8],
+    python: bool,
+    depth: usize,
+    suffix: Option<usize>,
+}
+
+impl Expression<'_> {
+    fn advance(&mut self, at: usize, byte: u8) -> usize {
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                return at + lexer::quoted_len(&self.bytes[at..], false, false, |_| {});
+            }
+            b'(' | b'[' | b'{' => self.depth += 1,
+            b')' | b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+            b':' | b'!' => self.observe_suffix(at),
+            _ => {}
+        }
+        at + 1
+    }
+
+    fn observe_suffix(&mut self, at: usize) {
+        let at_root = self.python && self.depth == 0;
+        if at_root && self.bytes.get(at + 1) != Some(&b'=') {
+            self.suffix.get_or_insert(at);
+        }
+    }
+}
+
 pub(super) fn visit(
     lang: Language,
-    token: &Token,
+    site: super::parser::ParserSite,
     prefix: &str,
-    scope: usize,
-    a: &mut Analysis,
-    e: &mut Evidence,
+    (analysis, evidence): (&mut Analysis, &mut Evidence),
 ) {
     let python = lang == Language::Python;
-    if python {
-        if !matches!(prefix.to_ascii_lowercase().as_str(), "f" | "rf" | "fr") {
-            return;
-        }
-    } else if !token.text.starts_with('`') {
+    let text = site.token.text;
+    if !interpolated(text, prefix, python) {
         return;
     }
-    let b = token.text.as_bytes();
-    let mut p = 0;
-    while p < b.len() {
-        let open = if python {
-            if b[p] == b'{' && b.get(p + 1) == Some(&b'{') {
-                p += 2;
-                continue;
-            }
-            b[p] == b'{'
-        } else {
-            if b[p] == b'\\' {
-                p += 2;
-                continue;
-            }
-            b[p] == b'$' && b.get(p + 1) == Some(&b'{')
-        };
-        if !open {
-            p += 1;
-            continue;
-        }
-        let start = p + if python { 1 } else { 2 };
-        let Some((end, next)) = closing(b, start, python) else {
-            break;
-        };
-        let offset = token.span.start + start;
-        let mut tokens = lexer::tokens(&token.text[start..end], lang);
-        for t in &mut tokens {
-            t.span.start += offset;
-            t.span.end += offset;
-        }
-        for (i, t) in tokens.iter().enumerate() {
-            if t.kind != Kind::Word || !word(t) || keyword(lang, t.text) {
-                continue;
-            }
-            let member = i > 0 && tokens[i - 1].text == ".";
-            let receiver = if member
-                && i >= 2
-                && word(&tokens[i - 2])
-                && !(i > 2 && tokens[i - 3].text == ".")
-            {
-                Some(tokens[i - 2].span.clone())
-            } else {
-                None
-            };
-            if !member || receiver.is_some() {
-                add_use(
-                    a,
-                    e,
-                    t,
-                    scope,
-                    tokens.get(i + 1).is_some_and(|n| n.text == "("),
-                    Lookup::Name { scope, receiver },
-                );
-            }
-        }
-        p = next;
+    for range in interpolations(text, python) {
+        expression_uses(lang, site, range, (analysis, evidence));
     }
+}
+
+fn interpolated(text: &str, prefix: &str, python: bool) -> bool {
+    if python {
+        ["f", "rf", "fr"]
+            .iter()
+            .any(|form| prefix.eq_ignore_ascii_case(form))
+    } else {
+        text.starts_with('`')
+    }
+}
+
+fn interpolations(text: &str, python: bool) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let bytes = text.as_bytes();
+    let mut p = 0;
+    std::iter::from_fn(move || {
+        while p < bytes.len() {
+            if !interpolation_start(bytes, &mut p, python) {
+                continue;
+            }
+            let (range, next) = expression(bytes, p, python)?;
+            p = next;
+            return Some(range);
+        }
+        None
+    })
+}
+
+fn interpolation_start(bytes: &[u8], p: &mut usize, python: bool) -> bool {
+    let at = *p;
+    *p += 1;
+    let next = bytes.get(*p).copied();
+    match (python, bytes[at], next) {
+        (true, b'{', Some(b'{')) | (false, b'\\', _) => {
+            *p += 1;
+            false
+        }
+        (true, b'{', _) => true,
+        (false, b'$', Some(b'{')) => {
+            *p += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn expression_uses(
+    lang: Language,
+    site: super::parser::ParserSite,
+    range: std::ops::Range<usize>,
+    (analysis, evidence): (&mut Analysis, &mut Evidence),
+) {
+    let offset = site.token.span.start + range.start;
+    let mut tokens = lexer::tokens(&site.token.text[range], lang);
+    for token in &mut tokens {
+        token.span.start += offset;
+        token.span.end += offset;
+    }
+    let pairs = paired(&tokens);
+    References::new(&tokens, &pairs, lang).expression(
+        0..tokens.len(),
+        site.scope,
+        analysis,
+        evidence,
+    );
 }

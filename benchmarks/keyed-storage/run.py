@@ -6,14 +6,34 @@ import subprocess
 import tempfile
 import statistics
 
-def main():
+def options():
     cli = argparse.ArgumentParser()
     cli.add_argument("repo", type=Path)
     cli.add_argument("output", type=Path)
     cli.add_argument("--rounds", type=int, default=6)
     cli.add_argument("--arms", nargs="+", choices=["cow", "runs", "sqlite", "sqlite-blocks", "sqlite-batch"],
                      default=["cow", "sqlite", "runs"])
-    args = cli.parse_args()
+    return cli, cli.parse_args()
+
+
+def round_order(arms, index):
+    offset = index % len(arms) if len(arms) > 2 else 0
+    order = arms[offset:] + arms[:offset]
+    return order[::(-1 if index % 2 else 1)]
+
+
+def measure(binary, repo, mode, index):
+    with tempfile.TemporaryDirectory() as folder:
+        result = subprocess.check_output([binary, repo, Path(folder) / "db", mode], text=True)
+    row = {"backend": mode, "round": index}
+    for line in result.splitlines():
+        key, value = line.split()
+        row.setdefault(key, []).append(int(value))
+    return row
+
+
+def main():
+    cli, args = options()
     if args.rounds < 1:
         cli.error("rounds must be positive")
     repo = args.repo.resolve()
@@ -25,20 +45,16 @@ def main():
     arms = args.arms
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for i in range(args.rounds):
-        offset = i % len(arms) if len(arms) > 2 else 0
-        order = arms[offset:] + arms[:offset]
-        for mode in order[::(-1 if i % 2 else 1)]:
-            with tempfile.TemporaryDirectory() as folder:
-                result = subprocess.check_output([binary, repo, Path(folder)/"db",mode],text=True)
-            row = {"backend":mode,"round":i}
-            for line in result.splitlines():
-                key, value = line.split()
-                row.setdefault(key,[]).append(int(value))
-            report["runs"].append(row)
+        for mode in round_order(arms, i):
+            report["runs"].append(measure(binary, repo, mode, i))
             args.output.write_text(json.dumps(report)+"\n")
     assert git("rev-parse","HEAD")==report["revision"] and not git("status","--porcelain")
+    print_timings(arms, report["runs"])
+
+
+def print_timings(arms, runs):
     for arm in arms:
-        rows=[r for r in report["runs"] if r["backend"]==arm]
+        rows=[r for r in runs if r["backend"]==arm]
         def percentile(metric,p):
             values=sorted(v for row in rows for v in row[metric])
             return statistics.median(values) if p == .5 else values[round((len(values)-1)*p)]

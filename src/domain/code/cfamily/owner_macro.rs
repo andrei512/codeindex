@@ -23,20 +23,15 @@ impl Analyzer<'_, '_> {
     ) -> Option<usize> {
         // Like a written qualified definition, a macro can name a class whose
         // declaration lives in an included header. Other owners stay distinct.
-        let choices = self.lookup(scope, &name, None, at);
-        match choices.as_slice() {
-            [binding] => return binding.body,
-            [] => {}
-            _ => return None,
+        {
+            let mut choices = self.lookup(scope, &name, None, at);
+            if let Some(binding) = choices.next() {
+                return binding.body.filter(|_| choices.next().is_none());
+            }
         }
         if let Some(existing) = self.external_owner(scope, &name) {
             return Some(existing);
         }
-        let body = self.scope(scope, None);
-        self.scopes[body].container = Some(body);
-        self.scopes[scope]
-            .external_owners
-            .insert(Cow::Owned(name), body);
-        Some(body)
+        Some(self.create_external_scope(scope, Cow::Owned(name)))
     }
 }

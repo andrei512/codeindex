@@ -1,210 +1,221 @@
 //! Decide whether an edit changes any bytes consumed by a query product.
+mod blob_index;
+mod committed;
+use blob_index::BlobIndex;
+
 use super::{
     Pin,
     checkpoint::{Checkpoint, Row},
 };
 use crate::adapters::repository::{self, BlobId, CommitTree, ObservedPath};
 use crate::domain::{code::Language, markdown::is_markdown};
-use std::{collections::HashMap, io, path::Path, sync::OnceLock};
+use std::{io, path::Path, sync::OnceLock};
 
-pub(super) struct Plan {
+pub(super) struct Plan<'a, 'p> {
+    root: &'a Path,
+    pub(super) prior: Option<&'p Pin>,
+    checkpoint: Option<&'p Checkpoint>,
+    capture_root: Option<repository::CaptureRoot<'a>>,
     sha256: bool,
-    // One producer per slot. A populated slot can contain a path-only classification.
-    hashes: Vec<OnceLock<Option<BlobId>>>,
-    verified: Vec<Option<usize>>,
-    by_blob: OnceLock<HashMap<BlobId, Vec<usize>>>,
+    // The metadata probe stops at its first different file. Capture reuses that proof.
+    changed: Option<(usize, Option<BlobId>)>,
+    // Leading catalog ordinals with the same path and proven unchanged content.
+    verified_prefix: usize,
+    by_blob: OnceLock<BlobIndex>,
 }
 
-impl Plan {
-    pub(super) fn new(count: usize, sha256: bool) -> Self {
-        Self {
+struct ContentIdentity<'a> {
+    text: Option<&'a str>,
+    hash: Option<BlobId>,
+}
+
+impl<'a> ContentIdentity<'a> {
+    fn capture(text: Option<&'a str>, sha256: bool) -> Self {
+        Self { text, hash: text.map(|text| repository::raw_blob_id(text.as_bytes(), sha256)) }
+    }
+}
+
+enum Compared {
+    Retained,
+    DifferentPath,
+    Changed { text: Option<String>, hash: Option<BlobId> },
+}
+
+impl<'a, 'p> Plan<'a, 'p> {
+    pub(super) fn new(root: &'a Path, prior: Option<&'p Pin>) -> io::Result<Self> {
+        let sha256 = repository::uses_sha256(root)?;
+        let checkpoint = prior.and_then(|pin| pin.checkpoint.as_ref()).filter(|cp| cp.sha256 == sha256);
+        Ok(Self {
+            root, prior, checkpoint,
+            capture_root: None,
             sha256,
             by_blob: OnceLock::new(),
-            hashes: (0..count).map(|_| OnceLock::new()).collect(),
-            verified: vec![None; count],
+            changed: None,
+            verified_prefix: 0,
+        })
+    }
+
+    // The first changed file opens the repository. If proof turns into a
+    // rebuild, transfer the same descriptor to the parallel capture workers.
+    pub(super) fn take_capture_root(&mut self) -> io::Result<repository::CaptureRoot<'a>> {
+        self.capture_root.take().map_or_else(|| repository::CaptureRoot::new(self.root), Ok)
+    }
+    fn capture(&mut self, row: &mut ObservedPath) -> io::Result<Option<String>> {
+        if let Some(body) = row.captured.take() {
+            return Ok(body);
         }
+        let root = match self.capture_root {
+            Some(ref root) => root,
+            None => self.capture_root.insert(repository::CaptureRoot::new(self.root)?),
+        };
+        root.capture(&row.path, row.stamp)
     }
-    pub(super) fn can_forward(&self, pin: &Pin) -> bool {
-        pin.checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.sha256 == self.sha256)
-    }
-    fn prior_hash(&self, pin: &Pin, id: usize) -> Option<Option<BlobId>> {
-        let previous = pin.checkpoint.as_ref()?;
-        (previous.sha256 == self.sha256).then_some(previous.rows[id].blob)
+    fn prior_hash(&self, id: usize) -> Option<Option<BlobId>> {
+        Some(self.checkpoint?.rows[id].blob)
     }
     pub(super) fn verify_metadata_only(
         &mut self,
-        root: &Path,
         obs: &mut [ObservedPath],
         pin: &Pin,
-    ) -> io::Result<bool> {
-        if pin
-            .checkpoint
-            .as_ref()
-            .is_none_or(|c| c.sha256 != self.sha256)
-            || obs.len() != pin.files.len()
-            || obs.iter().zip(&pin.files).any(|(o, f)| o.path != f.path())
-        {
-            return Ok(false);
+        unchanged: usize,
+    ) -> io::Result<Option<&'p Checkpoint>> {
+        let Some(checkpoint) = self.checkpoint else { return Ok(None) };
+        if obs.len() != pin.files.len() {
+            return Ok(None);
         }
-        for (id, o) in obs.iter_mut().enumerate() {
-            if o.stamp == pin.files[id].stamp() {
-                continue;
-            }
-            let text = match o.captured.take() {
-                Some(body) => body,
-                None => repository::capture_observed(root, &o.path, o.stamp)?,
-            };
-            let hash = text
-                .as_ref()
-                .map(|s| repository::raw_blob_id(s.as_bytes(), self.sha256));
-            self.hashes[id].set(hash).expect("one digest per input");
-            if self.equal(pin, id, text.as_deref(), hash)? {
-                self.verified[id] = Some(id);
-            } else {
-                o.captured = Some(text);
-                return Ok(false);
+        for (id, observed) in obs.iter_mut().enumerate().skip(unchanged) {
+            let comparison = self.compare(pin, id, observed)?;
+            if !self.retain_observation(id, observed, comparison) {
+                return Ok(None);
             }
         }
-        Ok(true)
+        // External dependencies can still force a rebuild after every source
+        // has been proven identical. Forward those bytes through that build.
+        self.verified_prefix = obs.len();
+        Ok(Some(checkpoint))
     }
-    fn equal(
-        &self,
-        pin: &Pin,
-        id: usize,
-        text: Option<&str>,
-        hash: Option<BlobId>,
-    ) -> io::Result<bool> {
-        if self.prior_hash(pin, id) != Some(hash) {
+    fn compare(&mut self, pin: &Pin, id: usize, observed: &mut ObservedPath) -> io::Result<Compared> {
+        if observed.path != pin.files[id].path() {
+            return Ok(Compared::DifferentPath);
+        }
+        if observed.stamp == pin.files[id].stamp() {
+            return Ok(Compared::Retained);
+        }
+        let text = self.capture(observed)?;
+        let identity = ContentIdentity::capture(text.as_deref(), self.sha256);
+        if self.equal(pin, id, &identity)? {
+            return Ok(Compared::Retained);
+        }
+        let hash = identity.hash;
+        Ok(Compared::Changed { text, hash })
+    }
+
+    fn retain_observation(&mut self, id: usize, observed: &mut ObservedPath, comparison: Compared) -> bool {
+        match comparison {
+            Compared::Retained => return true,
+            Compared::DifferentPath => {}
+            Compared::Changed { text, hash } => {
+                self.changed = Some((id, hash));
+                observed.captured = Some(text);
+            }
+        }
+        self.verified_prefix = id;
+        false
+    }
+
+    fn equal(&self, pin: &Pin, id: usize, identity: &ContentIdentity<'_>) -> io::Result<bool> {
+        if self.prior_hash(id) != Some(identity.hash) {
             return Ok(false);
         }
-        match text {
-            Some(text) => Ok(pin.source(id)? == text),
+        match identity.text {
+            Some(text) => pin.same_source(id, text),
             None => Ok(pin.files[id].bytes.is_none()),
         }
     }
-    pub(super) fn verified(&self, id: usize) -> bool {
-        self.verified.get(id).is_some_and(Option::is_some)
+    pub(super) fn predecessor(&self, unchanged: usize) -> crate::application::index::build::Predecessor<'p> {
+        crate::application::index::build::Predecessor {
+            previous: self.prior.map(|p| p as &dyn crate::application::index::build::Previous),
+            forward_known: self.checkpoint.is_some(),
+            verified_prefix: unchanged.max(self.verified_prefix),
+        }
     }
     pub(super) fn identify(
         &self,
         index: usize,
         o: &ObservedPath,
         text: Option<&str>,
-        prior: Option<usize>,
-        pin: Option<&Pin>,
+        row: crate::application::index::build::PriorRow,
     ) -> io::Result<(Option<usize>, Option<BlobId>)> {
-        let unchanged = prior.or(self.verified[index]);
-        let hash = *self.hashes[index].get_or_init(|| {
-            unchanged
-                .and_then(|id| self.prior_hash(pin?, id))
-                .unwrap_or_else(|| text.map(|t| repository::raw_blob_id(t.as_bytes(), self.sha256)))
-        });
-        if unchanged.is_some() {
-            return Ok((unchanged, hash));
+        if let Some((id, hash)) = self.changed && id == index {
+            debug_assert_eq!(row.ordinal(), Some(id));
+            return Ok((None, hash));
         }
-        if let Some(p) = pin {
-            if let Ok(id) = p.files.binary_search_by(|e| e.path().cmp(&o.path)) {
-                return Ok((self.equal(p, id, text, hash)?.then_some(id), hash));
-            }
-            if let Some(blob) = hash
-                && let Some(cp) = p.checkpoint.as_ref()
-                && cp.sha256 == self.sha256
-            {
-                let candidates = self.by_blob.get_or_init(|| {
-                    let mut map = HashMap::<BlobId, Vec<usize>>::new();
-                    for (id, row) in cp.rows.iter().enumerate() {
-                        if let Some(blob) = row.blob {
-                            map.entry(blob).or_default().push(id)
-                        }
-                    }
-                    map
-                });
-                for &id in candidates.get(&blob).into_iter().flatten() {
-                    let from = p.files[id].path();
-                    if is_markdown(from) == is_markdown(&o.path)
-                        && Language::for_path(from) == Language::for_path(&o.path)
-                        && self.equal(p, id, text, hash)?
-                    {
-                        return Ok((Some(id), hash));
-                    }
-                }
-            }
-        }
-        Ok((None, hash))
+        let unchanged = row.unchanged();
+        let hash = unchanged
+            .and_then(|id| self.prior_hash(id))
+            .unwrap_or_else(|| ContentIdentity::capture(text, self.sha256).hash);
+        let identity = ContentIdentity { text, hash };
+        let reused = match (unchanged, self.prior) {
+            (Some(id), _) => Some(id),
+            (None, Some(pin)) => self.find_previous(pin, row.ordinal(), &o.path, identity)?,
+            (None, None) => None,
+        };
+        Ok((reused, hash))
     }
-    pub(super) fn finish(
+
+    fn find_previous(
         &self,
-        root: &Path,
-        commit: Option<&str>,
-        obs: &[ObservedPath],
-        old: Option<&Pin>,
-    ) -> io::Result<Checkpoint> {
-        let mut tree = None;
-        let mut opened = false;
-        let mut changed_paths = None;
-        let old_commit = old.and_then(|p| p.indexed_commit.as_deref());
-        let mut rows = Vec::with_capacity(obs.len());
-        for (i, (o, cell)) in obs.iter().zip(&self.hashes).enumerate() {
-            let prev = old.and_then(|pin| {
-                let cp = pin.checkpoint.as_ref()?;
-                let id = if pin.files.get(i).is_some_and(|entry| entry.path() == o.path) {
-                    i
-                } else {
-                    pin.files.binary_search_by(|e| e.path().cmp(&o.path)).ok()?
-                };
-                (self.sha256 == cp.sha256).then_some(cp.rows[id])
-            });
-            let blob = match cell.get().copied() {
-                Some(blob) => blob,
-                None => {
-                    prev.ok_or_else(|| {
-                        io::Error::other(format!("missing checkpoint identity for row {i}"))
-                    })?
-                    .blob
-                }
-            };
-            let committed = if blob.is_none() || commit.is_none() {
-                false
-            } else if let Some(p) = prev
-                && p.blob == blob
-                && old_commit == commit
+        pin: &Pin,
+        same_path: Option<usize>,
+        path: &str,
+        identity: ContentIdentity<'_>,
+    ) -> io::Result<Option<usize>> {
+        if let Some(id) = same_path {
+            return Ok(self.equal(pin, id, &identity)?.then_some(id));
+        }
+        let Some((blob, text)) = identity.hash.zip(identity.text) else {
+            return Ok(None);
+        };
+        let Some(checkpoint) = self.checkpoint else { return Ok(None) };
+        let candidates = self
+            .by_blob
+            .get_or_init(|| BlobIndex::new(checkpoint))
+            .paths(blob);
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let markdown = is_markdown(path);
+        let language = Language::for_path(path);
+        for &id in candidates {
+            let from = pin.files[id].path();
+            if is_markdown(from) == markdown
+                && Language::for_path(from) == language
+                && pin.same_source(id, text)?
             {
-                p.committed
-            } else {
-                if !opened {
-                    tree = CommitTree::open(root, commit.unwrap()).ok();
-                    if let Some(previous) = old_commit.filter(|old| Some(*old) != commit)
-                        && let Some(t) = tree.as_mut()
-                    {
-                        changed_paths = t.changed_paths(previous).ok();
-                    }
-                    opened = true
-                }
-                if let Some(new_id) = changed_paths
-                    .as_ref()
-                    .and_then(|changes| changes.get(&o.path))
-                {
-                    *new_id == blob
-                } else if changed_paths.is_some()
-                    && let Some(prior) = prev
-                    && prior.blob == blob
-                {
-                    prior.committed
-                } else {
-                    tree.as_mut().and_then(|t| t.blob(&o.path).ok().flatten()) == blob
-                }
-            };
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn finish<'r>(
+        &self,
+        commit: Option<&str>,
+        files: impl ExactSizeIterator<Item = (&'r str, [u64; 7], Option<BlobId>)>,
+        paths: &crate::application::index::build::PathOrder,
+    ) -> Checkpoint {
+        let mut provenance =
+            committed::Provenance::new(self.root, commit, self.prior.and_then(|p| p.indexed_commit.as_deref()));
+        let mut rows = Vec::with_capacity(files.len());
+        for (i, (path, stamp, blob)) in files.enumerate() {
+            let prev = self.checkpoint.and_then(|cp| Some(&cp.rows[paths.previous_at(i)?]));
+            let committed = provenance.committed(path, blob, prev);
             rows.push(Row {
                 blob,
-                stamp: o.stamp,
+                stamp,
                 committed,
             });
         }
-        Ok(Checkpoint {
-            sha256: self.sha256,
-            rows,
-        })
+        Checkpoint { sha256: self.sha256, rows }
     }
 }

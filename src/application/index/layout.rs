@@ -11,6 +11,16 @@ pub(crate) const N: usize = 8;
 #[derive(Clone, Default)]
 pub struct Directory(pub [Range<u64>; N]);
 
+impl Directory {
+    pub(super) fn write_product<W: ExtentSink, T>(&mut self, sink: &mut W, kind: usize,
+        emit: impl FnOnce(&mut W) -> std::io::Result<T>) -> std::io::Result<T> {
+        let start = sink.offset();
+        let value = emit(sink)?;
+        self.0[kind - 1] = start..sink.offset();
+        Ok(value)
+    }
+}
+
 pub trait ExtentSink: Write {
     fn offset(&self) -> u64;
     /// Advance by a verified logical range of the predecessor when this sink

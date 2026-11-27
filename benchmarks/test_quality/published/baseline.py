@@ -27,6 +27,22 @@ def source_archive(source, cache):
     return zipfile.ZipFile(archive)
 
 
+def write_fixtures(source, cache, rows, repo):
+    digest = hashlib.sha256()
+    with source_archive(source, cache) as archive:
+        prefix = source["repository"].split("/")[1] + "-" + source["revision"]
+        for row in rows:
+            path = row["path"]
+            b = archive.read(f"{prefix}/{path}")
+            digest.update(path.encode() + b"\0" + hashlib.sha256(b).digest())
+            dest = repo / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b)
+    if digest.hexdigest() != source["fixture_bundle_sha256"]:
+        raise ValueError(f"fixture bytes differ from frozen bundle: {digest.hexdigest()}")
+    return digest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/cx")
@@ -44,24 +60,21 @@ def main():
         home = Path(tmp) / "home"
         repo.mkdir()
         home.mkdir()
-        digest = hashlib.sha256()
-        with source_archive(source, cache) as archive:
-            prefix = source["repository"].split("/")[1] + "-" + source["revision"]
-            for row in rows:
-                path = row["path"]
-                b = archive.read(f"{prefix}/{path}")
-                digest.update(path.encode() + b"\0" + hashlib.sha256(b).digest())
-                dest = repo / path
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(b)
-        if digest.hexdigest() != source["fixture_bundle_sha256"]:
-            raise ValueError(f"fixture bytes differ from frozen bundle: {digest.hexdigest()}")
+        digest = write_fixtures(source, cache, rows, repo)
         env = {k:v for k,v in os.environ.items() if not k.startswith("GIT_")}
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
         # Plain directory mode builds a private in-memory index and returns all files.
         flags = [] if args.candidate else ["--ignore-test-rules"]
         result = subprocess.check_output([binary, "--score", *flags, "--json"],
                                          env=env, cwd=repo)
+    report = summarize_results(result, rows, binary, digest)
+    mode = "candidate" if args.candidate else "baseline"
+    (cache / f"{mode}.observations.json").write_bytes(result)
+    (cache / f"{mode}.json").write_text(json.dumps(report, indent=2)+"\n")
+    print(json.dumps(report, indent=2))
+
+
+def summarize_results(result, rows, binary, digest):
     files = {f["path"]: f for f in json.loads(result)["files"]}
     if set(files) != {r["path"] for r in rows}:
         raise ValueError("scored paths differ from expected paths")
@@ -70,15 +83,11 @@ def main():
     for f in files.values():
         findings.update(hit["rule"] for hit in f["findings"])
         any_finding += bool(f["findings"])
-    report = dict(dataset=AROMA, files_scored=len(files), files_with_findings=any_finding,
+    return dict(dataset=AROMA, files_scored=len(files), files_with_findings=any_finding,
                   files_without_findings=len(files)-any_finding, findings_by_rule=dict(sorted(findings.items())),
                   published_file_rule_decisions=sum(len(row["labels"]) for row in rows),
                   directly_equivalent_published_rules=[], binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   fixture_bundle_sha256=digest.hexdigest())
-    mode = "candidate" if args.candidate else "baseline"
-    (cache / f"{mode}.observations.json").write_bytes(result)
-    (cache / f"{mode}.json").write_text(json.dumps(report, indent=2)+"\n")
-    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

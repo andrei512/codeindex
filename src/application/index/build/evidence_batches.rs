@@ -1,6 +1,6 @@
-use super::{Local, Source, Unit, retained};
+use super::{Source, Unit, retained::{Evidence, EvidenceRows}};
 use crate::{
-    application::index::{Entry, layout::ExtentSink},
+    application::index::layout::ExtentSink,
     domain::code::{BoundedOutput, Language},
 };
 use std::{io, ops::Range, thread::ScopedJoinHandle};
@@ -12,24 +12,28 @@ pub(super) fn plan(
     workers: usize,
     available: usize,
 ) -> Option<(Vec<Range<usize>>, usize)> {
-    let weight = |u: &Unit| {
-        if Language::for_path(u.path).is_some() {
-            u.text.len()
-        } else {
-            0
-        }
-    };
-    let size = units
-        .iter()
-        .map(weight)
-        .try_fold(0usize, usize::checked_add)?;
+    let size = units.iter().map(weight).try_fold(0usize, usize::checked_add)?;
     let workers = workers.min(4).min(size.div_ceil(2 << 20));
-    let budget = available
-        .min(32 << 20)
+    let budget = available.min(32 << 20)
         .checked_sub(units.len().checked_mul(size_of::<u64>())?)?;
-    if workers < 2 || budget < 4 << 20 || size > budget.saturating_mul(2) {
+    if !parallel_worthwhile(workers, budget, size) {
         return None;
     }
+    let ranges = divide(units, workers, size);
+    let capacity = budget / ranges.len();
+    Some((ranges, capacity))
+}
+
+fn weight(unit: &Unit<'_>) -> usize {
+    if Language::for_path(unit.path).is_some() { unit.text.len() } else { 0 }
+}
+
+fn parallel_worthwhile(workers: usize, budget: usize, size: usize) -> bool {
+    let minimum = workers >= 2 && budget >= 4 << 20;
+    minimum && size <= budget.saturating_mul(2)
+}
+
+fn divide(units: &[Unit<'_>], workers: usize, size: usize) -> Vec<Range<usize>> {
     let target = size.div_ceil(workers);
     let mut ranges = Vec::with_capacity(workers);
     let (mut start, mut accumulated) = (0, 0);
@@ -44,8 +48,7 @@ pub(super) fn plan(
     if start < units.len() {
         ranges.push(start..units.len());
     }
-    let capacity = budget / ranges.len();
-    Some((ranges, capacity))
+    ranges
 }
 
 #[derive(Default)]
@@ -53,6 +56,17 @@ pub(super) struct Batch {
     bytes: Vec<u8>,
     offsets: Vec<u64>,
 }
+impl Batch {
+    fn write(&self, sink: &mut impl ExtentSink, offsets: &mut Vec<u64>) -> io::Result<()> {
+        let base = sink.offset();
+        for relative in &self.offsets {
+            offsets.push(base.checked_add(*relative)
+                .ok_or_else(|| io::Error::other("evidence offset overflow"))?);
+        }
+        sink.write_all(&self.bytes)
+    }
+}
+
 pub(super) fn encode(units: &[Unit<'_>], sources: &[Option<Source>], capacity: usize) -> Batch {
     let Some(mut buffer) = BoundedOutput::new(capacity) else {
         return Batch::default();
@@ -63,8 +77,8 @@ pub(super) fn encode(units: &[Unit<'_>], sources: &[Option<Source>], capacity: u
     }
     for (unit, source) in units.iter().zip(sources) {
         let row_start = buffer.data.len();
-        if source.is_some() && (Language::for_path(unit.path).is_some() || super::c_project::database(unit.path)) {
-            unit.analysis.encode_bounded(&mut buffer);
+        if let Evidence::Encoded(code) = Evidence::classify(unit.path, source.is_some(), unit.analysis, None) {
+            code.encode_bounded(&mut buffer);
             if buffer.overflowed {
                 buffer.data.truncate(row_start);
                 break;
@@ -81,40 +95,19 @@ pub(super) fn encode(units: &[Unit<'_>], sources: &[Option<Source>], capacity: u
 pub(super) fn write(
     sink: &mut impl ExtentSink,
     batches: Vec<(Range<usize>, ScopedJoinHandle<'_, Batch>)>,
-    locals: &[Local],
-    files: &[Entry],
-    reuse: &[Option<usize>],
+    rows: EvidenceRows<'_>,
 ) -> io::Result<Vec<u64>> {
-    let mut offsets = Vec::new();
-    let count = files
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("evidence table too large"))?;
-    offsets.try_reserve_exact(count).map_err(io::Error::other)?;
+    let mut offsets = rows.offsets()?;
     for (mut range, handle) in batches {
         let batch = handle
             .join()
             .map_err(|_| io::Error::other("evidence worker failed"))?;
-        let base = sink.offset();
-        for relative in &batch.offsets {
-            offsets.push(
-                base.checked_add(*relative)
-                    .ok_or_else(|| io::Error::other("evidence offset overflow"))?,
-            );
-        }
-        sink.write_all(&batch.bytes)?;
+        batch.write(sink, &mut offsets)?;
         // Every completed offset corresponds to a row from this range.
         range.start += batch.offsets.len();
         drop(batch);
         if !range.is_empty() {
-            retained::append_evidence(
-                sink,
-                None,
-                &reuse[range.clone()],
-                &locals[range.clone()],
-                &files[range],
-                &mut offsets,
-            )?;
+            rows.slice(range).append(sink, &mut offsets)?;
         }
     }
     offsets.push(sink.offset());
@@ -123,7 +116,7 @@ pub(super) fn write(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Observation, analyze, tests::MemorySink};
+    use super::super::{Entry, Observation, analyze, tests::MemorySink};
     use super::*;
 
     #[test]
@@ -142,6 +135,7 @@ mod tests {
         let files: Vec<_> = specs
             .iter()
             .map(|(path, s)| Entry {
+                score_marker: false,
                 score: None,
             test_score: None,
                 blob: None,
@@ -168,7 +162,8 @@ mod tests {
             .collect();
         let old = vec![None; files.len()];
         let mut serial = MemorySink(vec![12; 13]);
-        let offsets = retained::evidence(&mut serial, None, &old, &locals, &files).unwrap();
+        let evidence = || EvidenceRows { prior: None, reuse: &old, locals: &locals, files: &files };
+        let offsets = evidence().write(&mut serial).unwrap();
         // Try every cutoff, including one inside the first/middle/final row.
         // A zero-length row remains complete even at the exact capacity boundary.
         for capacity in 0..=serial.0.len() - 13 {
@@ -186,9 +181,7 @@ mod tests {
                 let actual = write(
                     &mut result,
                     vec![(0..4, first), (4..5, second)],
-                    &locals,
-                    &files,
-                    &old,
+                    evidence(),
                 )
                 .unwrap();
                 assert_eq!(offsets, actual);

@@ -1,226 +1,210 @@
+mod roles;
+pub(super) use roles::{Request as RoleRequest, query as roles};
+mod file;
 use super::{
-    Outcome, Pin,
+    Outcome, Pin, ScoreOptions,
     json::{array, object, quote},
     relationships,
 };
-use crate::domain::code::score::Score;
+use crate::domain::code::Language;
+use crate::domain::code::score::{
+    Rule, Score,
+    policy::{FilePolicy, Project, directives::Directives},
+};
 use std::{fmt::Write, io, path::Path};
 
-pub(super) fn query(
-    pin: &Pin,
-    cwd: &Path,
-    path: Option<&str>,
-    json: bool,
-    test_rules: bool,
-    outcome: &mut Outcome,
-) -> io::Result<String> {
-    let scope = path
-        .map(|p| relationships::relative(&pin.root, cwd, p))
-        .transpose()?
-        .unwrap_or_default();
-    let mut included = 0;
-    let mut supported = 0;
-    let mut loc = 0;
-    let mut weighted = 0.;
-    let mut worst = Vec::new();
-    let mut rows = Vec::new();
-    let first = pin.files.partition_point(|f| f.path() < scope.as_str());
-    for f in pin.files[first..]
-        .iter()
-        .take_while(|f| f.path().starts_with(&scope))
-    {
-        if !Path::new(f.path()).starts_with(&scope) {
-            continue;
-        }
-        included += 1;
-        let single = f.path() == scope && !json;
-        let score = if test_rules {
-            f.test_score.as_deref()
-        } else {
-            None
-        }
-        .or(f.score.as_deref())
-        .filter(|s| s.lines > 0);
-        let value = score.map(Score::value);
-        if json {
-            rows.push(object(&[
-                ("path", quote(f.path())),
-                (
-                    "score",
-                    value.map_or_else(|| "null".into(), |v| v.to_string()),
-                ),
-                ("lines", score.map_or(0, |s| s.lines).to_string()),
-                (
-                    "findings",
-                    array(score.into_iter().flat_map(|s| s.findings.iter()).map(|f| {
-                        object(&[
-                            ("rule", quote(f.rule.label())),
-                            ("line", f.line.to_string()),
-                            ("unit", quote(&f.unit)),
-                            ("value", f.value.to_string()),
-                            ("threshold", f.rule.threshold().to_string()),
-                        ])
-                    })),
-                ),
-            ]));
-        }
-        if let (Some(s), Some(value)) = (score, value) {
-            if single {
-                let mut output = format!("{}: {:.2}/10 ({} lines)", f.path(), value, s.lines);
-                findings(&mut output, f.path(), s);
-                return Ok(output);
-            }
-            supported += 1;
-            loc += s.lines;
-            weighted += value * s.lines as f64;
-            if !json && !s.findings.is_empty() {
-                worst.push((value, f.path(), s.findings.len()));
-            }
-        } else if single {
-            if f.score.is_some() {
-                return Ok(format!("{}: unscored (empty)", f.path()));
-            }
-            return Ok(format!(
-                "{}: unscored (no language profile or non-text)",
-                f.path()
-            ));
-        }
-    }
-    if json {
-        if included == 0 {
-            outcome.code = 1;
-        }
-        return Ok(object(&[
-            (
-                "score",
-                if loc == 0 {
-                    "null".into()
-                } else {
-                    (weighted / loc as f64).to_string()
-                },
-            ),
-            ("scored_files", supported.to_string()),
-            ("indexed_files", included.to_string()),
-            ("lines", loc.to_string()),
-            ("files", array(rows)),
-        ]));
-    }
-    if included == 0 {
-        outcome.code = 1;
-        return Ok("No indexed files in scope".into());
-    }
-    if loc == 0 {
-        return Ok(format!(
-            "Unscored: 0/{included} indexed files have scorable lines"
-        ));
-    }
-    worst.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
-    let mut output = format!(
-        "{:.2}/10 | {supported}/{included} indexed files scored | {loc} lines",
-        weighted / loc as f64
-    );
-    for (value, path, count) in worst.into_iter().take(10) {
-        write!(output, "\n{path}: {value:.2}/10 ({} findings)", count).unwrap();
-    }
-    Ok(output)
+pub(super) struct Request<'a> {
+    pub path: Option<&'a str>,
+    pub options: ScoreOptions,
 }
-fn findings(output: &mut String, path: &str, score: &Score) {
-    for f in &score.findings {
-        write!(
-            output,
-            "\n{path}:{}: {} | {} {} (threshold {})",
-            f.line,
-            f.unit.escape_default(),
-            f.rule.label(),
-            f.value,
-            f.rule.threshold()
-        )
-        .unwrap();
+
+pub(super) fn query(pin: &Pin, cwd: &Path, request: Request<'_>, outcome: &mut Outcome) -> io::Result<String> {
+    let scope = query_scope(&pin.root, cwd, request.path)?;
+    let project = read_policy(&pin.root, request.options.project_policy)?;
+    Report { scope: &scope, options: request.options, project: &project }
+        .write(pin, scoped_files(pin, &scope), outcome)
+}
+
+pub(super) fn plain(cwd: &Path, path: Option<&str>, options: ScoreOptions, outcome: &mut Outcome) -> io::Result<String> {
+    use crate::application::index::build::MemoryQuery;
+    let scope = query_scope(cwd, cwd, path)?;
+    let policy = read_policy(cwd, options.project_policy)?;
+    let needs = MemoryQuery::Score { scope: &scope, test_rules: options.test_rules, inline: options.project_policy, policy: &policy };
+    let pin = Pin::memory(cwd, needs)?;
+    Report { scope: &scope, options, project: &policy }.write(&pin, 0..pin.files.len(), outcome)
+}
+
+fn query_scope(root: &Path, cwd: &Path, path: Option<&str>) -> io::Result<String> {
+    Ok(path
+        .map(|p| relationships::relative(root, cwd, p))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn scoped_files(pin: &Pin, scope: &str) -> std::ops::Range<usize> {
+    crate::application::index::scope_range(&pin.files, scope, crate::application::index::Entry::path)
+}
+
+#[derive(Default)]
+struct Totals {
+    indexed: usize,
+    scored: usize,
+    lines: usize,
+    weighted: f64,
+    excluded_files: usize,
+    excluded_lines: usize,
+}
+
+impl Totals {
+    fn add(&mut self, file: &file::FileScore<'_>) {
+        self.indexed += 1;
+        self.excluded_lines += file.excluded_lines;
+        self.excluded_files += usize::from(file.excluded_file);
+        if let Some(value) = file.value {
+            self.scored += 1;
+            self.lines += file.lines();
+            self.weighted += value * file.lines() as f64;
+        }
+    }
+
+    fn average(&self) -> Option<f64> {
+        (self.lines != 0).then(|| self.weighted / self.lines as f64)
+    }
+
+    fn finish_json(&self, mut rows: String) -> String {
+        let value = self
+            .average()
+            .map_or_else(|| "null".into(), |v| v.to_string());
+        let header = format!(
+            r#"{{"score":{value},"scored_files":{},"indexed_files":{},"lines":{},"files":["#,
+            self.scored, self.indexed, self.lines
+        );
+        rows.insert_str(0, &header);
+        rows.push(']');
+        if self.excluded_files > 0 || self.excluded_lines > 0 {
+            write!(
+                rows,
+                r#","excluded_files":{},"excluded_lines":{}"#,
+                self.excluded_files, self.excluded_lines
+            )
+            .unwrap();
+        }
+        rows.push('}');
+        rows
+    }
+
+    fn summary(&self) -> String {
+        let mut output = match self.average() {
+            Some(value) => format!(
+                "{value:.2}/10 | {}/{} indexed files scored | {} lines",
+                self.scored, self.indexed, self.lines
+            ),
+            None => format!(
+                "Unscored: 0/{} indexed files have scorable lines",
+                self.indexed
+            ),
+        };
+        if self.excluded_files > 0 || self.excluded_lines > 0 {
+            write!(
+                output,
+                " | {} files excluded ({} lines)",
+                self.excluded_files, self.excluded_lines
+            )
+            .unwrap();
+        }
+        output
     }
 }
 
-pub(super) fn roles(
-    pin: &Pin,
-    cwd: &Path,
-    path: Option<&str>,
-    json: bool,
-    outcome: &mut Outcome,
-) -> io::Result<String> {
-    use crate::domain::code::roles::{Context, classify_with, needs_source};
-    let mut context = Context::new(pin.files.iter().map(|f| f.path()));
-    let scope = path
-        .map(|p| relationships::relative(&pin.root, cwd, p))
-        .transpose()?
-        .unwrap_or_default();
-    let mut rows = Vec::new();
-    let mut window = pin.source_window();
-    let first = pin.files.partition_point(|f| f.path() < scope.as_str());
-    for (i, f) in pin
-        .files
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take_while(|(_, f)| f.path().starts_with(&scope))
-    {
-        if !Path::new(f.path()).starts_with(&scope) || f.bytes.is_none() {
-            continue;
-        }
-        let text = if needs_source(f.path()) {
-            window.get(i)?
-        } else {
-            ""
-        };
-        let roles = classify_with(f.path(), text, &mut context, |header| {
-            let Some(header) = header.to_str() else {
-                return Ok(None);
-            };
-            match pin.files.binary_search_by(|f| f.path().cmp(header)) {
-                Ok(id) if pin.files[id].bytes.is_some() => pin.source(id).map(Some),
-                _ => Ok(None),
+// Equal scores keep catalog order, so truncation always retains the earliest paths.
+#[derive(Default)]
+struct WorstFiles<'a>(Vec<(f64, &'a str, usize)>);
+
+impl<'a> WorstFiles<'a> {
+    fn consider(&mut self, path: &'a str, file: &file::FileScore<'_>) {
+        const LIMIT: usize = 10;
+        let Some(value) = file.value else { return };
+        let count = file.findings().len();
+        if count == 0 { return; }
+        let position = self.0.partition_point(|row| row.0 <= value);
+        if position == LIMIT { return; }
+        if self.0.len() == LIMIT { self.0.pop(); }
+        self.0.insert(position, (value, path, count));
+    }
+}
+
+struct Report<'a> {
+    scope: &'a str,
+    options: ScoreOptions,
+    project: &'a Project,
+}
+
+enum Rows<'a> {
+    Json(String),
+    Text(WorstFiles<'a>),
+}
+
+impl<'a> Rows<'a> {
+    fn add(&mut self, count: usize, path: &'a str, file: &file::FileScore<'_>) {
+        match self {
+            Self::Json(rows) => {
+                if count > 1 {
+                    rows.push(',');
+                }
+                file.write_json(rows);
             }
-        })?;
-        if json {
-            rows.push(object(&[
-                ("path", quote(f.path())),
-                ("default_role", quote(roles.base.0.label())),
-                ("reason", quote(roles.base.1)),
-                (
-                    "regions",
-                    array(roles.regions.iter().map(|r| {
-                        object(&[
-                            ("start_line", r.first.to_string()),
-                            ("end_line", r.last.to_string()),
-                            ("start_byte", r.start.to_string()),
-                            ("end_byte", r.end.to_string()),
-                            ("role", quote(r.evidence.0.label())),
-                            ("reason", quote(r.evidence.1)),
-                        ])
-                    })),
-                ),
-            ]));
-        } else {
-            let mut row = format!("{}: {} ({})", f.path(), roles.base.0.label(), roles.base.1);
-            for r in roles.regions {
-                write!(
-                    row,
-                    "\n{}:{}-{}: {} ({})",
-                    f.path(),
-                    r.first,
-                    r.last,
-                    r.evidence.0.label(),
-                    r.evidence.1
-                )
-                .unwrap();
-            }
-            rows.push(row);
+            Self::Text(worst) => worst.consider(path, file),
         }
     }
-    if rows.is_empty() {
-        outcome.code = 1;
+
+    fn finish(self, totals: Totals) -> String {
+        match self {
+            Self::Json(rows) => totals.finish_json(rows),
+            Self::Text(_) if totals.indexed == 0 => "No indexed files in scope".into(),
+            Self::Text(worst) => worst.summary(totals),
+        }
     }
-    Ok(if json {
-        object(&[("files", array(rows))])
-    } else {
-        rows.join("\n")
-    })
+}
+
+impl Report<'_> {
+    fn write(self, pin: &Pin, files: std::ops::Range<usize>, outcome: &mut Outcome) -> io::Result<String> {
+        let mut totals = Totals::default();
+        let mut rows = if self.options.json { Rows::Json(String::new()) } else { Rows::Text(WorstFiles::default()) };
+        let mut scratch = crate::domain::pattern::Scratch::default();
+        for id in files {
+            let path = pin.files[id].path();
+            let policy = self.project.resolve_with(path, &mut scratch);
+            let file = file::FileScore::read(pin, id, policy, self.options)?;
+            if path == self.scope && !self.options.json {
+                return Ok(file.display());
+            }
+            totals.add(&file);
+            rows.add(totals.indexed, path, &file);
+        }
+        if totals.indexed == 0 {
+            outcome.code = 1;
+        }
+        Ok(rows.finish(totals))
+    }
+}
+
+impl WorstFiles<'_> {
+    fn summary(self, totals: Totals) -> String {
+        let mut output = totals.summary();
+        for (value, path, count) in self.0 {
+            write!(output, "\n{path}: {value:.2}/10 ({count} findings)").unwrap();
+        }
+        output
+    }
+}
+
+pub(super) fn read_policy(root: &Path, enabled: bool) -> io::Result<Project> {
+    if !enabled {
+        return Ok(Project::default());
+    }
+    match std::fs::read_to_string(root.join(".cxconfig")) {
+        Ok(text) => Project::parse(&text).map_err(io::Error::other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Project::default()),
+        Err(error) => Err(io::Error::new(error.kind(), format!(".cxconfig: {error}"))),
+    }
 }

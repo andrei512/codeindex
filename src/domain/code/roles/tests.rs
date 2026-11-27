@@ -79,9 +79,7 @@ fn rust_module_attributes_are_nested_and_exclude_strings_and_comments() {
     }
 }
 
-#[test]
-fn registrations_overrides_and_lookalikes() {
-    let cases = [
+const REGISTRATION_CASES: &[(&str, &str, &str, Role)] = &[
         (
             "pkg/thing_test.go",
             "func TestRead(t *testing.T) { exercise() }",
@@ -186,7 +184,10 @@ fn registrations_overrides_and_lookalikes() {
             Production,
         ),
     ];
-    for (path, src, probe, want) in cases {
+
+#[test]
+fn registrations_overrides_and_lookalikes() {
+    for &(path, src, probe, want) in REGISTRATION_CASES {
         assert_eq!(at(path, src, probe), want, "{path} {probe}");
     }
 }
@@ -220,6 +221,11 @@ fn headers_supply_wrappers_and_their_bytes_are_shared() {
         assert_eq!(result.regions.len(), 1);
         assert_eq!(result.regions[0].evidence.0, Test);
     }
+    let stringize = "#define SPELL(include) #include \"api.h\"\nWRAPPED_CASE(ok) { run(); }";
+    let result = classify_with("src/plain.c", stringize, &mut headers, |_| {
+        panic!("a stringized macro parameter is not an include directive")
+    }).unwrap();
+    assert!(result.regions.is_empty());
     assert_eq!(reads, 1);
 }
 
@@ -241,6 +247,13 @@ fn fixture_paths_install_sources_and_script_discovery() {
         assert_eq!(roles.base.0, expected);
     }
     assert_eq!(reads, 1);
+    let mut quoted = Context::new(["install.sh"].into_iter());
+    for (path, expected) in [("lib/has space/test_*.sh", Production), ("lib/has space/test_other.sh", Support)] {
+        let roles = classify_with(path, "helper() { :; }", &mut quoted, |_| {
+            Ok(Some("cp 'lib/has space/test_*.sh' /dst\n".into()))
+        }).unwrap();
+        assert_eq!(roles.base.0, expected);
+    }
     assert_eq!(at("fixtures/web/Procfile", "web: app", "app"), Support);
     assert_eq!(
         at("hack/docs.Dockerfile", "FROM alpine", "alpine"),
@@ -273,4 +286,21 @@ fn fixture_paths_install_sources_and_script_discovery() {
     assert_eq!(at("web/index.html", src, "ordinary"), Production);
     let fake = "<!-- <script src='testharness.js'></script> --><script>async_test(() => verify());</script>";
     assert_eq!(at("web/index.html", fake, "verify"), Production);
+}
+
+#[test]
+fn harness_calls_follow_the_javascript_binding() {
+    let page = concat!(
+        "<script src='/resources/testharness.js'></script><script>",
+        "function inner(promise_test) { promise_test(fake); } test(real);</script>",
+    );
+    assert_eq!(at("page.html", page, "fake"), Production);
+    assert_eq!(at("page.html", page, "real"), Test);
+}
+
+#[test]
+fn make_recipe_runner_uses_shell_words() {
+    let src = "build:\n\t@cargo build\ncheck:\n\t@FLAGS='a b' cargo \"test\"\n";
+    assert_eq!(at("Makefile", src, "FLAGS"), Support);
+    assert_ne!(at("Makefile", src, "cargo build"), Support);
 }

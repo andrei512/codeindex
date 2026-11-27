@@ -2,13 +2,14 @@
 
 import csv
 import hashlib
-import io
 import json
 from pathlib import Path
-import tarfile
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
-import zipfile
+
+from score_repository_sources import (
+    DEV, TEST, ZIP_IDS, EXTENSIONS, icsme_repository, java_archive_member, scored_repository,
+)
 
 FORGE = "codescene-research/ai-friendliness-forge-2026/c7e7afd437cfaecb282b9e7c366ed1dbae06ca2d"
 SCAM = "codescene-research/test-generation-scam-2026/7baf08bc1b458047fd01fb06336fabc50c36ec20"
@@ -16,53 +17,7 @@ ICSME = "codescene-research/maintainability-benchmarking-icsme-2024/0fb79230f1d9
 RW = "repowise-dev/repowise-bench/0fb3c03aab35fb67dc72540fd6a70e2c2c599878"
 RAW = "https://raw.githubusercontent.com/"
 REPOS = json.loads(Path(__file__).with_name("score_repositories.json").read_text())
-ZIP_IDS = {
-    "aoi": 24262451,
-    "argouml": 24262454,
-    "diarymanagement": 24262457,
-    "jsweet": 24262460,
-    "junit4": 24262463,
-}
 MODELS = "claude gemma glm gpt granite qwen3 sonnet".split()
-EXTENSIONS = {
-    ".proto": "Protobuf",
-    ".sh": "Shell",
-    ".json": "JSON",
-    ".yaml": "YAML",
-    ".yml": "YAML",
-    ".md": "Markdown",
-    ".sql": "SQL",
-    ".tf": "Terraform",
-    ".toml": "TOML",
-    ".hcl": "HCL",
-    "": "No extension",
-    ".c": "C",
-    ".php": "PHP",
-    ".rs": "Rust",
-    ".go": "Go",
-    ".cs": "C#",
-    ".js": "JavaScript",
-    ".ts": "TypeScript",
-    ".cjs": "JavaScript",
-    ".kts": "Kotlin",
-    ".kt": "Kotlin",
-    ".java": "Java",
-    ".py": "Python",
-    ".cc": "C++",
-    ".h": "C++",
-}
-TEST = {
-    "rich",
-    "axios",
-    "zod",
-    "bat",
-    "fiber",
-    "mockito",
-    "coroutines",
-    "spdlog",
-    "npgsql",
-}
-DEV = {"cockroach", "fd", "chi", "litestar", "argouml", "jsweet"}
 
 
 def collect(cache):
@@ -111,99 +66,40 @@ def collect(cache):
         return dict(pool.map(fetch, urls.items()))
 
 
-def rows(paths):
-    def jsonlines(key):
-        with paths[key].open() as f:
-            for line in f:
-                yield json.loads(line)
+def json_rows(path):
+    with path.open() as stream:
+        yield from map(json.loads, stream)
 
+
+def original_rows(path, origin, language, extension):
+    for index, row in enumerate(json_rows(path)):
+        yield (
+            origin, row["name"], f"{index}.{extension}", language, row["task"].encode(),
+            row.get("score", row.get("task-score")), row.get("smells"),
+        )
+
+
+def model_rows(path, model):
+    for index, row in enumerate(json_rows(path)):
+        score, source = row.get("ref-score"), row.get("ref-task")
+        if not isinstance(score, (int, float)) or not 1 <= score <= 10:
+            continue
+        if isinstance(source, str) and source.strip():
+            yield model, row["name"], f"{index}.py", "Python", source.encode(), score, None
+
+
+def rows(paths):
     for key, lang, ext in [
         ("original", "Python", "py"),
         ("java", "Java", "java"),
         ("cpp", "C++", "cpp"),
     ]:
-        for i, r in enumerate(jsonlines(key)):
-            yield (
-                key,
-                r["name"],
-                f"{i}.{ext}",
-                lang,
-                r["task"].encode(),
-                r.get("score", r.get("task-score")),
-                r.get("smells"),
-            )
+        yield from original_rows(paths[key], key, lang, ext)
     for model in MODELS:
-        for i, r in enumerate(jsonlines(model)):
-            score, source = r.get("ref-score"), r.get("ref-task")
-            if (
-                isinstance(score, (int, float))
-                and 1 <= score <= 10
-                and isinstance(source, str)
-                and source.strip()
-            ):
-                yield (
-                    model,
-                    r["name"],
-                    f"{i}.py",
-                    "Python",
-                    source.encode(),
-                    score,
-                    None,
-                )
+        yield from model_rows(paths[model], model)
     for repo in REPOS:
-        scores = json.loads(paths[repo + "-scores"].read_bytes())
-        seen = set()
-        with tarfile.open(paths[repo], mode="r|gz") as archive:
-            for item in archive:
-                name = item.name.partition("/")[2]
-                if name in scores and item.isfile():
-                    yield (
-                        repo,
-                        repo,
-                        name,
-                        EXTENSIONS[Path(name).suffix],
-                        archive.extractfile(item).read(),
-                        scores[name],
-                        None,
-                    )
-                    seen.add(name)
-        missing = [
-            name
-            for name, score in scores.items()
-            if score is not None and name not in seen
-        ]
-        if missing:
-            raise ValueError(f"{repo}: missing scored sources {missing[:5]}")
+        yield from scored_repository(paths, repo)
     with paths["icsme"].open(encoding="utf-8-sig") as f:
         labels = list(csv.DictReader(f, delimiter=";"))
     for repo in ZIP_IDS:
-        with zipfile.ZipFile(paths[repo]) as archive:
-            names = [
-                s
-                for s in archive.namelist()
-                if s.endswith(".java") and not s.startswith("__MACOSX")
-            ]
-            for row in labels:
-                if row["projectname"].lower() != repo:
-                    continue
-                name = row["path"].replace("\\", "/")
-                suffix = name.lower().split("sourcefiles/", 1)[-1]
-                matches = [
-                    s
-                    for s in names
-                    if s.lower().endswith("/" + suffix) or s.lower() == suffix
-                ]
-                if not matches:
-                    suffix = row["packageandclass"].replace(".", "/").lower() + ".java"
-                    matches = [s for s in names if s.lower().endswith("/" + suffix)]
-                if len(matches) != 1:
-                    raise ValueError(f"Cannot match {name}: {matches}")
-                yield (
-                    repo,
-                    repo,
-                    name,
-                    "Java",
-                    archive.read(matches[0]),
-                    float(row["Code_Health"]),
-                    None,
-                )
+        yield from icsme_repository(paths, repo, labels)

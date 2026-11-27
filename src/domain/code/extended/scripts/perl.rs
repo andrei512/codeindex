@@ -1,113 +1,226 @@
 use super::{Analysis, Token, before, call, colon_name, declare, word};
-use std::collections::{HashMap, HashSet};
+use crate::domain::code::record_unique;
+use std::collections::HashMap;
+
+enum Body<'a> {
+    Package(&'a str),
+    Sub(usize),
+}
+
+fn qualified<'a>(written: &'a str, package: &'a str, name: &'a str) -> (&'a str, &'a str) {
+    written.rsplit_once("::").unwrap_or((package, name))
+}
+
+/// A lexical sub shadows package lookup even when its target is ambiguous.
+#[derive(Default)]
+struct Subs<'a> {
+    lexical: HashMap<&'a str, Option<(usize, usize)>>,
+    packages: HashMap<(&'a str, &'a str), Option<usize>>,
+}
+
+impl<'a> Subs<'a> {
+    fn hide(&mut self, name: &'a str, target: Option<(usize, usize)>) {
+        self.lexical
+            .entry(name)
+            .and_modify(|slot| *slot = None)
+            .or_insert(target);
+    }
+
+    fn target(&self, at: usize, pkg: &str, name: &str, qualified: bool) -> Option<usize> {
+        match (qualified, self.lexical.get(name)) {
+            (false, Some(slot)) => slot.and_then(|(n, id)| (at > n).then_some(id)),
+            _ => self.packages.get(&(pkg, name)).copied().flatten(),
+        }
+    }
+}
+
+struct Scopes<'a> {
+    owner: Option<usize>,
+    package: &'a str,
+    blocks: Vec<(Option<usize>, &'a str)>,
+    bodies: HashMap<usize, Body<'a>>,
+}
+
+impl<'a> Scopes<'a> {
+    fn new() -> Self {
+        Self {
+            owner: None,
+            package: "main",
+            blocks: Vec::new(),
+            bodies: HashMap::new(),
+        }
+    }
+    fn brace(&mut self, word: &str, at: usize) -> bool {
+        match word {
+            "{" => {
+                self.blocks.push((self.owner, self.package));
+                match self.bodies.remove(&at) {
+                    Some(Body::Sub(id)) => self.owner = Some(id),
+                    Some(Body::Package(name)) => self.package = name,
+                    None => {}
+                }
+            }
+            "}" => self.close(),
+            _ => return false,
+        }
+        true
+    }
+    fn close(&mut self) {
+        if let Some(frame) = self.blocks.pop() {
+            (self.owner, self.package) = frame;
+        }
+    }
+
+    fn declare_package(&mut self, name: WrittenName<'a>, out: &mut Analysis) {
+        declare(out, name.span, "package_declaration");
+        if name.next == "{" {
+            self.bodies.insert(name.last + 1, Body::Package(name.full));
+        } else {
+            self.package = name.full;
+        }
+    }
+
+    fn declare_sub(
+        &mut self,
+        tokens: &[Token<'a>],
+        (keyword, name): (usize, WrittenName<'a>),
+        subs: &mut Subs<'a>,
+        out: &mut Analysis,
+    ) {
+        let kind = if name.next == ";" {
+            "function_declaration"
+        } else {
+            "function_definition"
+        };
+        let id = declare(out, name.bare.span(), kind);
+        let body = super::after_parameters(tokens, name.last + 1);
+        if word(tokens, body) != "{" {
+            return;
+        }
+        self.bodies.insert(body, Body::Sub(id));
+        if matches!(before(tokens, keyword), "my" | "state") {
+            let target =
+                (self.blocks.is_empty() && name.last == keyword + 1).then_some((name.last, id));
+            subs.hide(name.bare.text, target);
+        } else {
+            let qualified = qualified(name.full, self.package, name.bare.text);
+            record_unique(&mut subs.packages, qualified, id);
+        }
+    }
+}
+
+struct WrittenName<'a> {
+    last: usize,
+    span: std::ops::Range<usize>,
+    full: &'a str,
+    bare: Token<'a>,
+    next: &'a str,
+}
+
+impl<'a> WrittenName<'a> {
+    fn read(source: &'a str, tokens: &[Token<'a>], start: usize) -> Option<Self> {
+        let last = colon_name(tokens, start)?;
+        let bare = tokens[last];
+        let span = tokens[start].at..bare.span().end;
+        Some(Self {
+            last,
+            full: &source[span.clone()],
+            span,
+            bare,
+            next: word(tokens, last + 1),
+        })
+    }
+}
+
+enum Event<'a> {
+    Package(WrittenName<'a>),
+    Sub(WrittenName<'a>),
+    Call(WrittenName<'a>),
+}
+
+impl<'a> Event<'a> {
+    fn read(source: &'a str, tokens: &[Token<'a>], i: usize) -> Option<Self> {
+        let prev = before(tokens, i);
+        let token = tokens[i];
+        if !token.name() || matches!(prev, ">" | ":" | "$" | "@" | "%") {
+            return None;
+        }
+        if prev != "&" {
+            match token.text {
+                "package" => return WrittenName::read(source, tokens, i + 1).map(Self::Package),
+                "sub" => return WrittenName::read(source, tokens, i + 1).map(Self::Sub),
+                _ => {}
+            }
+        }
+        Self::read_call(source, tokens, i, prev)
+    }
+
+    fn read_call(source: &'a str, tokens: &[Token<'a>], i: usize, previous: &str) -> Option<Self> {
+        if matches!(previous, "sub" | "package") {
+            return None;
+        }
+        WrittenName::read(source, tokens, i)
+            .filter(|name| name.next == "(")
+            .map(Self::Call)
+    }
+}
 
 pub(super) fn analyze<'a>(source: &'a str, t: &[Token<'a>]) -> Analysis {
-    let mut out = Analysis::default();
-    let mut blocks = Vec::new();
-    let mut owner = None;
-    let mut package = "main";
-    let mut bodies = HashMap::new();
-    let mut package_bodies = HashMap::new();
-    let mut lexical = HashMap::new();
-    let mut lexical_names = HashSet::new();
-    let mut subs = HashMap::new();
-    let mut pending = Vec::new();
-    for (i, kw) in t.iter().enumerate() {
-        match kw.text {
-            "{" => {
-                blocks.push((owner, package));
-                if let Some(&id) = bodies.get(&i) {
-                    owner = Some(id);
-                }
-                if let Some(&pkg) = package_bodies.get(&i) {
-                    package = pkg;
-                }
-                continue;
-            }
-            "}" => {
-                if let Some(frame) = blocks.pop() {
-                    (owner, package) = frame;
-                }
-                continue;
-            }
-            _ => {}
-        }
-        let prev = before(t, i);
-        if !kw.name() || matches!(prev, ">" | ":" | "$" | "@" | "%") {
-            continue;
-        }
-        if matches!(kw.text, "package" | "sub") && prev != "&" {
-            let Some(n) = colon_name(t, i + 1) else {
-                continue;
-            };
-            let full = t[i + 1].at..t[n].span().end;
-            if kw.text == "package" {
-                let name = &source[full.clone()];
-                declare(&mut out, full, "package_declaration");
-                if word(t, n + 1) == "{" {
-                    package_bodies.insert(n + 1, name);
-                } else {
-                    package = name;
-                }
-            } else {
-                let kind = if word(t, n + 1) == ";" {
-                    "function_declaration"
-                } else {
-                    "function_definition"
-                };
-                let id = declare(&mut out, t[n].span(), kind);
-                let mut body = n + 1;
-                if word(t, body) == "(" {
-                    let mut depth = 1usize;
-                    body += 1;
-                    while depth != 0 && body < t.len() {
-                        match t[body].text {
-                            "(" => depth += 1,
-                            ")" => depth -= 1,
-                            _ => {}
-                        }
-                        body += 1;
-                    }
-                }
-                if word(t, body) == "{" {
-                    bodies.insert(body, id);
-                    if matches!(prev, "my" | "state") {
-                        if !lexical_names.insert(t[n].text) {
-                            lexical.remove(t[n].text);
-                        } else if blocks.is_empty() && n == i + 1 {
-                            lexical.insert(t[n].text, (n, id));
-                        }
-                    } else {
-                        let (pkg, name) = source[full]
-                            .rsplit_once("::")
-                            .unwrap_or((package, t[n].text));
-                        subs.entry((pkg, name))
-                            .and_modify(|v| *v = None)
-                            .or_insert(Some(id));
-                    }
-                }
-            }
-        } else if !matches!(prev, "sub" | "package")
-            && let Some(n) = colon_name(t, i)
-            && word(t, n + 1) == "("
-        {
-            let name = t[n].text;
-            let (pkg, _) = source[t[i].at..t[n].span().end]
-                .rsplit_once("::")
-                .unwrap_or((package, name));
-            pending.push((n, owner, pkg, i != n));
+    let mut file = FileBindings::default();
+    for i in 0..t.len() {
+        file.observe(source, t, i);
+    }
+    file.finish(t)
+}
+
+struct FileBindings<'a> {
+    out: Analysis,
+    scope: Scopes<'a>,
+    subs: Subs<'a>,
+    pending: Vec<(usize, Option<usize>, &'a str, bool)>,
+}
+
+impl Default for FileBindings<'_> {
+    fn default() -> Self {
+        Self {
+            out: Analysis::default(),
+            scope: Scopes::new(),
+            subs: Subs::default(),
+            pending: Vec::new(),
         }
     }
-    for (i, owner, pkg, qualified) in pending {
-        let name = t[i].text;
-        let target = if !qualified && lexical_names.contains(name) {
-            lexical.get(name).and_then(|&(n, id)| (i > n).then_some(id))
-        } else {
-            subs.get(&(pkg, name)).copied().flatten()
-        };
-        if let Some(id) = target {
-            call(&mut out, t[i].span(), owner, id);
+}
+
+impl<'a> FileBindings<'a> {
+    fn observe(&mut self, source: &'a str, t: &[Token<'a>], i: usize) {
+        if self.scope.brace(t[i].text, i) {
+            return;
+        }
+        match Event::read(source, t, i) {
+            Some(Event::Package(name)) => self.scope.declare_package(name, &mut self.out),
+            Some(Event::Sub(name)) => {
+                self.scope
+                    .declare_sub(t, (i, name), &mut self.subs, &mut self.out)
+            }
+            Some(Event::Call(name)) => {
+                let (pkg, _) = qualified(name.full, self.scope.package, name.bare.text);
+                self.pending
+                    .push((name.last, self.scope.owner, pkg, i != name.last));
+            }
+            None => {}
         }
     }
-    out
+
+    fn finish(mut self, t: &[Token<'a>]) -> Analysis {
+        let targets = self
+            .pending
+            .into_iter()
+            .filter_map(|(i, owner, pkg, qualified)| {
+                Some((i, owner, self.subs.target(i, pkg, t[i].text, qualified)?))
+            });
+        for (i, owner, id) in targets {
+            call(&mut self.out, t[i].span(), owner, id);
+        }
+        self.out
+    }
 }

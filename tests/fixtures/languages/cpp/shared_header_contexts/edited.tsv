@@ -1,0 +1,5 @@
+# Active declarations under a different forced header in each translation unit.
+definition	shared.hpp:6:32	shared.hpp:2:12	resolved
+references	shared.hpp:2:12	shared.hpp:6:32	resolved
+definition	unit0.cpp:2:21	shared.hpp:6:12	resolved
+definition	unit1.cpp:2:21	shared.hpp:6:12	resolved

@@ -1,11 +1,10 @@
 use super::*;
 use crate::domain::code::scored;
+mod foreign_abi;
 
 // Every parser profile gets a real syntax specimen and a measurable finding.
 // Flat configuration formats use structural size; procedural formats use branches.
-#[test]
-fn supported_language_profiles_produce_findings() {
-    let cases = [
+const BRANCH_FIXTURES: &[(&str, &str, &str, &str)] = &[
         ("x.rs", "fn run() {", "if ok { work(); }", "}"),
         ("x.js", "function run() {", "if (ok) work();", "}"),
         ("x.tsx", "const Run = () => {", "if (ok) work();", "}"),
@@ -60,7 +59,10 @@ fn supported_language_profiles_produce_findings() {
             "</%def>",
         ),
     ];
-    for (path, head, line, end) in cases {
+
+#[test]
+fn procedural_profiles_measure_branch_growth() {
+    for &(path, head, line, end) in BRANCH_FIXTURES {
         let lang = Language::for_path(path).unwrap();
         let small = format!("{head}\n{line}\n{end}\n");
         let small = scored(lang, &small, path, None).1.unwrap();
@@ -86,6 +88,10 @@ fn supported_language_profiles_produce_findings() {
             s.findings
         );
     }
+}
+
+#[test]
+fn structural_profiles_measure_size_growth() {
     for (path, head, line, end) in [
         ("x.html", "<main>", "<span>text</span>", "</main>"),
         ("x.css", ".rule {", " color: red;", "}"),
@@ -473,4 +479,51 @@ fn independent_deep_functions_each_affect_the_file_score() {
     let single = score.value();
     score.record(Rule::Nesting, 4, 20, "another");
     assert!(score.value() < single);
+}
+
+#[test]
+fn duplicate_witnesses_survive_order_changes_and_exclude_overlapping_ranges() {
+    // Each end shares 57 of 61 shingles with the middle, and 55 of 63 with the other end.
+    let mut words = Vec::new();
+    for changed in [0, 2, 4, 60] {
+        for i in 0..60 {
+            let prefix = if i < changed { "alternate" } else { "base" };
+            words.push(format!("{prefix}{i}"));
+        }
+    }
+    let source = words.join(" ");
+    let tokens = crate::domain::code::lexer::tokens(&source, Language::Rust);
+    let ranges = [0..60, 60..120, 120..180, 180..240, 181..240];
+    for order in [[0, 1, 2, 3, 4], [1, 2, 0, 4, 3], [4, 3, 2, 0, 1]] {
+        let bodies = order.map(|id| duplicates::Body {
+            name: "unit",
+            line: id + 1,
+            lines: 12,
+            tokens: ranges[id].clone(),
+        });
+        let mut score = Score::default();
+        duplicates::record(&mut score, &tokens, &bodies);
+        let marked: Vec<_> = score.findings.iter().map(|f| f.line).collect();
+        let expected: Vec<_> = order.iter().filter(|&&id| id < 3).map(|&id| id + 1).collect();
+        assert_eq!(marked, expected);
+    }
+}
+
+#[test]
+fn void_tag_spelling_preserves_parent_depth() {
+    for tag in ["<br>", "<br/>", "<BR />"] {
+        let html = format!("<main><section>{tag}<div><p><span>x</span></p></div></section></main>");
+        let score = scored(Language::Html, &html, "page.html", None).1.unwrap();
+        assert!(score.findings.iter().any(|f| f.rule == Rule::Nesting && f.value == 5));
+        assert!(!score.findings.iter().any(|f| f.rule == Rule::Bumps));
+    }
+}
+
+#[test]
+fn decorator_arguments_do_not_change_method_binding() {
+    for (decorator, static_method) in [("@staticmethod", true), ("@remember(staticmethod)", false)] {
+        let code = format!("class Group:\n    {decorator}\n    def run(self,a,b,c,d): pass\n");
+        let score = scored(Language::Python, &code, "methods.py", None).1.unwrap();
+        assert_eq!(score.findings.iter().any(|f| f.rule == Rule::Arguments), static_method);
+    }
 }

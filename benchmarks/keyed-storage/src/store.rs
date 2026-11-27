@@ -9,6 +9,68 @@ use std::{
 };
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const MAX_RUNS: usize = 4;
+const SELECTOR_MAGIC: &[u8; 8] = b"CXREPLAY";
+
+struct RunCursor {
+    root: u64,
+    more: bool,
+    entries: std::iter::Peekable<std::vec::IntoIter<Entry>>,
+}
+
+impl RunCursor {
+    fn open(arena: &Arena, root: u64, key: &[u8], batch: usize) -> io::Result<Self> {
+        let entries = arena.scan(Some(root), key, batch)?;
+        Ok(Self {
+            root,
+            more: entries.len() == batch,
+            entries: entries.into_iter().peekable(),
+        })
+    }
+
+    fn next_visible(
+        cursors: &mut [Self],
+        arena: &Arena,
+        batch: usize,
+    ) -> io::Result<Option<Entry>> {
+        while let Some(min) = Self::first_key(cursors) {
+            if let Some(value) = Self::newest_value(cursors, arena, &min, batch)? {
+                return Ok(Some((min, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn first_key(cursors: &mut [Self]) -> Option<Vec<u8>> {
+        cursors.iter_mut().filter_map(|cursor| cursor.entries.peek().map(|entry| &entry.0))
+            .min().cloned()
+    }
+
+    fn newest_value(cursors: &mut [Self], arena: &Arena, key: &[u8], batch: usize) -> io::Result<Option<Vec<u8>>> {
+        let mut value = Vec::new();
+        for cursor in cursors {
+            if let Some(newer) = cursor.take(arena, key, batch)? {
+                value = newer;
+            }
+        }
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value.remove(0);
+        Ok(Some(value))
+    }
+
+    fn take(&mut self, arena: &Arena, key: &[u8], batch: usize) -> io::Result<Option<Vec<u8>>> {
+        let Some((_, value)) = self.entries.next_if(|entry| entry.0.as_slice() == key) else {
+            return Ok(None);
+        };
+        if self.more && self.entries.peek().is_none() {
+            let mut next = key.to_vec();
+            next.push(0);
+            *self = Self::open(arena, self.root, &next, batch)?;
+        }
+        Ok(Some(value))
+    }
+}
 
 struct Pages {
     path: PathBuf,
@@ -21,13 +83,7 @@ impl Pages {
     fn create(path: &Path, runs: bool) -> Result<Self> {
         let store = Self {
             path: path.into(),
-            arena: Arena::new(
-                OpenOptions::new()
-                    .create_new(true)
-                    .read(true)
-                    .append(true)
-                    .open(path.join("arena-0"))?,
-            )?,
+            arena: Self::create_arena(path, 0)?,
             roots: vec![],
             runs,
             epoch: 0,
@@ -35,12 +91,20 @@ impl Pages {
         File::open(path)?.sync_all()?;
         Ok(store)
     }
+    fn create_arena(path: &Path, epoch: u64) -> io::Result<Arena> {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(path.join(format!("arena-{epoch}")))?;
+        Arena::new(file)
+    }
     fn publish(&self) -> Result<()> {
         let start = std::time::Instant::now();
         self.arena.sync()?;
         let arena_synced = std::time::Instant::now();
         let mut f = File::create(self.path.join("pending"))?;
-        f.write_all(b"CXREPLAY")?;
+        f.write_all(SELECTOR_MAGIC)?;
         f.write_all(&self.epoch.to_le_bytes())?;
         f.write_all(&self.arena.len().to_le_bytes())?;
         for root in &self.roots {
@@ -62,15 +126,20 @@ impl Pages {
     }
     fn reopen(&mut self) -> Result<()> {
         let data = fs::read(self.path.join("current"))?;
-        if data.len() < 24 || data.len() % 8 != 0 || &data[..8] != b"CXREPLAY" {
+        let (magic, words) = data.split_at_checked(8).ok_or("invalid selector")?;
+        let (words, tail) = words.as_chunks::<8>();
+        let [epoch, len, roots @ ..] = words else {
+            return Err("invalid selector".into());
+        };
+        if magic != SELECTOR_MAGIC || !tail.is_empty() {
             return Err("invalid selector".into());
         }
-        self.epoch = u64::from_le_bytes(data[8..16].try_into()?);
+        let epoch = u64::from_le_bytes(*epoch);
+        let len = u64::from_le_bytes(*len);
         let f = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(self.path.join(format!("arena-{}", self.epoch)))?;
-        let len = u64::from_le_bytes(data[16..24].try_into()?);
+            .open(self.path.join(format!("arena-{epoch}")))?;
         let physical = f.metadata()?.len();
         if physical < len {
             return Err("short arena".into());
@@ -79,13 +148,14 @@ impl Pages {
             f.set_len(len)?;
         }
         self.arena = Arena::new(f)?;
-        self.roots = data[24..]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-            .collect();
+        self.epoch = epoch;
+        self.roots = roots.iter().copied().map(u64::from_le_bytes).collect();
         Ok(())
     }
     fn scan(&self, key: &[u8], limit: usize) -> Result<Vec<Entry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         if !self.runs {
             return Ok(self.arena.scan(self.roots.first().copied(), key, limit)?);
         }
@@ -95,40 +165,14 @@ impl Pages {
         let mut cursors: Vec<_> = self
             .roots
             .iter()
-            .map(|&id| {
-                self.arena
-                    .scan(Some(id), key, batch)
-                    .map(|v| v.into_iter().peekable())
-            })
+            .map(|&id| RunCursor::open(&self.arena, id, key, batch))
             .collect::<io::Result<_>>()?;
         let mut out = Vec::new();
         while out.len() < limit {
-            let Some(min) = cursors
-                .iter_mut()
-                .filter_map(|c| c.peek().map(|e| &e.0))
-                .min()
-                .cloned()
-            else {
+            let Some(entry) = RunCursor::next_visible(&mut cursors, &self.arena, batch)? else {
                 break;
             };
-            let mut value = Vec::new();
-            for (idx, c) in cursors.iter_mut().enumerate() {
-                if c.peek().is_some_and(|e| e.0 == min) {
-                    value = c.next().unwrap().1;
-                    if c.peek().is_none() {
-                        let mut next = min.clone();
-                        next.push(0);
-                        *c = self
-                            .arena
-                            .scan(Some(self.roots[idx]), &next, batch)?
-                            .into_iter()
-                            .peekable();
-                    }
-                }
-            }
-            if let Some((_, body)) = value.split_first() {
-                out.push((min, body.to_vec()))
-            }
+            out.push(entry);
         }
         Ok(out)
     }
@@ -172,13 +216,7 @@ impl Pages {
     fn replace(&mut self, rows: Rows) -> Result<()> {
         let old = self.epoch;
         self.epoch += 1;
-        self.arena = Arena::new(
-            OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .open(self.path.join(format!("arena-{}", self.epoch)))?,
-        )?;
+        self.arena = Self::create_arena(&self.path, self.epoch)?;
         File::open(&self.path)?.sync_all()?;
         self.bulk(rows)?;
         fs::remove_file(self.path.join(format!("arena-{old}")))?;
@@ -186,14 +224,16 @@ impl Pages {
         Ok(())
     }
 }
+// The ordered-map oracle models a change independently of each storage backend.
 pub fn apply(rows: &mut Rows, edits: &Edits) {
-    for (k, v) in edits {
-        if let Some(v) = v {
-            rows.insert(k.clone(), v.clone());
-        } else {
-            rows.remove(k);
-        }
+    for (key, _) in edits.iter().filter(|(_, value)| value.is_none()) {
+        rows.remove(key);
     }
+    rows.extend(
+        edits
+            .iter()
+            .filter_map(|(key, value)| value.as_ref().map(|value| (key.clone(), value.clone()))),
+    );
 }
 #[derive(PartialEq, Eq)]
 enum SqlLayout {
@@ -244,6 +284,91 @@ fn insert_batches(conn: &mut Connection, rows: Rows) -> Result<()> {
     Ok(())
 }
 
+fn edit_sql_row(
+    insert: &mut rusqlite::Statement<'_>,
+    delete: &mut rusqlite::Statement<'_>,
+    key: &[u8],
+    value: Option<&[u8]>,
+) -> Result<()> {
+    match value {
+        Some(value) => insert.execute(params![key, value])?,
+        None => delete.execute([key])?,
+    };
+    Ok(())
+}
+
+impl Sql {
+    fn bulk(&mut self, rows: Rows) -> Result<()> {
+        match self.layout {
+            SqlLayout::Rows => self.bulk_rows(rows),
+            SqlLayout::BatchedRows => insert_batches(&mut self.conn, rows),
+            SqlLayout::Blocks => crate::sql_blocks::bulk(&mut self.conn, rows),
+        }
+    }
+
+    fn edit(&mut self, edits: &Edits) -> Result<()> {
+        match self.layout {
+            SqlLayout::Blocks => crate::sql_blocks::edit(&mut self.conn, edits),
+            SqlLayout::Rows | SqlLayout::BatchedRows => self.edit_rows(edits),
+        }
+    }
+
+    fn scan(&self, key: &[u8], limit: usize) -> Result<Vec<Entry>> {
+        if self.layout == SqlLayout::Blocks {
+            return crate::sql_blocks::scan(&self.conn, key, limit);
+        }
+        let mut q = self
+            .conn
+            .prepare_cached("SELECT k,v FROM rows WHERE k>=?1 ORDER BY k LIMIT ?2")?;
+        let rows = q.query_map(
+            params![key, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn bulk_rows(&mut self, rows: Rows) -> Result<()> {
+        let t = self.conn.transaction()?;
+        {
+            let mut q = t.prepare("INSERT INTO rows VALUES(?1,?2)")?;
+            for (k, v) in rows {
+                q.execute(params![k, v])?;
+            }
+        }
+        t.commit()?;
+        Ok(())
+    }
+
+    fn edit_rows(&mut self, edits: &Edits) -> Result<()> {
+        let t = self.conn.transaction()?;
+        {
+            let mut ins = t.prepare("INSERT OR REPLACE INTO rows VALUES(?1,?2)")?;
+            let mut del = t.prepare("DELETE FROM rows WHERE k=?1")?;
+            for (key, value) in edits {
+                edit_sql_row(&mut ins, &mut del, key, value.as_deref())?;
+            }
+        }
+        t.commit()?;
+        Ok(())
+    }
+
+    fn create(path: &Path, mode: &str) -> Result<Self> {
+        let path = path.join("rows.db");
+        let layout = match mode {
+            "sqlite-blocks" => SqlLayout::Blocks,
+            "sqlite-batch" => SqlLayout::BatchedRows,
+            _ => SqlLayout::Rows,
+        };
+        let conn = connect(&path, layout != SqlLayout::Rows)?;
+        if layout == SqlLayout::Rows {
+            conn.execute_batch(
+                "CREATE TABLE rows(k BLOB PRIMARY KEY,v BLOB NOT NULL) WITHOUT ROWID",
+            )?;
+        }
+        Ok(Self { conn, path, layout })
+    }
+}
+
 enum Engine {
     Packed(Pages),
     Sql(Sql),
@@ -254,86 +379,26 @@ impl Store {
         fs::create_dir(path)?;
         Ok(Self(match mode {
             "cow" | "runs" => Engine::Packed(Pages::create(path, mode == "runs")?),
-            "sqlite" | "sqlite-blocks" | "sqlite-batch" => {
-                let path = path.join("rows.db");
-                let layout = match mode {
-                    "sqlite-blocks" => SqlLayout::Blocks,
-                    "sqlite-batch" => SqlLayout::BatchedRows,
-                    _ => SqlLayout::Rows,
-                };
-                let conn = connect(&path, layout != SqlLayout::Rows)?;
-                if layout == SqlLayout::Rows {
-                    conn.execute_batch(
-                        "CREATE TABLE rows(k BLOB PRIMARY KEY,v BLOB NOT NULL) WITHOUT ROWID",
-                    )?;
-                }
-                Engine::Sql(Sql { conn, path, layout })
-            }
+            "sqlite" | "sqlite-blocks" | "sqlite-batch" => Engine::Sql(Sql::create(path, mode)?),
             _ => return Err("unknown backend".into()),
         }))
     }
     pub fn bulk(&mut self, rows: Rows) -> Result<()> {
         match &mut self.0 {
             Engine::Packed(p) => p.bulk(rows),
-            Engine::Sql(s) if s.layout == SqlLayout::BatchedRows => {
-                insert_batches(&mut s.conn, rows)
-            }
-            Engine::Sql(s) if s.layout == SqlLayout::Blocks => {
-                crate::sql_blocks::bulk(&mut s.conn, rows)
-            }
-            Engine::Sql(s) => {
-                let t = s.conn.transaction()?;
-                {
-                    let mut q = t.prepare("INSERT INTO rows VALUES(?1,?2)")?;
-                    for (k, v) in rows {
-                        q.execute(params![k, v])?;
-                    }
-                }
-                t.commit()?;
-                Ok(())
-            }
+            Engine::Sql(s) => s.bulk(rows),
         }
     }
     pub fn edit(&mut self, edits: &Edits) -> Result<()> {
         match &mut self.0 {
             Engine::Packed(p) => p.edit(edits),
-            Engine::Sql(s) if s.layout == SqlLayout::Blocks => {
-                crate::sql_blocks::edit(&mut s.conn, edits)
-            }
-            Engine::Sql(s) => {
-                let t = s.conn.transaction()?;
-                {
-                    let mut ins = t.prepare("INSERT OR REPLACE INTO rows VALUES(?1,?2)")?;
-                    let mut del = t.prepare("DELETE FROM rows WHERE k=?1")?;
-                    for (k, v) in edits {
-                        if let Some(v) = v {
-                            ins.execute(params![k, v])?;
-                        } else {
-                            del.execute([k])?;
-                        }
-                    }
-                }
-                t.commit()?;
-                Ok(())
-            }
+            Engine::Sql(s) => s.edit(edits),
         }
     }
     pub fn scan(&self, key: &[u8], limit: usize) -> Result<Vec<Entry>> {
         match &self.0 {
             Engine::Packed(p) => p.scan(key, limit),
-            Engine::Sql(s) if s.layout == SqlLayout::Blocks => {
-                crate::sql_blocks::scan(&s.conn, key, limit)
-            }
-            Engine::Sql(s) => {
-                let mut q = s
-                    .conn
-                    .prepare_cached("SELECT k,v FROM rows WHERE k>=?1 ORDER BY k LIMIT ?2")?;
-                Ok(q.query_map(
-                    params![key, i64::try_from(limit).unwrap_or(i64::MAX)],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?
-                .collect::<rusqlite::Result<_>>()?)
-            }
+            Engine::Sql(s) => s.scan(key, limit),
         }
     }
     pub fn reopen(&mut self) -> Result<()> {
@@ -364,6 +429,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_scan_refills_past_tombstones_and_keeps_the_newest_value() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("cx-run-scan-{}", std::process::id()));
+        fs::create_dir(&path)?;
+        let mut store = Pages::create(&path, true)?;
+        let key = |n: u16| n.to_be_bytes().to_vec();
+        let original: Rows = (0..150).map(|n| (key(n), vec![1])).collect();
+        store.bulk(original)?;
+        let mut edits: Edits = (0..130).map(|n| (key(n), None)).collect();
+        edits.insert(key(130), Some(vec![2]));
+        store.edit(&edits)?;
+        store.edit(&Edits::from([(key(130), Some(vec![]))]))?;
+        store.reopen()?;
+        assert_eq!(
+            store.scan(b"", 2)?,
+            [(key(130), vec![]), (key(131), vec![1])]
+        );
+        assert!(store.scan(b"", 0)?.is_empty());
+        fs::remove_dir_all(path)?;
+        Ok(())
+    }
 
     #[test]
     fn unpublished_tail_is_discarded_and_old_pin_survives_compaction() -> Result<()> {

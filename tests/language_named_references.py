@@ -11,15 +11,16 @@ baseline files are used.
 """
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import tempfile
 
-from language_conformance import FIXTURES, ROOT, checkout, compare, git
+from language_fixture_positions import SourceLines, utf16_prefix
+from language_conformance import FIXTURES, ROOT, check_response, prepare_fixture
 
 
 # vscode-langservers-extracted 4.10.0 forwards position and stylesheet to
@@ -43,30 +44,39 @@ def fixture_rows(case):
         yield op, subject, expected, options[0] if options else "", options[1:] == ["contains"]
 
 
-def invoke(binary, repo, home, *args):
-    return subprocess.run([binary, *args], cwd=repo, text=True, capture_output=True, timeout=120,
-                          env={**os.environ, "HOME": str(home), "GIT_CONFIG_GLOBAL": "./.missing-config",
-                               "GIT_CONFIG_NOSYSTEM": "1"})
+@dataclass(frozen=True)
+class Probe:
+    binary: Path
+    repo: Path
+    home: Path
+
+    def invoke(self, *args):
+        return subprocess.run(
+            [self.binary, *args], cwd=self.repo, text=True, capture_output=True, timeout=120,
+            env={**os.environ, "HOME": str(self.home), "GIT_CONFIG_GLOBAL": "./.missing-config",
+                 "GIT_CONFIG_NOSYSTEM": "1"},
+        )
 
 
 def location(repo, anchor, name):
     parts = anchor.split("|", 1)[0].split(":")
     path, line = parts[:2]
-    text = (repo / path).read_text().splitlines()[int(line) - 1]
+    text = SourceLines((repo / path).read_bytes()).at(int(line))
     if len(parts) == 3:
         column = int(parts[2])
     elif text.count(name) == 1:
         column = len(text[:text.index(name)].encode("utf-16-le")) // 2 + 1
     else:
         return None
-    prefix = text.encode("utf-16-le")[:2 * (column - 1)].decode("utf-16-le")
+    prefix = utf16_prefix(text, column)
     return path, line, column, len(prefix.encode("utf-8")) + 1
 
 
-def ambiguous(binary, repo, home, name, anchors):
-    attempt = invoke(binary, repo, home, "--reference", name)
+def ambiguous(probe, name, anchors):
+    attempt = probe.invoke("--reference", name)
     result = {"exit": attempt.returncode, "diagnostic": attempt.stderr.strip(), "diff": {}}
-    if attempt.returncode != 2 or "ambiguous" not in attempt.stderr.lower() or attempt.stdout:
+    established = (attempt.returncode == 2, "ambiguous" in attempt.stderr.lower(), not attempt.stdout)
+    if not all(established):
         result["diff"]["ambiguity"] = "expected exit 2, ambiguity on stderr and empty stdout"
         return result
     # Replay only the supported advice instead of evaluating arbitrary diagnostics.
@@ -75,79 +85,86 @@ def ambiguous(binary, repo, home, name, anchors):
         result["diff"]["advice"] = "no symbol lookup command for the ambiguous name"
         return result
     flags = match.group(1).split()
-    replay = invoke(binary, repo, home, "--symbol", name, *flags)
+    replay = probe.invoke("--symbol", name, *flags)
     if replay.returncode:
         result["diff"]["advice"] = f"recommended symbol lookup exited {replay.returncode}"
         return result
-    actual = set()
-    if "--json" in flags:
-        for hit in json.loads(replay.stdout)["hits"]:
-            actual.add((hit["path"], str(hit["line"]), hit["byte_column"]))
-    else:
-        for line in replay.stdout.splitlines():
-            m = re.match(r"^([^:]+):(\d+):(\d+):", line)
-            if m:
-                actual.add((m[1], m[2], int(m[3])))
-    for anchor in anchors:
-        pos = location(repo, anchor, name)
-        if pos is None:
-            # A line-only expectation can establish the need for a choice even
-            # when the expected byte column itself cannot be reconstructed.
-            path, line = anchor.split("|", 1)[0].split(":")
-            found = any(x[:2] == (path, line) for x in actual)
-        else:
-            found = (pos[0], pos[1], pos[3]) in actual
-        if not found:
-            result["diff"]["advice"] = "recommended command omits a verified candidate or its byte column"
-            break
+    actual = symbol_locations(replay.stdout, flags)
+    if any(not contains_anchor(actual, probe.repo, anchor, name) for anchor in anchors):
+        result["diff"]["advice"] = "recommended command omits a verified candidate or its byte column"
     return result
+
+
+def symbol_locations(output, flags):
+    if "--json" in flags:
+        return {(hit["path"], str(hit["line"]), hit["byte_column"]) for hit in json.loads(output)["hits"]}
+    return {(m[1], m[2], int(m[3])) for line in output.splitlines()
+            if (m := re.match(r"^([^:]+):(\d+):(\d+):", line))}
+
+
+def contains_anchor(actual, repo, anchor, name):
+    pos = location(repo, anchor, name)
+    if pos is None:
+        # A line-only expectation still establishes the need for a choice.
+        path, line = anchor.split("|", 1)[0].split(":")
+        return any(x[:2] == (path, line) for x in actual)
+    return (pos[0], pos[1], pos[3]) in actual
+
+
+def unique(probe, subject, by_site):
+    name, (anchor,), subset = subject
+    pos = location(probe.repo, anchor, name)
+    anchor = ":".join(map(str, pos[:3])) if pos else None
+    if subset or anchor not in by_site:
+        return {"mode": "unpaired"}
+    expected_sites, status, partial = by_site[anchor]
+    result = {"mode": "unique", "anchor": anchor, "expected": expected_sites, "diff": {}}
+    expected_exit = 2 if status.partition("/")[0] in {"unindexed", "unsupported"} else int(expected_sites == "-")
+    query = dict(op="references", subject=name, expected=expected_sites, status=status, subset=partial)
+    for entry, argv in (("named", [name]), ("positional", [pos[0], pos[1], str(pos[3])])):
+        answer = probe.invoke("--reference", *argv, "--json")
+        try:
+            result[entry] = check_response(answer, query, "fresh")
+        except (ValueError, KeyError, TypeError) as exc:
+            result[entry] = {"error": str(exc), "stderr": answer.stderr.strip()}
+        if answer.returncode != expected_exit:
+            result[entry]["exit"] = [expected_exit, answer.returncode]
+    result["diff"] = {arm: result[arm] for arm in ("named", "positional") if result[arm]}
+    return result
+
+
+def checked_subjects(rows):
+    for op, name, expected, _, subset in rows:
+        if op == "symbol" and expected != "-":
+            yield name, expected.split(","), subset
+
+
+def inspect_subject(probe, subject, by_site):
+    name, anchors, _ = subject
+    if len(anchors) >= 2:
+        result = ambiguous(probe, name, anchors)
+        result["mode"] = "ambiguous"
+        return result
+    return unique(probe, subject, by_site)
 
 
 def run_case(case, binary, cache, records):
     rows = list(fixture_rows(case))
+    case_name = str(case.relative_to(FIXTURES))
     by_site = {subject: (expected, status, subset) for op, subject, expected, status, subset in rows
                if op == "references"}
-    for anchor, sites in SUPPLEMENTAL_REFERENCES.get(str(case.relative_to(FIXTURES)), {}).items():
+    for anchor, sites in SUPPLEMENTAL_REFERENCES.get(case_name, {}).items():
         by_site.setdefault(anchor, (sites, "resolved", False))
-    if not any(op == "symbol" and expected != "-" for op, _, expected, _, _ in rows):
+    subjects = list(checked_subjects(rows))
+    if not subjects:
         return
     with tempfile.TemporaryDirectory(prefix="cx-named-") as directory:
         temp = Path(directory)
-        repo, home = temp / "repo", temp / "home"
-        home.mkdir()
-        if (case / "public.json").is_file():
-            repo.mkdir()
-            checkout(json.loads((case / "public.json").read_text()), repo, cache)
-        else:
-            shutil.copytree(case / "repo", repo)
-            git("init", "-q", cwd=repo)
-        for op, name, expected, _, subset in rows:
-            if op != "symbol" or expected == "-":
-                continue
-            anchors = expected.split(",")
-            if len(anchors) >= 2:
-                mode = "ambiguous"
-                result = ambiguous(binary, repo, home, name, anchors)
-            else:
-                mode = "unique"
-                pos = location(repo, anchors[0], name)
-                anchor = ":".join(map(str, pos[:3])) if pos else None
-                if subset or anchor not in by_site:
-                    records.append(dict(case=str(case.relative_to(FIXTURES)), name=name, mode="unpaired"))
-                    continue
-                expected_sites, status, partial = by_site[anchor]
-                result = {"anchor": anchor, "expected": expected_sites, "diff": {}}
-                expected_exit = 2 if status.partition("/")[0] in {"unindexed", "unsupported"} else int(expected_sites == "-")
-                for entry, argv in (("named", [name]), ("positional", [pos[0], pos[1], str(pos[3])])):
-                    answer = invoke(binary, repo, home, "--reference", *argv, "--json")
-                    try:
-                        result[entry] = compare(json.loads(answer.stdout), "references", expected_sites, status, partial)
-                    except (ValueError, KeyError, TypeError) as exc:
-                        result[entry] = {"error": str(exc), "stderr": answer.stderr.strip()}
-                    if answer.returncode != expected_exit:
-                        result[entry]["exit"] = [expected_exit, answer.returncode]
-                result["diff"] = result["named"]
-            records.append(dict(case=str(case.relative_to(FIXTURES)), name=name, mode=mode, **result))
+        probe = Probe(binary, temp / "repo", temp / "home")
+        probe.home.mkdir()
+        prepare_fixture(case, probe.repo, cache)
+        for subject in subjects:
+            records.append(dict(case=case_name, name=subject[0], **inspect_subject(probe, subject, by_site)))
 
 
 def main():

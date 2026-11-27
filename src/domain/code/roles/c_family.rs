@@ -1,6 +1,7 @@
 //! Follow simple function-like macro aliases in the source and its quoted local
 //! headers. Header bodies stay in the pinned snapshot and never execute.
 use super::{Language, Role, Roles, Syntax, Token, lexer, script};
+use crate::domain::code::cfamily::directives::{Directive as Keyword, WrittenDirective};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -13,40 +14,76 @@ struct Defines {
     aliases: Vec<(String, String)>,
 }
 
-fn definitions(t: &[Token], pairs: &[usize]) -> Defines {
-    let mut d = Defines::default();
-    for (i, w) in t.iter().enumerate() {
-        if w.text != "#" || i > 0 && t[i - 1].line == w.line {
-            continue;
+enum Directive<'a> {
+    Define(usize),
+    Include(&'a str),
+}
+
+fn directives<'t, 'a>(tokens: &'t [Token<'a>]) -> impl Iterator<Item = Directive<'a>> + 't {
+    tokens.iter().enumerate().filter_map(move |(i, marker)| {
+        if marker.text != "#" || continues_directive_line(tokens, i) {
+            return None;
         }
-        let Some([op, name, open]) = t.get(i + 1..i + 4) else {
-            continue;
+        let row = tokens.get(i..i + 3)?;
+        let keyword = WrittenDirective::read(row, false)?;
+        let name = keyword
+            .args
+            .first()
+            .filter(|name| name.line == marker.line)?;
+        match keyword.kind {
+            Keyword::Include if name.kind == super::Kind::String => {
+                Some(Directive::Include(name.text))
+            }
+            Keyword::Write(true) => Some(Directive::Define(i + 2)),
+            _ => None,
+        }
+    })
+}
+
+fn continues_directive_line(tokens: &[Token], i: usize) -> bool {
+    let Some(prior) = i.checked_sub(1) else {
+        return false;
+    };
+    let previous = &tokens[prior];
+    let line = tokens[i].line;
+    previous.line == line || escaped_line(previous, line)
+}
+
+fn escaped_line(previous: &Token, line: usize) -> bool {
+    previous.text == "\\" && previous.line + 1 == line
+}
+
+fn alias_target<'a>(tokens: &[Token<'a>], close: usize) -> Option<&'a str> {
+    let mut j = close + 1;
+    while tokens.get(j).is_some_and(|t| t.text == "\\") {
+        j += 1;
+    }
+    let [target, call] = tokens.get(j..j + 2)? else {
+        return None;
+    };
+    let same_directive = target.line == tokens[close].line || j > close + 1;
+    (same_directive && call.text == "(").then_some(target.text)
+}
+
+impl Defines {
+    fn observe_macro(&mut self, tokens: &[Token], pairs: &[usize], name: usize) {
+        let open = name + 1;
+        let Some(token) = tokens.get(open) else {
+            return;
         };
-        if op.text != "define"
-            || name.line != w.line
-            || open.text != "("
-            || open.span.start != name.span.end
-        {
-            continue;
+        if token.text != "(" || token.span.start != tokens[name].span.end {
+            return;
         }
-        d.local.insert(name.text.to_owned());
-        let close = pairs[i + 3];
-        if close >= t.len() {
-            continue;
+        let name = tokens[name].text;
+        self.local.insert(name.to_owned());
+        let close = pairs[open];
+        if close >= tokens.len() {
+            return;
         }
-        let mut j = close + 1;
-        while t.get(j).is_some_and(|v| v.text == "\\") {
-            j += 1;
-        }
-        if let Some(replacement) = t.get(j)
-            && (replacement.line == t[close].line || j > close + 1)
-            && t.get(j + 1).is_some_and(|v| v.text == "(")
-        {
-            d.aliases
-                .push((name.text.to_owned(), replacement.text.to_owned()));
+        if let Some(target) = alias_target(tokens, close) {
+            self.aliases.push((name.to_owned(), target.to_owned()));
         }
     }
-    d
 }
 
 fn builtin(name: &str) -> bool {
@@ -64,9 +101,111 @@ fn builtin(name: &str) -> bool {
             | "START_TEST"
     )
 }
+fn include_path(path: &str, spelling: &str) -> Option<PathBuf> {
+    let rel = spelling.strip_prefix('"')?.strip_suffix('"')?;
+    if Path::new(rel).is_absolute() {
+        return None;
+    }
+    let mut key = PathBuf::new();
+    for component in Path::new(path).parent()?.join(rel).components() {
+        match component {
+            Component::Normal(name) => key.push(name),
+            Component::ParentDir if !key.pop() => return None,
+            _ => {}
+        }
+    }
+    (!key.as_os_str().is_empty()).then_some(key)
+}
+
+fn header_definitions(source: &str) -> Defines {
+    let tokens = lexer::tokens(source, Language::Cpp);
+    let pairs = script::paired_for_score(&tokens);
+    let mut definitions = Defines::default();
+    for directive in directives(&tokens) {
+        if let Directive::Define(name) = directive {
+            definitions.observe_macro(&tokens, &pairs, name);
+        }
+    }
+    definitions
+}
+
+struct Registrations<'a> {
+    local: &'a Defines,
+    aliases: HashSet<&'a str>,
+}
+
+impl<'a> Registrations<'a> {
+    fn new(local: &'a Defines, included: impl Iterator<Item = &'a Defines>) -> Self {
+        let mut resolved = Self {
+            local,
+            aliases: HashSet::new(),
+        };
+        let mut users: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut pending = Vec::new();
+        for (alias, target) in std::iter::once(local)
+            .chain(included)
+            .flat_map(|d| &d.aliases)
+        {
+            users.entry(target).or_default().push(alias);
+            if resolved.contains(target) {
+                pending.push(target.as_str());
+            }
+        }
+        while let Some(target) = pending.pop() {
+            let callers = users.remove(target).unwrap_or_default();
+            resolved.aliases.extend(callers.iter().copied());
+            pending.extend(callers);
+        }
+        resolved
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        builtin(name) && !self.local.local.contains(name) || self.aliases.contains(name)
+    }
+
+    fn body(&self, s: &Syntax, i: usize) -> Option<usize> {
+        let previous = i.checked_sub(1).map(|prior| s.w(prior));
+        if s.w(i + 1) != "(" || previous == Some("define") {
+            return None;
+        }
+        let brace = s.close(i + 1)? + 1;
+        (s.w(brace) == "{" && self.contains(s.w(i))).then_some(brace)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Headers(HashMap<PathBuf, Defines>);
 impl Headers {
+    fn load(
+        &mut self,
+        path: &Path,
+        read: &mut impl FnMut(&Path) -> io::Result<Option<String>>,
+    ) -> io::Result<()> {
+        if !self.0.contains_key(path) {
+            let source = read(path)?;
+            let defines = source
+                .as_deref()
+                .map(header_definitions)
+                .unwrap_or_default();
+            self.0.insert(path.to_owned(), defines);
+        }
+        Ok(())
+    }
+
+    fn include(
+        &mut self,
+        source: (&str, &str),
+        headers: &mut HashSet<PathBuf>,
+        read: &mut impl FnMut(&Path) -> io::Result<Option<String>>,
+    ) -> io::Result<()> {
+        if let Some(path) = include_path(source.0, source.1).filter(|path| !headers.contains(path))
+        {
+            self.load(&path, read)?;
+            headers.insert(path);
+        }
+        Ok(())
+    }
+
     pub(super) fn collect(
         &mut self,
         path: &str,
@@ -74,86 +213,27 @@ impl Headers {
         res: &mut Roles,
         mut read: impl FnMut(&Path) -> io::Result<Option<String>>,
     ) -> io::Result<()> {
-        let local = definitions(s.tokens, s.pairs);
-        let mut aliases: Vec<_> = local.aliases.clone();
+        let mut local = Defines::default();
         let mut headers = HashSet::new();
-        for i in 0..s.tokens.len() {
-            if !s.seq(i, &["#", "include"]) || !s.string(i + 2) {
-                continue;
-            }
-            let Some(rel) = s
-                .w(i + 2)
-                .strip_prefix('"')
-                .and_then(|r| r.strip_suffix('"'))
-            else {
-                continue;
-            };
-            if Path::new(rel).is_absolute() {
-                continue;
-            }
-            let mut key = PathBuf::new();
-            for c in Path::new(path)
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join(rel)
-                .components()
-            {
-                match c {
-                    Component::Normal(p) => key.push(p),
-                    Component::ParentDir => {
-                        if !key.pop() {
-                            key.clear();
-                            break;
-                        }
-                    }
-                    _ => {}
+        // Read first occurrences in source order; aliases may normalize to one header.
+        for directive in directives(s.tokens) {
+            match directive {
+                Directive::Define(name) => local.observe_macro(s.tokens, s.pairs, name),
+                Directive::Include(spelling) => {
+                    self.include((path, spelling), &mut headers, &mut read)?;
                 }
             }
-            if key.as_os_str().is_empty() || !headers.insert(key.clone()) {
-                continue;
-            }
-            if !self.0.contains_key(&key) {
-                let defs = if let Some(text) = read(&key)? {
-                    let tokens = lexer::tokens(&text, Language::Cpp);
-                    let pairs = script::paired_for_score(&tokens);
-                    definitions(&tokens, &pairs)
-                } else {
-                    Defines::default()
-                };
-                self.0.insert(key.clone(), defs);
-            }
-            aliases.extend(self.0[&key].aliases.iter().cloned());
         }
-        let mut resolved = HashSet::new();
-        loop {
-            let count = resolved.len();
-            for (a, b) in &aliases {
-                if builtin(b) && !local.local.contains(b) || resolved.contains(b.as_str()) {
-                    resolved.insert(a.as_str());
-                }
-            }
-            if resolved.len() == count {
-                break;
-            }
-        }
-        for (i, t) in s.tokens.iter().enumerate() {
-            if !(builtin(t.text) && !local.local.contains(t.text) || resolved.contains(t.text))
-                || i > 0 && s.w(i - 1) == "define"
-                || s.w(i + 1) != "("
-            {
-                continue;
-            }
-            if let Some(close) = s.close(i + 1)
-                && s.w(close + 1) == "{"
-            {
-                s.add(
-                    res,
-                    i,
-                    s.close(close + 1),
-                    Role::Test,
-                    "test registration macro",
-                );
-            }
+        let included = headers.iter().map(|key| &self.0[key]);
+        let registrations = Registrations::new(&local, included);
+        let bodies = (0..s.tokens.len()).filter_map(|i| Some((i, registrations.body(s, i)?)));
+        for (i, brace) in bodies {
+            s.add(
+                res,
+                i,
+                s.close(brace),
+                Role::Test.evidence("test registration macro"),
+            );
         }
         Ok(())
     }

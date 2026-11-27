@@ -211,81 +211,76 @@ fn blob_hashes_include_the_git_header_and_support_both_object_formats() {
 
 #[test]
 fn commit_lookup_uses_pinned_commit_in_loose_and_packed_stores() {
-    use std::process::Command;
     for format in ["sha1", "sha256"] {
-        let f = Fixture::new();
-        let git = |args: &[&str]| {
-            let output = Command::new("git")
-                .current_dir(&f.0)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args([
-                    "-c",
-                    "user.name=Fixture",
-                    "-c",
-                    "user.email=fixture@example.org",
-                ])
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        git(&["init", "--quiet", &format!("--object-format={format}")]);
-        f.put("README.md", b"root file");
-        f.put("nested/file.rs", b"committed\n");
-        f.put("stable/deep/file.txt", b"identical in both commits");
-        symlink("file.rs", f.0.join("nested/link")).unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "first version"]);
-        let head = head_commit(&f.0).unwrap().unwrap();
-        f.put("nested/file.rs", b"staged\n");
-        git(&["add", "."]);
-        f.put("nested/file.rs", b"working\n");
-        for packed in [false, true] {
-            if packed {
-                git(&["gc", "--quiet"]);
-            }
-            let mut tree = CommitTree::open(&f.0, &head).unwrap();
-            assert_eq!(uses_sha256(&f.0).unwrap(), format == "sha256");
-            assert_eq!(
-                tree.blob("nested/file.rs").unwrap(),
-                Some(raw_blob_id(b"committed\n", format == "sha256"))
-            );
-            assert!(tree.blob("README.md").unwrap().is_some());
-            for absent in ["nested", "nested/link", "missing", "/README.md", "/nested/file.rs", "nested/file.rs/child"] {
-                assert_eq!(tree.blob(absent).unwrap(), None);
-            }
-        }
-        fs::remove_dir_all(f.0.join("nested")).unwrap();
-        f.put("nested", b"new file replacing directory");
-        f.put("new/subdir/add", b"added");
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "replace directory"]);
-        let next = head_commit(&f.0).unwrap().unwrap();
-        git(&["gc", "--quiet"]);
-        let mut latest = CommitTree::open(&f.0, &next).unwrap();
-        assert_eq!(
-            latest.changed_paths(&head).unwrap(),
-            std::collections::HashMap::from([
-                (
-                    "nested".into(),
-                    Some(raw_blob_id(
-                        b"new file replacing directory",
-                        format == "sha256"
-                    ))
-                ),
-                ("nested/file.rs".into(), None),
-                (
-                    "new/subdir/add".into(),
-                    Some(raw_blob_id(b"added", format == "sha256"))
-                ),
-            ])
-        );
-        assert!(latest.changed_paths(&next).unwrap().is_empty());
+        check_commit_lookup(format);
+    }
+}
+
+impl Fixture {
+    fn git(&self, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(&self.0)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.org"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
+fn check_commit_lookup(format: &str) {
+    let f = Fixture::new();
+    f.git(&["init", "--quiet", &format!("--object-format={format}")]);
+    f.put("README.md", b"root file");
+    f.put("nested/file.rs", b"committed\n");
+    f.put("stable/deep/file.txt", b"identical in both commits");
+    symlink("file.rs", f.0.join("nested/link")).unwrap();
+    f.git(&["add", "."]);
+    f.git(&["commit", "-qm", "first version"]);
+    let head = head_commit(&f.0).unwrap().unwrap();
+    f.put("nested/file.rs", b"staged\n");
+    f.git(&["add", "."]);
+    f.put("nested/file.rs", b"working\n");
+    assert_pinned_tree(&f, &head, format == "sha256");
+    f.git(&["gc", "--quiet"]);
+    assert_pinned_tree(&f, &head, format == "sha256");
+    fs::remove_dir_all(f.0.join("nested")).unwrap();
+    f.put("nested", b"new file replacing directory");
+    f.put("new/subdir/add", b"added");
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "replace directory"]);
+    let next = head_commit(&f.0).unwrap().unwrap();
+    f.git(&["gc", "--quiet"]);
+    let mut latest = CommitTree::open(&f.0, &next).unwrap();
+    assert_eq!(
+        latest.changed_paths(&head).unwrap(),
+        std::collections::HashMap::from([
+            (
+                "nested".into(),
+                Some(raw_blob_id(
+                    b"new file replacing directory",
+                    format == "sha256"
+                ))
+            ),
+            ("nested/file.rs".into(), None),
+            (
+                "new/subdir/add".into(),
+                Some(raw_blob_id(b"added", format == "sha256"))
+            ),
+        ])
+    );
+    assert!(latest.changed_paths(&next).unwrap().is_empty());
+}
+
+fn assert_pinned_tree(fixture: &Fixture, head: &str, sha256: bool) {
+    let mut tree = CommitTree::open(&fixture.0, head).unwrap();
+    assert_eq!(uses_sha256(&fixture.0).unwrap(), sha256);
+    assert_eq!(tree.blob("nested/file.rs").unwrap(), Some(raw_blob_id(b"committed\n", sha256)));
+    assert!(tree.blob("README.md").unwrap().is_some());
+    for absent in ["nested", "nested/link", "missing", "/README.md", "/nested/file.rs", "nested/file.rs/child"] {
+        assert_eq!(tree.blob(absent).unwrap(), None);
     }
 }
 
@@ -331,22 +326,24 @@ fn parallel_directories_inherit_only_ancestor_rules_and_keep_tracked_exceptions(
     f.put("hidden/untracked.tmp", b"");
     let mut expected = vec![".gitignore".to_owned(), "hidden/tracked.tmp".to_owned()];
     for n in 0..12 {
-        let base = format!("branch-{n:02}/deep/nested");
-        f.put(&format!("{base}/visible"), b"");
-        f.put(&format!("{base}/child/keep.tmp"), b"");
-        expected.push(format!("{base}/visible"));
-        if n % 2 == 0 {
-            f.put(&format!("{base}/.gitignore"), b"!keep.tmp\n");
-            expected.push(format!("{base}/.gitignore"));
-            expected.push(format!("{base}/child/keep.tmp"));
-        }
+        add_parallel_branch(&f, n, &mut expected);
     }
     expected.sort_unstable();
     let got = observe(&f.0).unwrap();
-    for path in &got {
-        if path.path.ends_with("/.gitignore") {
-            assert_eq!(path.captured.as_ref().unwrap().as_deref(), Some("!keep.tmp\n"));
-        }
+    for path in got.iter().filter(|path| path.path.ends_with("/.gitignore")) {
+        assert_eq!(path.captured.as_ref().unwrap().as_deref(), Some("!keep.tmp\n"));
     }
     assert_eq!(got.into_iter().map(|p| p.path).collect::<Vec<_>>(), expected);
+}
+
+fn add_parallel_branch(fixture: &Fixture, number: usize, expected: &mut Vec<String>) {
+    let base = format!("branch-{number:02}/deep/nested");
+    fixture.put(&format!("{base}/visible"), b"");
+    fixture.put(&format!("{base}/child/keep.tmp"), b"");
+    expected.push(format!("{base}/visible"));
+    if number % 2 == 0 {
+        fixture.put(&format!("{base}/.gitignore"), b"!keep.tmp\n");
+        expected.push(format!("{base}/.gitignore"));
+        expected.push(format!("{base}/child/keep.tmp"));
+    }
 }

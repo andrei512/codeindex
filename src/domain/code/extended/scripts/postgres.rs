@@ -1,13 +1,12 @@
-use super::{Analysis, Language, Token, declare, tokens, usage, word};
+use super::{Analysis, Language, Token, declare, tokens, word};
 use std::ops::Range;
 
 fn name(tok: Token<'_>) -> Option<Range<usize>> {
     if tok.name() {
         Some(tok.span())
-    } else if tok.text.starts_with('"') && tok.text.ends_with('"') && tok.text.len() > 2 {
-        Some(tok.at + 1..tok.span().end - 1)
     } else {
-        None
+        let interior = tok.text.strip_prefix('"')?.strip_suffix('"')?;
+        (!interior.is_empty()).then_some(tok.at + 1..tok.at + 1 + interior.len())
     }
 }
 fn key(tok: Token<'_>) -> String {
@@ -21,91 +20,225 @@ struct Block {
     label: Option<(String, usize)>,
     is_loop: bool,
 }
-fn labels(t: &[Token<'_>], out: &mut Analysis, owner: Option<usize>) {
-    let mut blocks = Vec::<Block>::new();
-    let mut pending = None;
-    let mut i = 0;
-    while i < t.len() {
-        let tok = t[i];
-        i += 1;
-        if tok.text == "<"
-            && word(t, i) == "<"
-            && word(t, i + 2) == ">"
-            && word(t, i + 3) == ">"
-            && let Some(span) = t.get(i + 1).and_then(|n| name(*n))
-            && matches!(
-                word(t, i + 4).to_ascii_lowercase().as_str(),
-                "declare" | "begin" | "loop" | "while" | "for" | "foreach"
-            )
-        {
-            pending = Some((key(t[i + 1]), declare(out, span, "label")));
-            i += 4;
-        } else if tok.text.eq_ignore_ascii_case("begin") || tok.text.eq_ignore_ascii_case("loop") {
-            blocks.push(Block {
-                label: pending.take(),
-                is_loop: tok.text.eq_ignore_ascii_case("loop"),
-            });
-        } else if tok.text.eq_ignore_ascii_case("if") || tok.text.eq_ignore_ascii_case("case") {
-            blocks.push(Block {
-                label: None,
-                is_loop: false,
-            });
-        } else if tok.text.eq_ignore_ascii_case("exit") || tok.text.eq_ignore_ascii_case("continue")
-        {
-            if let Some(&next) = t.get(i)
-                && let Some(span) = name(next)
-            {
-                let wanted = key(next);
-                if let Some(b) = blocks
-                    .iter()
-                    .rev()
-                    .find(|b| b.label.as_ref().is_some_and(|(k, _)| k == &wanted))
-                    && (b.is_loop || tok.text.eq_ignore_ascii_case("exit"))
-                {
-                    usage(out, span, owner, b.label.as_ref().unwrap().1, false);
-                }
-            }
-        } else if tok.text.eq_ignore_ascii_case("end") {
-            let block = blocks.pop();
-            if matches!(
-                word(t, i).to_ascii_lowercase().as_str(),
-                "loop" | "if" | "case"
-            ) {
-                i += 1;
-            }
-            if let Some((k, id)) = block.and_then(|b| b.label)
-                && let Some(&next) = t.get(i)
-                && let Some(span) = name(next)
-                && key(next) == k
-            {
-                usage(out, span, owner, id, false);
-            }
-        }
+impl Block {
+    fn jump(blocks: &[Self], wanted: &str, exit: bool) -> Option<usize> {
+        let (id, block) = blocks
+            .iter()
+            .rev()
+            .find_map(|block| Some((block.target(wanted)?, block)))?;
+        (exit || block.is_loop).then_some(id)
+    }
+
+    fn target(&self, name: &str) -> Option<usize> {
+        let (key, target) = self.label.as_ref()?;
+        (key == name).then_some(*target)
     }
 }
-fn routines(source: &str, t: &[Token<'_>], out: &mut Analysis, mixed: bool) {
-    let mut i = 0;
-    while i < t.len() {
-        let tok = t[i];
-        i += 1;
-        if !tok.text.eq_ignore_ascii_case("create") {
-            continue;
-        }
-        let mut j = i;
-        if word(t, j).eq_ignore_ascii_case("or") && word(t, j + 1).eq_ignore_ascii_case("replace") {
-            j += 2;
-        }
-        let kind = if word(t, j).eq_ignore_ascii_case("function") {
-            "function_definition"
-        } else if word(t, j).eq_ignore_ascii_case("procedure") {
-            "procedure_declaration"
-        } else {
-            continue;
+
+fn label_header(t: &[Token], i: usize) -> Option<(String, Range<usize>)> {
+    let [left, candidate, right, close, body, ..] = t.get(i..)? else {
+        return None;
+    };
+    if (left.text, right.text, close.text) != ("<", ">", ">")
+        || !["declare", "begin", "loop", "while", "for", "foreach"]
+            .iter()
+            .any(|w| body.text.eq_ignore_ascii_case(w))
+    {
+        return None;
+    }
+    Some((key(*candidate), name(*candidate)?))
+}
+
+fn label_use(
+    token: Option<&Token>,
+    out: &mut Analysis,
+    owner: Option<usize>,
+    find: impl FnOnce(&str) -> Option<usize>,
+) {
+    let Some(&token) = token else { return };
+    let Some(span) = name(token) else { return };
+    if let Some(target) = find(&key(token)) {
+        out.direct_edge(target, span, owner, false);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockWord {
+    Begin,
+    Loop,
+    Branch,
+    Exit,
+    Continue,
+    End,
+    Label,
+    Other,
+}
+impl BlockWord {
+    fn read(word: &str) -> Self {
+        const WORDS: &[(&str, BlockWord)] = &[
+            ("begin", BlockWord::Begin),
+            ("loop", BlockWord::Loop),
+            ("if", BlockWord::Branch),
+            ("case", BlockWord::Branch),
+            ("exit", BlockWord::Exit),
+            ("continue", BlockWord::Continue),
+            ("end", BlockWord::End),
+            ("<", BlockWord::Label),
+        ];
+        WORDS
+            .iter()
+            .find_map(|&(key, kind)| word.eq_ignore_ascii_case(key).then_some(kind))
+            .unwrap_or(Self::Other)
+    }
+}
+
+#[derive(Default)]
+struct Blocks {
+    stack: Vec<Block>,
+    pending: Option<(String, usize)>,
+}
+
+impl Blocks {
+    fn open(&mut self, is_loop: bool) {
+        self.stack.push(Block {
+            label: self.pending.take(),
+            is_loop,
+        });
+    }
+
+    fn header(&mut self, tokens: &[Token], next: usize, out: &mut Analysis) -> usize {
+        let Some((key, span)) = label_header(tokens, next) else {
+            return next;
         };
+        self.pending = Some((key, declare(out, span, "label")));
+        next + 4
+    }
+
+    fn close(
+        &mut self,
+        tokens: &[Token],
+        next: usize,
+        owner: Option<usize>,
+        out: &mut Analysis,
+    ) -> usize {
+        let block = self.stack.pop();
+        let label = next
+            + usize::from(matches!(
+                BlockWord::read(word(tokens, next)),
+                BlockWord::Loop | BlockWord::Branch
+            ));
+        if let Some(block) = block.filter(|block| block.label.is_some()) {
+            label_use(tokens.get(label), out, owner, |wanted| block.target(wanted));
+        }
+        label
+    }
+
+    fn observe(
+        &mut self,
+        tokens: &[Token],
+        (at, word): (usize, BlockWord),
+        owner: Option<usize>,
+        out: &mut Analysis,
+    ) -> usize {
+        let next = at + 1;
+        match word {
+            BlockWord::Label => return self.header(tokens, next, out),
+            BlockWord::Begin | BlockWord::Loop => self.open(word == BlockWord::Loop),
+            BlockWord::Branch => self.stack.push(Block {
+                label: None,
+                is_loop: false,
+            }),
+            BlockWord::Exit | BlockWord::Continue => {
+                label_use(tokens.get(next), out, owner, |wanted| {
+                    Block::jump(&self.stack, wanted, word == BlockWord::Exit)
+                });
+            }
+            BlockWord::End => return self.close(tokens, next, owner, out),
+            BlockWord::Other => {}
+        }
+        next
+    }
+}
+
+fn labels(tokens: &[Token], out: &mut Analysis, owner: Option<usize>) {
+    let mut blocks = Blocks::default();
+    let mut at = 0;
+    while let Some(token) = tokens.get(at) {
+        at = blocks.observe(tokens, (at, BlockWord::read(token.text)), owner, out);
+    }
+}
+
+struct Routine {
+    name: Range<usize>,
+    raw: Range<usize>,
+    function: bool,
+    procedural: bool,
+    body: Option<Range<usize>>,
+}
+
+#[derive(Default)]
+struct RoutineOptions<'a> {
+    plpgsql: bool,
+    body: Option<Token<'a>>,
+}
+
+impl<'a> RoutineOptions<'a> {
+    fn observe(&mut self, tokens: &[Token<'a>], at: usize, keyword: &str) {
+        if keyword.eq_ignore_ascii_case("as") {
+            self.body = tokens.get(at + 1).copied();
+            return;
+        }
+        if keyword.eq_ignore_ascii_case("language") && admits_language(word(tokens, at - 1)) {
+            let spelling = word(tokens, at + 1);
+            self.plpgsql = spelling.eq_ignore_ascii_case("plpgsql")
+                || matches!(spelling, "\"plpgsql\"" | "'plpgsql'");
+        }
+    }
+
+    fn body_span(&self) -> Option<Range<usize>> {
+        let token = self.body.filter(|_| self.plpgsql)?;
+        let content = crate::domain::code::lexer::dollar_content(token.text)?;
+        Some(token.at + content.start..token.at + content.end)
+    }
+}
+
+fn admits_language(previous: &str) -> bool {
+    !previous.eq_ignore_ascii_case("set") && !previous.eq_ignore_ascii_case("returns")
+}
+
+fn routine_body(t: &[Token<'_>], start: usize) -> (usize, bool, Option<Range<usize>>) {
+    let mut depth = 0usize;
+    let mut options = RoutineOptions::default();
+    let mut end = start;
+    while end < t.len() && t[end].text != ";" {
+        match t[end].text {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            keyword if depth == 0 => options.observe(t, end, keyword),
+            _ => {}
+        }
+        end += 1;
+    }
+    (end, options.plpgsql, options.body_span())
+}
+
+fn after_create<'a>(at: usize, word: impl Fn(usize) -> &'a str) -> usize {
+    if word(at).eq_ignore_ascii_case("or") && word(at + 1).eq_ignore_ascii_case("replace") {
+        at + 2
+    } else {
+        at
+    }
+}
+
+impl Routine {
+    fn after_create(t: &[Token<'_>], i: usize) -> Option<(usize, Self)> {
+        let mut j = after_create(i, |j| word(t, j));
+        let function = word(t, j).eq_ignore_ascii_case("function");
+        if !function && !word(t, j).eq_ignore_ascii_case("procedure") {
+            return None;
+        }
         j += 1;
-        let Some(mut span) = t.get(j).and_then(|n| name(*n)) else {
-            continue;
-        };
+        let mut span = name(*t.get(j)?)?;
         while word(t, j + 1) == "."
             && let Some(part) = t.get(j + 2).and_then(|n| name(*n))
         {
@@ -113,83 +246,194 @@ fn routines(source: &str, t: &[Token<'_>], out: &mut Analysis, mixed: bool) {
             span = part;
         }
         if word(t, j + 1) != "(" {
-            continue;
+            return None;
         }
         let raw_span = t[j].span();
-        let mut depth = 0usize;
-        let mut plpgsql = false;
-        let mut body = None;
-        let mut end = j + 1;
-        while end < t.len() && t[end].text != ";" {
-            match t[end].text {
-                "(" => depth += 1,
-                ")" => depth = depth.saturating_sub(1),
-                keyword
-                    if depth == 0
-                        && keyword.eq_ignore_ascii_case("language")
-                        && !word(t, end - 1).eq_ignore_ascii_case("set")
-                        && !word(t, end - 1).eq_ignore_ascii_case("returns") =>
-                {
-                    plpgsql = word(t, end + 1).eq_ignore_ascii_case("plpgsql")
-                        || matches!(word(t, end + 1), "\"plpgsql\"" | "'plpgsql'");
-                }
-                keyword if depth == 0 && keyword.eq_ignore_ascii_case("as") => {
-                    body = t.get(end + 1).copied();
-                }
-                _ => {}
-            }
-            end += 1;
-        }
-        i = end;
-        if mixed && !plpgsql {
-            continue;
-        }
-        let kind = match (mixed, kind) {
-            (true, "function_definition") => "plpgsql_function",
-            (true, _) => "plpgsql_procedure",
-            (_, kind) => kind,
-        };
-        let owner = if mixed
-            && let Some(id) = out.declarations.iter().position(|d| {
-                d.kind == "object_reference" && (d.span == raw_span || d.span == span)
-            }) {
-            out.declarations[id].span = span;
-            out.declarations[id].kind = kind;
-            id
-        } else {
-            declare(out, span, kind)
-        };
-        if plpgsql
-            && let Some(body) = body
-            && body.text.starts_with('$')
-            && let Some(k) = body.text[1..].find('$')
+        let (end, plpgsql, body) = routine_body(t, j + 1);
+        Some((
+            end,
+            Self {
+                name: span,
+                raw: raw_span,
+                function,
+                procedural: plpgsql,
+                body,
+            },
+        ))
+    }
+}
+
+fn visit_routines(t: &[Token<'_>], mut visit: impl FnMut(Routine)) {
+    let mut i = 0;
+    while let Some(token) = t.get(i) {
+        i += 1;
+        if token.text.eq_ignore_ascii_case("create")
+            && let Some((end, routine)) = Routine::after_create(t, i)
         {
-            let width = k + 2;
-            if body.text.len() >= 2 * width && body.text.ends_with(&body.text[..width]) {
-                let base = body.at + width;
-                let mut inner = tokens(&source[base..body.span().end - width], Language::PlPgSql);
-                for token in &mut inner {
-                    token.at += base;
-                }
-                labels(&inner, out, Some(owner));
-            }
+            i = end;
+            visit(routine);
         }
     }
 }
 
-pub(super) fn sql_routines(source: &str, out: &mut Analysis) {
-    let t = tokens(source, Language::PlPgSql);
-    // The outer SQL parser emits declarations only. Its generic lexer can see
-    // CREATE text inside a PostgreSQL dollar body or a nested comment.
-    out.declarations.retain(|d| {
-        d.kind != "object_reference" || t.binary_search_by_key(&d.span.start, |tok| tok.at).is_ok()
+pub(in crate::domain::code) fn body_comments(
+    source: &str,
+    t: &[Token<'_>],
+    mut comment: impl FnMut(usize),
+) -> bool {
+    let mut found = false;
+    visit_routines(t, |r| {
+        found |= r.procedural;
+        if let Some(body) = r.body {
+            super::tokens_with_comments(&source[body.clone()], Language::PlPgSql, |at| {
+                comment(body.start + at)
+            });
+        }
     });
-    routines(source, &t, out, true);
+    found
+}
+
+impl Routine {
+    fn bind_outer(&self, out: &mut Analysis, outer_count: usize, next: &mut usize) -> usize {
+        while *next < outer_count && out.declarations[*next].span.start < self.raw.start {
+            *next += 1;
+        }
+        let kind = if self.function {
+            "plpgsql_function"
+        } else {
+            "plpgsql_procedure"
+        };
+        if *next < outer_count
+            && (out.declarations[*next].span == self.raw
+                || out.declarations[*next].span == self.name)
+        {
+            let id = *next;
+            *next += 1;
+            out.declarations[id].span = self.name.clone();
+            out.declarations[id].kind = kind;
+            id
+        } else {
+            declare(out, self.name.clone(), kind)
+        }
+    }
+
+    fn body_labels(&self, source: &str, out: &mut Analysis, owner: usize) {
+        if let Some(body) = &self.body {
+            let mut inner = tokens(&source[body.clone()], Language::PlPgSql);
+            for token in &mut inner {
+                token.at += body.start;
+            }
+            labels(&inner, out, Some(owner));
+        }
+    }
+}
+
+// The outer SQL grammar also recognizes non-PostgreSQL identifier spellings
+// such as backticks. Keep its source spans even when a procedural body is present.
+fn object_name_start<'a>(at: usize, word: impl Fn(usize) -> &'a str) -> Option<usize> {
+    let mut at = after_create(at, &word);
+    while ["temporary", "temp", "unlogged", "materialized"]
+        .iter()
+        .any(|kind| word(at).eq_ignore_ascii_case(kind))
+    {
+        at += 1;
+    }
+    if !["table", "view", "procedure", "function", "sequence"]
+        .iter()
+        .any(|kind| word(at).eq_ignore_ascii_case(kind))
+    {
+        return None;
+    }
+    let start = at + 1;
+    let extension = ["if", "not", "exists"]
+        .iter()
+        .enumerate()
+        .all(|(offset, part)| word(start + offset).eq_ignore_ascii_case(part));
+    Some(start + 3 * usize::from(extension))
+}
+
+fn object_name<'a>(
+    t: &'a [crate::domain::code::Token],
+    at: usize,
+) -> Option<&'a crate::domain::code::Token<'a>> {
+    use crate::domain::code::Kind;
+    let word = |i: usize| t.get(i).map_or("", |tok| tok.text);
+    let mut i = object_name_start(at, word)?;
+    while word(i + 1) == "." {
+        i += 2;
+    }
+    let name = t.get(i)?;
+    (name.kind == Kind::Word || name.kind == Kind::String && name.text.starts_with(['"', '`']))
+        .then_some(name)
+}
+
+fn procedural_language(keyword: &str, name: Option<&crate::domain::code::Token>) -> bool {
+    keyword.eq_ignore_ascii_case("language")
+        && name.is_some_and(|token| {
+            token
+                .text
+                .trim_matches(['\'', '"'])
+                .eq_ignore_ascii_case("plpgsql")
+        })
+}
+
+fn outer_names(outer: &[crate::domain::code::Token], out: &mut Analysis) -> bool {
+    let mut mixed = false;
+    for (i, token) in outer.iter().enumerate() {
+        let next = i + 1;
+        if token.text.eq_ignore_ascii_case("create") {
+            out.declarations
+                .extend(
+                    object_name(outer, next).map(|name| crate::domain::code::Declaration {
+                        span: name.span.clone(),
+                        kind: "object_reference",
+                    }),
+                );
+            continue;
+        }
+        mixed |= !mixed && procedural_language(token.text, outer.get(next));
+    }
+    mixed
+}
+
+pub(in crate::domain::code) fn sql(source: &str, outer: &[crate::domain::code::Token]) -> Analysis {
+    let mut out = Analysis::default();
+    if !outer_names(outer, &mut out) {
+        return out;
+    }
+    // Declarations and procedural tokens are both in source order. Reject
+    // outer names hidden inside a nested comment or dollar-quoted literal.
+    let t = tokens(source, Language::PlPgSql);
+    let mut token = t.iter().peekable();
+    out.declarations.retain(|d| {
+        while token.next_if(|t| t.at < d.span.start).is_some() {}
+        token.peek().is_some_and(|t| t.at == d.span.start)
+    });
+    // Upgrade the existing declaration in place so forward IDs keep their
+    // source order. Body labels and new routine names follow all outer names.
+    let outer_count = out.declarations.len();
+    let mut next = 0;
+    visit_routines(&t, |r| {
+        if !r.procedural {
+            return;
+        }
+        let owner = r.bind_outer(&mut out, outer_count, &mut next);
+        r.body_labels(source, &mut out, owner);
+    });
+    out
 }
 
 pub(super) fn analyze(source: &str, t: &[Token<'_>]) -> Analysis {
     let mut out = Analysis::default();
-    routines(source, t, &mut out, false);
+    visit_routines(t, |r| {
+        let kind = if r.function {
+            "function_definition"
+        } else {
+            "procedure_declaration"
+        };
+        let owner = declare(&mut out, r.name.clone(), kind);
+        r.body_labels(source, &mut out, owner);
+    });
     labels(t, &mut out, None);
     out
 }

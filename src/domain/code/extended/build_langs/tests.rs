@@ -1,5 +1,5 @@
 use super::*;
-use Language::*;
+use crate::domain::code::{analyze, Language::*};
 
 fn declarations<'a>(a: &Analysis, s: &'a str) -> Vec<(&'a str, &'static str)> {
     a.declarations
@@ -67,6 +67,18 @@ fn make_targets_variables_and_recursive_recipe() {
         ]
     );
 }
+#[test]
+fn make_comment_offsets_follow_recipe_prefix_and_continuations() {
+    let source = concat!(
+        "  # first\n.RECIPEPREFIX := !\ntarget:\n!# recipe\n",
+        "VALUE = one \\\n# continued operand\n",
+        "define BODY\ndefine INNER\n# body\nendef\nendef\n#",
+    );
+    let mut offsets = Vec::new();
+    super::make_comments(source, |offset| offsets.push(offset));
+    assert_eq!(offsets, [source.find("# first").unwrap(), source.len() - 1]);
+}
+
 #[test]
 fn batch_call_and_goto_have_different_meanings() {
     let s = "@echo off\r\n:Main\r\n@CALL :Work x\r\ngoto :work\r\nrem call :Work\r\necho call :Work\r\n::fake\r\n:Work\r\ngoto :eof\r\n";
@@ -143,6 +155,23 @@ fn hcl_terraform_addresses_scope_labels_and_ignore_literals() {
         ]
     );
 }
+#[test]
+fn hcl_data_addresses_preserve_the_target_across_comments_and_field_access() {
+    let source = r#"data "platform" "server" {}
+locals {
+  spaced = data /* gap */ . platform . server.zone
+  direct = "${data.platform.server.zone}"
+  invalid = "${data.platform.server.bad!}"
+}"#;
+    assert_eq!(
+        edges(&analyze(Hcl, source), source),
+        [
+            ("server", "server", Some("spaced"), false),
+            ("server", "server", Some("direct"), false),
+        ]
+    );
+}
+
 #[test]
 fn nix_recursive_let_static_selections_params_and_nonrecursive_attrs() {
     let s = "let base = 1; fn = x: x; cfg = { base = 2; value = base; }; other = rec { a = 1; b = a; }; in fn cfg.value";

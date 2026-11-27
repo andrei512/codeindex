@@ -36,18 +36,22 @@ PROJECTS = {
 }
 
 
+def fetch_archive(archive, repo, revision, digest):
+    url = f"https://codeload.github.com/{repo}/tar.gz/{revision}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        data = response.read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError(f"archive checksum mismatch: {repo}")
+    archive.write_bytes(data)
+
+
 def source(language, directory):
     repo, revision, digest = PROJECTS[language]
     archive = ROOT / "target/finding-eval" / (revision + ".tgz")
     if not archive.exists():
         archive = directory.parent / (revision + ".tgz")
         if not archive.exists():
-            url = f"https://codeload.github.com/{repo}/tar.gz/{revision}"
-            with urllib.request.urlopen(url, timeout=60) as response:
-                data = response.read()
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise ValueError(f"archive checksum mismatch: {repo}")
-            archive.write_bytes(data)
+            fetch_archive(archive, repo, revision, digest)
     if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
         raise ValueError(f"archive checksum mismatch: {repo}")
     # Re-extract complete regular files; previously edited sources must never
@@ -116,6 +120,10 @@ def libuv_locations(root, directory):
                     "-DLIBUV_BUILD_BENCH=OFF", "-DCMAKE_BUILD_TYPE=Release"], check=True)
     subprocess.run([*cmake, "--build", build, "--target", "uv_run_tests", "--parallel", "8"], check=True)
     listing = subprocess.check_output([build / "uv_run_tests", "--list"], cwd=root, text=True)
+    return match_registrations(libuv_registered(listing), libuv_declarations(root))
+
+
+def libuv_registered(listing):
     registered = set()
     for row in listing.splitlines():
         item = re.fullmatch(r"(\w+)\s*(?:\(helpers: ([\w ]+)\))?", row)
@@ -123,6 +131,10 @@ def libuv_locations(root, directory):
             raise ValueError(f"Unrecognized libuv runner row: {row}")
         registered.add(("test", item[1]))
         registered.update(("test-support", name) for name in (item[2] or "").split())
+    return registered
+
+
+def libuv_declarations(root):
     declarations = defaultdict(list)
     for path in (root / "test").rglob("*.c"):
         for line, text in enumerate(path.read_text().splitlines(), 1):
@@ -130,6 +142,10 @@ def libuv_locations(root, directory):
             if match:
                 role = "test-support" if match[1] == "HELPER_IMPL" else "test"
                 declarations[role, match[2]].append((str(path.relative_to(root)), line))
+    return declarations
+
+
+def match_registrations(registered, declarations):
     result = defaultdict(dict)
     unresolved = []
     for role, name in sorted(registered):
@@ -144,6 +160,32 @@ def libuv_locations(root, directory):
     return result
 
 
+def project_labels(language, origin, directory):
+    repo, revision = origin
+    root = source(language, directory)
+    if language == "python":
+        dest = directory / "pytest.json"
+        env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONPATH=str(root / "src"))
+        subprocess.run(["uv", "run", "--no-project", "--isolated", "--python", PYTHON,
+                        "--with", f"pytest=={PYTEST}", "--with", root, "python", __file__, "_pytest", dest],
+                       cwd=root, env=env, check=True)
+        result = json.loads(dest.read_text())
+    else:
+        result = libuv_locations(root, directory)
+    for path, labels in result.items():
+        b = (root / path).read_bytes()
+        yield dict(language=language, repository=repo, revision=revision, path=path,
+                         sha256=hashlib.sha256(b).hexdigest(), split="dev",
+                         labels=sorted([int(line), *label] for line, label in labels.items()))
+    if language == "c":
+        # libuv defines its registration macros in a shared header. Keep
+        # that input visible to cx without assigning any role to it.
+        path = "test/task.h"
+        yield dict(language=language, repository=repo, revision=revision, path=path,
+                         sha256=hashlib.sha256((root / path).read_bytes()).hexdigest(),
+                         split="dev", labels=[], context=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -154,28 +196,7 @@ def main():
     with tempfile.TemporaryDirectory(dir=cache_root) as tmp:
         directory = Path(tmp)
         for language, (repo, revision, _) in PROJECTS.items():
-            root = source(language, directory)
-            if language == "python":
-                dest = directory / "pytest.json"
-                env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONPATH=str(root / "src"))
-                subprocess.run(["uv", "run", "--no-project", "--isolated", "--python", PYTHON,
-                                "--with", f"pytest=={PYTEST}", "--with", root, "python", __file__, "_pytest", dest],
-                               cwd=root, env=env, check=True)
-                result = json.loads(dest.read_text())
-            else:
-                result = libuv_locations(root, directory)
-            for path, labels in result.items():
-                b = (root / path).read_bytes()
-                rows.append(dict(language=language, repository=repo, revision=revision, path=path,
-                                 sha256=hashlib.sha256(b).hexdigest(), split="dev",
-                                 labels=sorted([int(line), *label] for line, label in labels.items())))
-            if language == "c":
-                # libuv defines its registration macros in a shared header. Keep
-                # that input visible to cx without assigning any role to it.
-                path = "test/task.h"
-                rows.append(dict(language=language, repository=repo, revision=revision, path=path,
-                                 sha256=hashlib.sha256((root / path).read_bytes()).hexdigest(),
-                                 split="dev", labels=[], context=True))
+            rows.extend(project_labels(language, (repo, revision), directory))
     rows.sort(key=lambda r: (r["language"], r["path"]))
     for language in PROJECTS:
         print(language, dict(Counter(role for r in rows if r["language"] == language

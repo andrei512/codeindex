@@ -15,6 +15,10 @@ The score is a deterministic function of the findings saved for one file. Each r
 | Parameters | 5 | A = 2 if present |
 | Similar body (code lines) | 10 | U = 4 if present |
 
+For Rust, each arm of a written `match` expression contributes to branch complexity. A `=>` used to declare a macro rule or a wire tag contributes no branch by itself. A `match` written inside a macro body still contributes its arms.
+
+The Rust parameter count omits bare `_` parameters in functions declared with a foreign ABI, such as `extern "C" fn`. Such slots can be required by the caller even when the function ignores them. Named parameters, including names beginning with an underscore, still count. Functions using the Rust ABI count wildcard parameters as well. An implicit `extern fn` uses the C ABI. The scorer also retains wildcard parameters when the written ABI string contains escapes.
+
 Empty sums, the maximum over no findings, and absent penalties are zero. Set F to 2 if C or L is positive and to zero otherwise.
 
 ```text

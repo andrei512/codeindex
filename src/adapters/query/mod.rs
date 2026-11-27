@@ -3,106 +3,259 @@ mod json;
 use display::Display;
 mod lines;
 pub(crate) use lines::pcre::version as pcre_version;
+pub(crate) use lines::{CallerOutput, Options as LineOptions, ValueOption, switch_spellings};
 mod navigation;
 mod relationships;
+pub(super) use relationships::Operation as RelationshipOperation;
 mod score;
 use crate::{
     adapters::snapshot::Pin,
     adapters::snapshot::manifest::*,
     domain::{
-        content_lookup::{Cursor, ExtentRead},
+        content_lookup::Cursor,
         markdown::is_markdown,
-        pattern::{Glob, Regex},
+        pattern::{Glob, Regex, Scratch},
         ranked::RankedIndex,
     },
 };
-use json::{array, object, quote};
-use navigation::Markdown;
+use json::{object, quote};
+use navigation::{DocumentQuery, Markdown};
 use std::{collections::BTreeSet, io, path::Path};
+
+#[derive(Clone, Copy)]
+pub struct ScoreOptions {
+    json: bool,
+    test_rules: bool,
+    project_policy: bool,
+}
 
 pub enum Request<'a> {
     Lines(lines::Lines<'a>),
-    Roles(Option<&'a str>, bool),
-    Score(Option<&'a str>, bool),
-    BaselineScore(Option<&'a str>, bool),
+    Roles(Option<String>, bool),
+    Score(Option<String>, ScoreOptions),
+    Page(PageQuery<'a>),
+    Document(DocumentQuery<'a>),
+    Relationship(relationships::Query<'a>),
+}
+pub enum PageQuery<'a> {
     Search(&'a str),
     Symbol(&'a str),
     Content(&'a str),
     Regex(Regex),
-    Path(&'a str),
-    PathRegex(Regex),
+    Paths(PathQuery<'a>),
+}
+pub enum PathQuery<'a> {
+    Contains(&'a str),
+    Regex(Regex),
     Exact(&'a str),
     Glob(Glob),
-    Section(&'a str, bool),
-    Backlinks(&'a str),
-    NamedRelationship(&'a str, &'a str),
-    Relationship(&'a str, &'a str, usize, usize),
 }
-impl<'a> Request<'a> {
-    pub fn parse(args: &'a [String]) -> Result<Self, String> {
-        let mut v: Vec<_> = args.iter().map(String::as_str).collect();
-        if let Some(verb) = v.first_mut() {
-            *verb = match *verb {
-                "--refs" | "--reference" => "references",
-                "--symbol" => "symbol",
-                original => original,
-            };
-        }
-        let pos = |s: &str| {
-            s.parse::<usize>()
-                .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| "expected a positive position".to_string())
-        };
-        Ok(match v.as_slice() {
-            ["-k" | "--keywords" | "rank", q] if !q.trim().is_empty() => Self::Search(q),
-            ["content", q] if !q.is_empty() => Self::Content(q),
-            ["regex", q] if !q.is_empty() => Self::Regex(Regex::new(q)?),
-            ["path", q] if !q.is_empty() => Self::Path(q),
-            ["path-regex", q] if !q.is_empty() => Self::PathRegex(Regex::new(q)?),
-            ["path-exact", q] if !q.is_empty() => Self::Exact(q),
-            ["glob", q] if !q.is_empty() => Self::Glob(Glob::new(q)?),
-            ["symbol", q] if !q.is_empty() => Self::Symbol(q),
-            ["section", q] => Self::Section(q, false),
-            ["section", q, "--parent"] => Self::Section(q, true),
-            ["backlinks", q] => Self::Backlinks(q),
-            [op @ ("callers" | "references"), name] if !name.is_empty() => {
-                Self::NamedRelationship(op, name)
+
+impl PathQuery<'_> {
+    fn collect(self, pin: &Pin, page: &mut page::Page) -> io::Result<()> {
+        match self {
+            Self::Contains(q) => {
+                page.paths(pin, candidates(pin, PATHGRAM, q)?, |path| path.contains(q));
             }
-            [
-                op @ ("definition" | "references" | "callers"),
-                path,
-                line,
-                col,
-            ] => Self::Relationship(op, path, pos(line)?, pos(col)?),
-            _ => return Err("invalid query arguments".into()),
+            Self::Regex(re) => {
+                let mut scratch = Scratch::default();
+                page.paths(
+                    pin,
+                    candidates(pin, PATHGRAM, re.required_literal())?,
+                    |path| re.matches_with(path, &mut scratch).next().is_some(),
+                );
+            }
+            Self::Exact(q) => {
+                if let Ok(i) = pin.files.binary_search_by(|f| f.path().cmp(q)) {
+                    page.path(pin.files[i].path());
+                }
+            }
+            Self::Glob(g) => {
+                let mut scratch = Scratch::default();
+                page.paths(pin, 0..pin.files.len(), |path| {
+                    g.matches_with(path, &mut scratch)
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Command {
+    Rank,
+    Page(PageCommand),
+    Relationship(relationships::Operation),
+    Section,
+    Backlinks,
+    Intro,
+    Help,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageCommand {
+    Content,
+    Regex,
+    Path,
+    PathExact,
+    PathRegex,
+    Glob,
+    Symbol,
+}
+
+impl Command {
+    pub(crate) fn advanced(name: &str) -> Option<Self> {
+        use relationships::Operation;
+        use PageCommand::*;
+        const SPELLINGS: &[(&str, Command)] = &[
+            ("rank", Command::Rank),
+            ("-k", Command::Rank),
+            ("--keywords", Command::Rank),
+            ("content", Command::Page(Content)),
+            ("regex", Command::Page(Regex)),
+            ("path", Command::Page(Path)),
+            ("path-exact", Command::Page(PathExact)),
+            ("path-regex", Command::Page(PathRegex)),
+            ("glob", Command::Page(Glob)),
+            ("symbol", Command::Page(Symbol)),
+            ("--symbol", Command::Page(Symbol)),
+            ("definition", Command::Relationship(Operation::Definition)),
+            ("references", Command::Relationship(Operation::References)),
+            ("--reference", Command::Relationship(Operation::References)),
+            ("callers", Command::Relationship(Operation::Callers)),
+            ("section", Command::Section),
+            ("backlinks", Command::Backlinks),
+            ("intro", Command::Intro),
+            ("help", Command::Help),
+        ];
+        SPELLINGS.iter().find(|&&(spelling, _)| spelling == name).map(|&(_, command)| command)
+    }
+}
+
+impl<'a> Request<'a> {
+    fn parse_public(command: Command, args: &'a [String]) -> Result<(Self, Display), String> {
+        let (request, flags) = match command {
+            Command::Relationship(operation) => {
+                let (query, flags) = relationships::Query::parse_public(operation, args)?;
+                (Self::Relationship(query), flags)
+            }
+            _ => {
+                let (operands, flags) = args.split_at_checked(1).ok_or("missing indexed query operand")?;
+                (Self::parse_command(command, operands)?, flags)
+            }
+        };
+        Ok((request, Display::parse(flags)?))
+    }
+
+    fn parse_command(command: Command, operands: &'a [String]) -> Result<Self, String> {
+        match command {
+            Command::Relationship(operation) => relationships::Query::parse(operation, operands).map(Self::Relationship),
+            Command::Section => DocumentQuery::section(operands).map(Self::Document),
+            _ => Self::parse_single_operand(command, operands),
+        }
+    }
+
+    fn parse_single_operand(command: Command, operands: &'a [String]) -> Result<Self, String> {
+        match (command, operands) {
+            (Command::Rank, [q]) if !q.trim().is_empty() => Ok(Self::Page(PageQuery::Search(q))),
+            (Command::Backlinks, [handle]) => Ok(Self::Document(DocumentQuery::Backlinks(handle))),
+            (Command::Page(page), [q]) if !q.is_empty() => PageQuery::parse(page, q).map(Self::Page),
+            _ => Err("invalid query arguments".into()),
+        }
+    }
+}
+
+impl<'a> DocumentQuery<'a> {
+    fn section(operands: &'a [String]) -> Result<Self, String> {
+        match operands {
+            [handle] => Ok(Self::Section { handle, parent: false }),
+            [handle, flag] if flag == "--parent" => Ok(Self::Section { handle, parent: true }),
+            _ => Err("invalid query arguments".into()),
+        }
+    }
+}
+
+impl<'a> PageQuery<'a> {
+    fn parse(command: PageCommand, query: &'a str) -> Result<Self, String> {
+        Ok(match command {
+            PageCommand::Content => Self::Content(query),
+            PageCommand::Regex => Self::Regex(Regex::new(query)?),
+            PageCommand::Path => Self::Paths(PathQuery::Contains(query)),
+            PageCommand::PathRegex => Self::Paths(PathQuery::Regex(Regex::new(query)?)),
+            PageCommand::PathExact => Self::Paths(PathQuery::Exact(query)),
+            PageCommand::Glob => Self::Paths(PathQuery::Glob(Glob::new(query)?)),
+            PageCommand::Symbol => Self::Symbol(query),
         })
     }
 }
-fn candidates(pin: &Pin, product: usize, q: &str) -> io::Result<Vec<usize>> {
-    if pin.is_memory() { return Ok((0..pin.files.len()).collect()); }
-    let chars: Vec<_> = q.chars().take(18).collect();
-    if chars.len() < 3 {
-        return Ok((0..pin.files.len()).collect());
-    }
-    let keys: BTreeSet<_> = chars.windows(3).map(|x| [x[0], x[1], x[2]]).collect();
-    Cursor::open(pin.reader(product)?)?.candidates(keys, pin.files.len())
+
+/// A full scan needs only the file count. Indexed searches own their posting list.
+enum Candidates {
+    All(usize),
+    Postings(Vec<usize>),
 }
-fn add_crumbs(
+
+impl Candidates {
+    fn len(&self) -> usize {
+        match self {
+            Self::All(count) => *count,
+            Self::Postings(ids) => ids.len(),
+        }
+    }
+}
+
+impl IntoIterator for Candidates {
+    type Item = usize;
+    type IntoIter = std::iter::Chain<std::ops::Range<usize>, std::vec::IntoIter<usize>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let (count, postings) = match self {
+            Self::All(count) => (count, Vec::new()),
+            Self::Postings(ids) => (0, ids),
+        };
+        (0..count).chain(postings)
+    }
+}
+
+fn candidates(pin: &Pin, product: usize, q: &str) -> io::Result<Candidates> {
+    let count = pin.files.len();
+    if pin.is_memory() {
+        return Ok(Candidates::All(count));
+    }
+    let keys = query_trigrams(q);
+    if keys.is_empty() {
+        return Ok(Candidates::All(count));
+    }
+    Cursor::open(pin.reader(product)?)?
+        .candidates(keys, count)
+        .map(Candidates::Postings)
+}
+
+fn query_trigrams(text: &str) -> BTreeSet<[char; 3]> {
+    let mut chars = text.chars().take(18);
+    let mut keys = BTreeSet::new();
+    if let (Some(mut a), Some(mut b)) = (chars.next(), chars.next()) {
+        for c in chars {
+            keys.insert([a, b, c]);
+            (a, b) = (b, c);
+        }
+    }
+    keys
+}
+
+fn breadcrumbs(
     pin: &Pin,
     md: &mut Option<Markdown>,
     file: usize,
     offset: usize,
-    fields: &mut Vec<(&str, String)>,
-) -> io::Result<()> {
-    if is_markdown(pin.files[file].path()) {
-        if md.is_none() {
-            *md = Some(Markdown::read(pin)?);
-        }
-        let crumbs = md.as_mut().unwrap().hit_crumbs(pin, file, offset)?;
-        fields.push(("breadcrumbs", crumbs));
+) -> io::Result<Option<String>> {
+    if !is_markdown(pin.files[file].path()) {
+        return Ok(None);
     }
-    Ok(())
+    if md.is_none() {
+        *md = Some(Markdown::read(pin)?);
+    }
+    md.as_mut().unwrap().hit_crumbs(pin, file, offset).map(Some)
 }
 #[derive(Default)]
 pub struct Outcome {
@@ -114,316 +267,191 @@ pub struct Invocation<'a> {
     pub mode: &'a str,
     display: Display,
 }
+fn score_request(args: &[String]) -> Result<Request<'static>, String> {
+    use clap::{Arg, ArgAction, Command};
+    let switch = |name: &'static str| Arg::new(name).long(name).action(ArgAction::SetTrue);
+    let mut flags = Command::new("score")
+        .no_binary_name(true)
+        .disable_help_flag(true)
+        .arg(Arg::new("path"))
+        .arg(switch("json"))
+        .arg(switch("roles").conflicts_with_all(["ignore-test-rules", "ignore-score-policy"]))
+        .arg(switch("ignore-test-rules"))
+        .arg(switch("ignore-score-policy"))
+        .try_get_matches_from(args)
+        .map_err(|_| {
+            "usage: cx --score [FILE|DIR] [--roles | --ignore-score-policy] [--json]".to_string()
+        })?;
+    let path = flags.remove_one("path");
+    let json = flags.get_flag("json");
+    Ok(if flags.get_flag("roles") {
+        Request::Roles(path, json)
+    } else {
+        Request::Score(
+            path,
+            ScoreOptions {
+                json,
+                test_rules: !flags.get_flag("ignore-test-rules"),
+                project_policy: !flags.get_flag("ignore-score-policy"),
+            },
+        )
+    })
+}
+
+/// The first argument selects the index and query grammar before config expansion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexedMode {
+    Score,
+    Advanced,
+    Public(Command),
+}
+
+impl IndexedMode {
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        Some(match flag {
+            "--score" => Self::Score,
+            "--cx" => Self::Advanced,
+            "--reference" | "--refs" => Self::Public(Command::Relationship(relationships::Operation::References)),
+            "-k" | "--keywords" => Self::Public(Command::Rank),
+            "--symbol" => Self::Public(Command::Page(PageCommand::Symbol)),
+            _ => return None,
+        })
+    }
+}
+
 impl<'a> Invocation<'a> {
     pub fn parse(args: &'a [String]) -> Result<Self, String> {
         let mode = args.first().ok_or("missing pattern")?.as_str();
-        if mode == "--score" {
-            let mut path = None;
-            let mut json = false;
-            let mut roles = false;
-            let mut baseline = false;
-            for arg in &args[1..] {
-                if arg == "--json" && !json {
-                    json = true;
-                } else if arg == "--ignore-test-rules" && !baseline && !roles {
-                    baseline = true;
-                } else if arg == "--roles" && !roles && !baseline {
-                    roles = true;
-                } else if arg.starts_with('-') || path.replace(arg.as_str()).is_some() {
-                    return Err("usage: cx --score [FILE|DIR] [--roles] [--json]".into());
-                }
-            }
-            return Ok(Self {
-                request: if roles {
-                    Request::Roles(path, json)
-                } else if baseline {
-                    Request::BaselineScore(path, json)
-                } else {
-                    Request::Score(path, json)
-                },
-                mode,
-                display: Display::default(),
-            });
+        match IndexedMode::from_flag(mode) {
+            Some(kind) => Self::indexed(args, kind),
+            None => Self::pattern(mode, args),
         }
-        if mode == "--cx" {
-            let tail = &args[1..];
-            let mode = tail.first().ok_or("missing indexed command")?.as_str();
-            if !super::cli::is_command(mode) && mode != "rank" {
-                return Err("unknown indexed command".into());
-            }
-            return Ok(Self {
-                request: Request::parse(tail)?,
+    }
+
+    /// Canonical pattern arguments already passed mode selection at the boundary.
+    pub(crate) fn pattern(mode: &'a str, args: &'a [String]) -> Result<Self, String> {
+        Self::lines(mode, LineOptions::parse(args)?)
+    }
+
+    pub(crate) fn indexed(args: &'a [String], kind: IndexedMode) -> Result<Self, String> {
+        let mode = args[0].as_str();
+        let (request, mode, display) = match kind {
+            IndexedMode::Score => (
+                score_request(&args[1..])?,
                 mode,
-                display: Display::default(),
-            });
-        }
-        if matches!(
-            mode,
-            "--reference" | "--refs" | "--symbol" | "-k" | "--keywords"
-        ) {
-            let count = if matches!(mode, "--reference" | "--refs")
-                && args.get(2).is_some_and(|s| !s.starts_with('-'))
-            {
-                4
-            } else {
-                2
-            };
-            if args.len() < count {
-                return Err("missing indexed query operand".into());
+                Display::default(),
+            ),
+            IndexedMode::Advanced => {
+                let tail = &args[1..];
+                let name = tail.first().ok_or("missing indexed command")?.as_str();
+                let command = Command::advanced(name).ok_or("unknown indexed command")?;
+                (Request::parse_command(command, &tail[1..])?, name, Display::default())
             }
-            return Ok(Self {
-                request: Request::parse(&args[..count])?,
-                mode,
-                display: Display::parse(&args[count..])?,
-            });
-        }
-        let argv: Vec<_> = args.iter().map(String::as_str).collect();
+            IndexedMode::Public(command) => {
+                let (request, display) = Request::parse_public(command, &args[1..])?;
+                (request, mode, display)
+            }
+        };
+        Ok(Self { request, mode, display })
+    }
+
+    pub(crate) fn lines(mode: &'a str, options: LineOptions<'a>) -> Result<Self, String> {
         Ok(Self {
-            request: Request::Lines(lines::Lines::parse(&argv)?),
+            request: Request::Lines(options.finish()?),
             mode,
             display: Display::default(),
         })
     }
 }
-pub(crate) fn plain(invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<Vec<u8>> {
-    use crate::application::index::build::MemoryQuery;
-    let scope;
-    let needs = match &invocation.request {
-        Request::Score(path, _) | Request::BaselineScore(path, _) => {
-            scope = path.map(|p| relationships::relative(cwd, cwd, p)).transpose()?.unwrap_or_default();
-            MemoryQuery::Score { scope: &scope, test_rules: matches!(invocation.request, Request::Score(..)) }
-        }
-        Request::Roles(..) => MemoryQuery::Source,
-        Request::Lines(lines) => return lines.plain(cwd, outcome),
-        Request::Search(_) => MemoryQuery::Rank { breadcrumbs: invocation.display.json || !invocation.display.public },
-        Request::Symbol(_) => MemoryQuery::Symbols,
-        Request::NamedRelationship(..) | Request::Relationship(..) => MemoryQuery::Relationships,
-        Request::Section(..) | Request::Backlinks(_) => MemoryQuery::Markdown,
-        Request::Content(_) | Request::Regex(_) => MemoryQuery::Content,
-        Request::Exact(_) | Request::Path(_) | Request::PathRegex(_) | Request::Glob(_) => MemoryQuery::Paths,
-    };
-    evaluate(&Pin::memory(cwd, needs)?, invocation, cwd, outcome)
+pub(crate) fn plain(
+    invocation: Invocation<'_>,
+    cwd: &Path,
+    outcome: &mut Outcome,
+) -> io::Result<Vec<u8>> {
+    invocation.execute(None, cwd, outcome)
 }
+
 pub fn evaluate(
     pin: &Pin,
     invocation: Invocation<'_>,
     cwd: &Path,
     outcome: &mut Outcome,
 ) -> io::Result<Vec<u8>> {
-    if let Request::Lines(lines) = invocation.request {
-        return lines.run(pin, cwd, outcome);
-    }
-    evaluate_indexed(pin, invocation, cwd, outcome).map(String::into_bytes)
+    invocation.execute(Some(pin), cwd, outcome)
 }
 
-fn evaluate_indexed(pin: &Pin, invocation: Invocation<'_>, cwd: &Path, outcome: &mut Outcome) -> io::Result<String> {
-    let Invocation {
-        request: req,
-        mut mode,
-        display,
-    } = invocation;
-    let compact = display.public && !display.json;
-    let mut sites = Vec::new();
-    let mut hits = Vec::new();
-    let mut truncated = false;
-    let mut md = None;
-    match req {
-        Request::Roles(path,json) => return score::roles(pin,cwd,path,json,outcome),
-        Request::Score(path, json) => return score::query(pin, cwd, path, json, true, outcome),
-        Request::BaselineScore(path, json) => return score::query(pin, cwd, path, json, false, outcome),
-        Request::Lines(_) => unreachable!("line search returns raw bytes"),
-        Request::NamedRelationship(op, name) => {
-            return relationships::query(
-                pin,
-                cwd,
-                op,
-                relationships::Subject::Name(name),
-                &display,
-                outcome,
-            );
-        }
-        Request::Relationship(op, path, line, col) => {
-            return relationships::query(
-                pin,
-                cwd,
-                op,
-                relationships::Subject::Position(path, line, col),
-                &display,
-                outcome,
-            );
-        }
-        Request::Section(s, parent) => return Markdown::read(pin)?.section(pin, s, parent),
-        Request::Backlinks(s) => return Markdown::read(pin)?.backlinks(pin, s),
-        Request::Search(q) => {
-            mode = "search";
-            let mut reader = pin.reader(RANK)?;
-            let (rows, extra) = RankedIndex::search_extent(
-                reader.length(),
-                |at, bytes| reader.read(at, bytes),
-                pin.files.len(),
-                |i| pin.files[i].path(),
-                |i, r| pin.source_slice(i, r),
-                q,
-            )?;
-            truncated = extra;
-            for h in rows {
-                let entry = &pin.files[h.file];
-                if compact {
-                    sites.push((h.file, h.anchor));
-                    continue;
-                }
-                let mut fields = vec![
-                    ("path", quote(entry.path())),
-                    ("line", h.line.to_string()),
-                    ("last_line", h.last_line.to_string()),
-                    ("score", h.score.to_string()),
-                    ("excerpt", quote(&h.excerpt)),
-                ];
-                add_crumbs(
-                    pin,
-                    &mut md,
-                    h.file,
-                    entry
-                        .line_start(h.line)
-                        .ok_or_else(|| io::Error::other("bad chunk line"))?,
-                    &mut fields,
-                )?;
-                hits.push(object(&fields));
-            }
-        }
-        Request::Symbol(q) => {
-            mode = "symbol";
-            let mut lookup = crate::application::index::symbol_lookup::SymbolLookup::open(
-                pin.reader(SYMBOLS)?,
-                pin.files.len(),
-            )?;
-            let (rows, extra) = lookup.get(q, 50)?;
-            truncated = extra;
-            for s in rows {
-                if compact {
-                    sites.push((s.file, s.span.start));
-                    continue;
-                }
-                let f = &pin.files[s.file];
-                let (l, c) = f.line_column(s.span.start);
-                let start = s.span.start + 1 - c;
-                let col = if start == s.span.start {
-                    1
-                } else {
-                    1 + pin
-                        .source_slice(s.file, start as u64..s.span.start as u64)?
-                        .encode_utf16()
-                        .count()
-                };
-                hits.push(object(&[
-                    ("path", quote(f.path())),
-                    ("line", l.to_string()),
-                    ("byte_column", c.to_string()),
-                    ("col", col.to_string()),
-                    ("name", quote(&s.name)),
-                    ("kind", quote(&s.kind)),
-                ]));
-            }
-        }
-        Request::Content(_) | Request::Regex(_) => {
-            let ids = match &req {
-                Request::Content(q) => candidates(pin, CONTENT, q)?,
-                Request::Regex(re) => candidates(pin, CONTENT, re.required_literal())?,
-                _ => unreachable!(),
-            };
-            let mut scan = (ids.len() == pin.files.len()).then(|| pin.source_window());
-            'files: for id in ids {
-                let f = &pin.files[id];
-                if f.bytes.is_none() {
-                    continue;
-                }
-                let owned;
-                let text = if let Some(window) = &mut scan {
-                    window.get(id)?
-                } else {
-                    owned = pin.source(id)?;
-                    &owned
-                };
-                let found: Box<dyn Iterator<Item = usize> + '_> = match &req {
-                    Request::Content(q) => Box::new(text.match_indices(q).map(|(i, _)| i)),
-                    Request::Regex(re) => Box::new(re.matches(text).map(|r| r.start)),
-                    _ => unreachable!(),
-                };
-                for byte in found {
-                    if hits.len() == 50 {
-                        truncated = true;
-                        break 'files;
-                    }
-                    let (l, c) = f.line_column(byte);
-                    let mut fields = vec![
-                        ("path", quote(f.path())),
-                        ("line", l.to_string()),
-                        ("byte_column", c.to_string()),
-                    ];
-                    add_crumbs(pin, &mut md, id, byte, &mut fields)?;
-                    hits.push(object(&fields));
-                }
-            }
-        }
-        Request::Path(_) | Request::PathRegex(_) | Request::Exact(_) | Request::Glob(_) => {
-            let ids = match &req {
-                Request::Exact(q) => pin
-                    .files
-                    .binary_search_by(|f| f.path().cmp(q))
-                    .ok()
-                    .into_iter()
-                    .collect(),
-                Request::Path(q) => candidates(pin, PATHGRAM, q)?,
-                Request::PathRegex(re) => candidates(pin, PATHGRAM, re.required_literal())?,
-                _ => (0..pin.files.len()).collect(),
-            };
-            for id in ids {
-                let path = pin.files[id].path();
-                let ok = match &req {
-                    Request::Glob(g) => g.is_match(path),
-                    Request::PathRegex(re) => re.matches(path).next().is_some(),
-                    Request::Path(s) => path.contains(s),
-                    _ => true,
-                };
-                if ok {
-                    if hits.len() == 50 {
-                        truncated = true;
-                        break;
-                    }
-                    hits.push(object(&[("path", quote(path))]));
-                }
-            }
+mod page;
+impl Invocation<'_> {
+    /// A line query can read its operands directly when snapshot refresh fails.
+    pub(crate) fn after_refresh(
+        self,
+        pin: Result<&Pin, &io::Error>,
+        cwd: &Path,
+        outcome: &mut Outcome,
+    ) -> io::Result<Vec<u8>> {
+        match pin {
+            Ok(pin) => evaluate(pin, self, cwd, outcome),
+            Err(_) if matches!(self.request, Request::Lines(_)) => self.execute(None, cwd, outcome),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
         }
     }
-    if display.public {
-        outcome.code = u8::from(hits.is_empty() && sites.is_empty());
-        if compact {
-            if truncated {
-                outcome.diagnostics.push_str("cx: results truncated\n");
-            }
-            return display::render(pin, cwd, sites, &display, mode == "search");
+
+    fn execute(self, pin: Option<&Pin>, cwd: &Path, outcome: &mut Outcome) -> io::Result<Vec<u8>> {
+        use crate::application::index::build::MemoryQuery;
+        let Self {
+            request,
+            mode,
+            display,
+        } = self;
+        let mut source = QuerySource {
+            cwd,
+            current: pin,
+            temporary: None,
+        };
+        let result = match request {
+            Request::Lines(lines) => return lines.walk_search(cwd, outcome, pin),
+            Request::Roles(path, json) => source.roles(path.as_deref(), json, outcome),
+            Request::Score(path, options) => source.score(path.as_deref(), options, outcome),
+            Request::Relationship(query) => query.run(
+                source.index(|| MemoryQuery::Relationships)?,
+                cwd,
+                &display,
+                outcome,
+            ),
+            Request::Document(query) => query.run(pin, cwd),
+            Request::Page(query) => query.run(&mut source, mode, &display, outcome),
+        };
+        result.map(String::into_bytes)
+    }
+}
+
+struct QuerySource<'a> {
+    cwd: &'a Path,
+    current: Option<&'a Pin>,
+    temporary: Option<Pin>,
+}
+
+impl QuerySource<'_> {
+    fn roles(&mut self, path: Option<&str>, json: bool, outcome: &mut Outcome) -> io::Result<String> {
+        use crate::application::index::build::MemoryQuery;
+        let request = score::RoleRequest { cwd: self.cwd, path, json };
+        score::roles(self.index(|| MemoryQuery::Source)?, request, outcome)
+    }
+
+    fn score(&self, path: Option<&str>, options: ScoreOptions, outcome: &mut Outcome) -> io::Result<String> {
+        match self.current {
+            Some(pin) => score::query(pin, self.cwd, score::Request { path, options }, outcome),
+            None => score::plain(self.cwd, path, options, outcome),
         }
     }
-    let paths_only = pin.is_memory() && matches!(req, Request::Path(_) | Request::PathRegex(_) | Request::Exact(_) | Request::Glob(_));
-    let (text_files, parsed_files) = pin.coverage_counts();
-    Ok(object(&[
-        ("root", quote(&pin.root.to_string_lossy())),
-        ("mode", quote(mode)),
-        ("generation", pin.generation.to_string()),
-        ("reused", pin.reused.to_string()),
-        (
-            "coverage",
-            object(&[
-                ("paths", pin.files.len().to_string()),
-                ("text_files", if paths_only { "null".into() } else { text_files.to_string() }),
-                ("parsed_files", if pin.is_memory() && !matches!(req, Request::Symbol(_)) { "0".into() } else { parsed_files.to_string() }),
-                ("files_with_parse_errors", "null".into()),
-                ("skipped_paths", "null".into()),
-                ("symbols", quote("partial")),
-            ]),
-        ),
-        ("relationship_status", quote("partial")),
-        ("truncated", truncated.to_string()),
-        ("hits", array(hits)),
-    ]))
+
+    fn index<'a>(
+        &mut self,
+        product: impl FnOnce() -> crate::application::index::build::MemoryQuery<'a>,
+    ) -> io::Result<&Pin> {
+        if let Some(pin) = self.current {
+            return Ok(pin);
+        }
+        Ok(self.temporary.insert(Pin::memory(self.cwd, product())?))
+    }
 }

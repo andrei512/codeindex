@@ -172,55 +172,58 @@ impl Source {
 // Reserve one share of the machine's memory for source. Other builders currently
 // account independently. Kernel-reclaimable mapped pages are outside the heap cap.
 pub(super) fn source_allowance() -> usize {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn sysctlbyname(
-                name: *const std::ffi::c_char,
-                old: *mut std::ffi::c_void,
-                len: *mut usize,
-                new: *mut std::ffi::c_void,
-                newlen: usize,
-            ) -> i32;
-        }
-        let mut bytes = 0u64;
-        let mut len = 8usize;
-        if unsafe {
-            sysctlbyname(
-                c"hw.memsize".as_ptr(),
-                (&mut bytes as *mut u64).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        } == 0
-            && len == 8
-            && bytes > 0
-        {
-            return (bytes / 64).max(1) as usize;
-        }
+    available_memory().map_or(64 << 20, |bytes| (bytes / 64).max(1) as usize)
+}
+
+#[cfg(target_os = "macos")]
+fn available_memory() -> Option<u64> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            old: *mut std::ffi::c_void,
+            len: *mut usize,
+            new: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
     }
-    #[cfg(target_os = "linux")]
-    if let Ok(info) = fs::read_to_string("/proc/meminfo") {
-        if let Some(kib) = info.lines().find_map(|line| {
-            line.strip_prefix("MemAvailable:")?
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()
-        }) {
-            let mut bytes = kib.saturating_mul(1024);
-            if let (Ok(max), Ok(used)) = (
-                fs::read_to_string("/sys/fs/cgroup/memory.max"),
-                fs::read_to_string("/sys/fs/cgroup/memory.current"),
-            ) {
-                if let (Ok(max), Ok(used)) = (max.trim().parse::<u64>(), used.trim().parse::<u64>())
-                {
-                    bytes = bytes.min(max.saturating_sub(used));
-                }
-            }
-            return (bytes / 64).max(1) as usize;
-        }
-    }
-    64 << 20
+    let mut bytes = 0u64;
+    let mut len = 8usize;
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && len == 8 && bytes > 0).then_some(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory() -> Option<u64> {
+    let info = fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = info.lines().find_map(|line| {
+        line.strip_prefix("MemAvailable:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    let bytes = kib.saturating_mul(1024);
+    Some(cgroup_free_memory().map_or(bytes, |free| bytes.min(free)))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_free_memory() -> Option<u64> {
+    let max = fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let used = fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?;
+    let max = max.trim().parse::<u64>().ok()?;
+    let used = used.trim().parse::<u64>().ok()?;
+    Some(max.saturating_sub(used))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn available_memory() -> Option<u64> {
+    None
 }

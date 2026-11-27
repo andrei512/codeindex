@@ -32,6 +32,15 @@ fn length(bytes: &mut &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(n.try_into()?) as usize)
 }
 
+fn append_row(block: &mut Vec<u8>, key: &[u8], value: &[u8], prefix: usize) -> Result<()> {
+    for n in [prefix, key.len() - prefix, value.len()] {
+        put_length(block, n)?;
+    }
+    block.extend_from_slice(&key[prefix..]);
+    block.extend_from_slice(value);
+    Ok(())
+}
+
 fn write_blocks(statement: &mut Statement<'_>, rows: Rows) -> Result<()> {
     let mut previous = Vec::new();
     let mut block = Vec::with_capacity(BLOCK_BYTES);
@@ -43,11 +52,7 @@ fn write_blocks(statement: &mut Statement<'_>, rows: Rows) -> Result<()> {
             block.clear();
             prefix = 0;
         }
-        for n in [prefix, key.len() - prefix, value.len()] {
-            put_length(&mut block, n)?;
-        }
-        block.extend_from_slice(&key[prefix..]);
-        block.extend_from_slice(&value);
+        append_row(&mut block, &key, &value, prefix)?;
         previous = key;
     }
     if !block.is_empty() {
@@ -56,23 +61,28 @@ fn write_blocks(statement: &mut Statement<'_>, rows: Rows) -> Result<()> {
     Ok(())
 }
 
+fn decode_row<'a>(key: &mut Vec<u8>, data: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let prefix = length(data)?;
+    let suffix_len = length(data)?;
+    let value_len = length(data)?;
+    if prefix > key.len() {
+        return Err("invalid key prefix".into());
+    }
+    let (suffix, rest) = data.split_at_checked(suffix_len).ok_or("truncated key")?;
+    let (value, next) = rest.split_at_checked(value_len).ok_or("truncated value")?;
+    key.truncate(prefix);
+    key.extend_from_slice(suffix);
+    *data = next;
+    Ok(value)
+}
+
 fn visit(mut data: &[u8], mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
     let mut key = Vec::new();
     while !data.is_empty() {
-        let prefix = length(&mut data)?;
-        let suffix_len = length(&mut data)?;
-        let value_len = length(&mut data)?;
-        if prefix > key.len() {
-            return Err("invalid key prefix".into());
-        }
-        let (suffix, rest) = data.split_at_checked(suffix_len).ok_or("truncated key")?;
-        let (value, next) = rest.split_at_checked(value_len).ok_or("truncated value")?;
-        key.truncate(prefix);
-        key.extend_from_slice(suffix);
+        let value = decode_row(&mut key, &mut data)?;
         if !f(&key, value) {
-            break;
+            return Ok(());
         }
-        data = next;
     }
     Ok(())
 }
@@ -87,43 +97,54 @@ pub fn bulk(conn: &mut Connection, rows: Rows) -> Result<()> {
 
 pub fn edit(conn: &mut Connection, edits: &Edits) -> Result<()> {
     let tx = conn.transaction()?;
-    {
-        let mut lookup = tx.prepare("SELECT k,v FROM rows WHERE k>=?1 ORDER BY k LIMIT 1")?;
-        let mut del = tx.prepare("DELETE FROM rows WHERE k=?1")?;
-        let mut ins = tx.prepare("INSERT INTO rows VALUES(?1,?2)")?;
-        let mut pending = edits.iter().peekable();
-        while let Some(&(key, _)) = pending.peek() {
-            let mut items = Rows::new();
-            let block: Option<Entry> = lookup
-                .query_row([key], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            let upper = if let Some((last, block)) = block {
-                visit(&block, |k, v| {
-                    items.insert(k.into(), v.into());
-                    true
-                })?;
-                del.execute([&last])?;
-                Some(last)
-            } else {
-                None
-            };
-            while let Some((k, v)) =
-                pending.next_if(|(k, _)| upper.as_ref().is_none_or(|end| *k <= end))
-            {
-                match v {
-                    Some(v) => {
-                        items.insert(k.clone(), v.clone());
-                    }
-                    None => {
-                        items.remove(k);
-                    }
-                }
-            }
-            write_blocks(&mut ins, items)?;
-        }
-    }
+    edit_blocks(&tx, edits)?;
     tx.commit()?;
     Ok(())
+}
+
+fn edit_blocks(conn: &Connection, edits: &Edits) -> Result<()> {
+    let mut lookup = conn.prepare("SELECT k,v FROM rows WHERE k>=?1 ORDER BY k LIMIT 1")?;
+    let mut del = conn.prepare("DELETE FROM rows WHERE k=?1")?;
+    let mut ins = conn.prepare("INSERT INTO rows VALUES(?1,?2)")?;
+    let mut pending = edits.iter().peekable();
+    while let Some(&(key, _)) = pending.peek() {
+        let block: Option<Entry> = lookup
+            .query_row([key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let (mut items, upper) = take_block(&mut del, block)?;
+        let group = std::iter::from_fn(|| {
+            pending.next_if(|(key, _)| upper.as_ref().is_none_or(|end| *key <= end))
+        });
+        for (key, value) in group {
+            patch_block_row(&mut items, key, value);
+        }
+        write_blocks(&mut ins, items)?;
+    }
+    Ok(())
+}
+
+fn patch_block_row(rows: &mut Rows, key: &Vec<u8>, value: &Option<Vec<u8>>) {
+    match value {
+        Some(value) => {
+            rows.insert(key.clone(), value.clone());
+        }
+        None => {
+            rows.remove(key);
+        }
+    }
+}
+
+fn take_block(delete: &mut Statement<'_>, block: Option<Entry>) -> Result<(Rows, Option<Vec<u8>>)> {
+    let mut items = Rows::new();
+    let Some((last, block)) = block else {
+        return Ok((items, None));
+    };
+    visit(&block, |key, value| {
+        items.insert(key.into(), value.into());
+        true
+    })?;
+    delete.execute([&last])?;
+    Ok((items, Some(last)))
 }
 
 pub fn scan(conn: &Connection, start: &[u8], limit: usize) -> Result<Vec<Entry>> {
@@ -133,18 +154,22 @@ pub fn scan(conn: &Connection, start: &[u8], limit: usize) -> Result<Vec<Entry>>
     }
     let mut query = conn.prepare_cached("SELECT v FROM rows WHERE k>=?1 ORDER BY k")?;
     let mut blocks = query.query([start])?;
-    while let Some(row) = blocks.next()? {
-        visit(row.get_ref(0)?.as_blob()?, |k, v| {
-            if k >= start {
-                result.push((k.into(), v.into()));
-            }
-            result.len() < limit
-        })?;
-        if result.len() == limit {
+    while result.len() < limit {
+        let Some(row) = blocks.next()? else {
             break;
-        }
+        };
+        scan_block(&mut result, row.get_ref(0)?.as_blob()?, start, limit)?;
     }
     Ok(result)
+}
+
+fn scan_block(result: &mut Vec<Entry>, block: &[u8], start: &[u8], limit: usize) -> Result<()> {
+    visit(block, |key, value| {
+        if key >= start {
+            result.push((key.into(), value.into()));
+        }
+        result.len() < limit
+    })
 }
 
 #[cfg(test)]

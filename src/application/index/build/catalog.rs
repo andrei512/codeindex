@@ -12,18 +12,14 @@ pub(super) fn write_markdown(w: &mut impl ExtentSink, locals: &[Local]) -> io::R
     let mut destinations = Vec::new();
     let mut backlinks = BTreeMap::<(&str, &str), Vec<(usize, usize)>>::new();
     put(w, locals.iter().filter(|l| l.markdown.is_some()).count())?;
-    for (i, l) in locals.iter().enumerate() {
-        if let Some(m) = &l.markdown {
-            docs.push(w.offset() - start);
-            put(w, i)?;
-            m.write_to(&mut *w)?;
-            for (n, link) in m.links.iter().enumerate() {
-                backlinks
-                    .entry((&link.target, &link.anchor))
-                    .or_default()
-                    .push((i, n));
-            }
-        }
+    let documents = locals.iter().enumerate().filter_map(|(id, local)| {
+        local.markdown.as_deref().map(|markdown| (id, markdown))
+    });
+    for (id, markdown) in documents {
+        docs.push(w.offset() - start);
+        put(w, id)?;
+        markdown.write_to(&mut *w)?;
+        add_backlinks(&mut backlinks, id, markdown);
     }
     docs.push(w.offset() - start);
     put(w, backlinks.len())?;
@@ -42,60 +38,96 @@ pub(super) fn write_markdown(w: &mut impl ExtentSink, locals: &[Local]) -> io::R
     Ok(())
 }
 
-pub(super) fn write(
-    w: &mut impl ExtentSink,
-    previous: Option<&dyn Previous>,
-    files: &mut [Entry],
-    locals: &[Local],
-    reuse: &[Option<usize>],
-    offsets: &[u64],
+fn add_backlinks<'a>(
+    backlinks: &mut BTreeMap<(&'a str, &'a str), Vec<(usize, usize)>>,
+    id: usize,
+    markdown: &'a crate::domain::markdown::Parsed,
+) {
+    for (n, link) in markdown.links.iter().enumerate() {
+        backlinks.entry((&link.target, &link.anchor)).or_default().push((id, n));
+    }
+}
+
+pub(super) struct Rows<'a> {
+    pub previous: Option<&'a dyn Previous>,
+    pub locals: &'a [Local],
+    pub reuse: &'a [Option<usize>],
+    pub offsets: &'a [u64],
+}
+
+impl Rows<'_> {
+    pub(super) fn write(self, w: &mut impl ExtentSink, files: &mut [Entry]) -> io::Result<()> {
+        let start = w.offset();
+        w.write_all(crate::application::index::CATALOG_MAGIC)?;
+        put(w, files.len())?;
+        let mut writer = retained::Run::new(self.previous, w);
+        let mut row = Vec::new();
+        for (i, ((file, local), prior)) in files.iter_mut().zip(self.locals).zip(self.reuse).enumerate() {
+            let row_start = writer.offset() - start;
+            file.evidence = self.offsets[i]..self.offsets[i + 1];
+            let previous = self.prior(*prior);
+            write_file(&mut writer, &mut row, (file, local), previous)?;
+            file.catalog_row = row_start..writer.offset() - start;
+        }
+        writer.bytes(&self.offsets[0].to_le_bytes())?;
+        self.write_evidence_lengths(&mut writer)?;
+        writer.flush()
+    }
+
+    fn prior(&self, id: Option<usize>) -> Option<PriorRow<'_>> {
+        let (previous, id) = self.previous.zip(id)?;
+        let entry = &previous.entries()[id];
+        (!entry.catalog_row.is_empty()).then_some(PriorRow { previous, id, entry })
+    }
+
+    fn write_evidence_lengths(&self, writer: &mut retained::Run<'_, impl ExtentSink>) -> io::Result<()> {
+        for (pair, prior) in self.offsets.windows(2).zip(self.reuse) {
+            let len = pair[1] - pair[0];
+            let old_word = self.prior(*prior).and_then(|prior| prior.evidence_word(len));
+            match old_word {
+                Some(word) => writer.borrow(word..word + 8)?,
+                None => writer.bytes(&len.to_le_bytes())?,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PriorRow<'a> {
+    previous: &'a dyn Previous,
+    id: usize,
+    entry: &'a Entry,
+}
+
+impl PriorRow<'_> {
+    fn matches(&self, file: &Entry) -> bool {
+        let old = self.entry;
+        let same_source = (old.path(), old.blob, old.catalog_stamp()) == (file.path(), file.blob, file.stamp());
+        same_source && (&old.score, &old.test_score, old.score_marker) == (&file.score, &file.test_score, file.score_marker)
+    }
+
+    fn evidence_word(&self, length: u64) -> Option<u64> {
+        (self.entry.evidence.end - self.entry.evidence.start == length).then(|| {
+            self.previous.extent(FILES).end - 8 * (self.previous.entries().len() - self.id) as u64
+        })
+    }
+
+    fn range(&self) -> std::ops::Range<u64> {
+        let base = self.previous.extent(FILES).start;
+        base + self.entry.catalog_row.start..base + self.entry.catalog_row.end
+    }
+}
+
+fn write_file(
+    writer: &mut retained::Run<'_, impl ExtentSink>,
+    scratch: &mut Vec<u8>,
+    (file, local): (&Entry, &Local),
+    previous: Option<PriorRow<'_>>,
 ) -> io::Result<()> {
-    let start = w.offset();
-    w.write_all(crate::application::index::CATALOG_MAGIC)?;
-    put(w, files.len())?;
-    let mut writer = retained::Run::new(previous, w);
-    let mut row = Vec::new();
-    for (i, ((f, l), prior)) in files
-        .iter_mut()
-        .zip(locals)
-        .zip(reuse.iter().copied())
-        .enumerate()
-    {
-        let row_start = writer.offset() - start;
-        f.evidence = offsets[i]..offsets[i + 1];
-        let ends = &l.lf[..l.lf.len() - usize::from(l.partial_line)];
-        if let Some((p, old)) = previous.zip(prior)
-            && let old = &p.entries()[old]
-            && !old.catalog_row.is_empty()
-            && old.path() == f.path()
-            && old.score == f.score
-            && old.test_score == f.test_score
-            && old.blob == f.blob
-            && old.catalog_stamp() == f.stamp()
-        {
-            let base = p.extent(FILES).start;
-            writer.borrow(base + old.catalog_row.start..base + old.catalog_row.end)?;
-        } else {
-            row.clear();
-            f.write_with_lines(&mut row, ends)?;
-            writer.bytes(&row)?;
-        }
-        f.catalog_row = row_start..writer.offset() - start;
+    if let Some(prior) = previous.filter(|prior| prior.matches(file)) {
+        return writer.borrow(prior.range());
     }
-    writer.bytes(&offsets[0].to_le_bytes())?;
-    for (pair, prior) in offsets.windows(2).zip(reuse) {
-        let len = pair[1] - pair[0];
-        if let Some((p, id)) = previous.zip(*prior)
-            && let old = &p.entries()[id]
-            && !old.catalog_row.is_empty()
-            && old.evidence.end - old.evidence.start == len
-        {
-            let word = p.extent(FILES).end - 8 * (p.entries().len() - id) as u64;
-            writer.borrow(word..word + 8)?;
-        } else {
-            writer.bytes(&len.to_le_bytes())?;
-        }
-    }
-    writer.flush()?;
-    Ok(())
+    scratch.clear();
+    file.write_with_lines(scratch, &local.line_ends)?;
+    writer.bytes(scratch)
 }

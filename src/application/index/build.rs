@@ -2,83 +2,39 @@ use super::{Entry, Observation, ObservedPath, graph};
 use crate::{
     application::index::layout::*,
     domain::{
+        BlobId,
         code::{self, Analysis, ForwardNames, Language, Unit},
         markdown::{self, Parsed},
     },
 };
 use std::{io, path::Path};
 
+mod binding_reuse;
 mod c_project;
 mod capture;
 mod catalog;
 mod content_delta;
 mod evidence_batches;
 mod fresh_postings;
+mod graph_reuse;
+use graph_reuse::GraphReuse;
 mod incremental;
 #[cfg(test)]
 mod incremental_tests;
 mod markdown_delta;
+mod path_order;
+pub(crate) use path_order::{PathOrder, PriorRow};
 mod retained;
 mod script_edit;
 mod source;
 use source::{Pool, Source};
-pub(crate) struct Local {
-    pub(crate) code: Analysis,
-    pub(crate) score: code::score::Saved,
-    pub(crate) test_score: code::score::Saved,
-    pub(crate) markdown: Option<Parsed>,
-    pub(crate) lf: Vec<usize>,
-    pub(crate) partial_line: bool,
-}
+mod local;
+mod local_job;
+use local::Facts;
+pub(crate) use local::Local;
+
 fn analyze(path: &str, body: Option<&str>) -> Local {
-    analyze_with_project(path, body, None)
-}
-fn analyze_with_project(path: &str, body: Option<&str>, project: Option<&code::CProject>) -> Local {
-    analyze_products(path, body, project, true, true, Some(true))
-}
-fn analyze_products(
-    path: &str,
-    body: Option<&str>,
-    project: Option<&code::CProject>,
-    code_needed: bool,
-    markdown_needed: bool,
-    score_policy: Option<bool>,
-) -> Local {
-    let text = body.unwrap_or("");
-    let (code, mut score, mut test_score) = Language::for_path(path)
-        .filter(|_| code_needed && body.is_some())
-        .map_or_else(Default::default, |l| {
-            if let Some(test_rules) = score_policy {
-                return code::score_file(l, text, path, project, test_rules);
-            }
-            let facts = match project {
-                Some(p) if matches!(l, Language::C | Language::Cpp) => p.analyze(l, path, text),
-                _ => code::analyze(l, text),
-            };
-            (facts, None, None)
-        });
-    let markdown =
-        (markdown_needed && body.is_some() && markdown::is_markdown(path)).then(|| Parsed::parse(path, text));
-    let mut lf: Vec<_> = text.match_indices('\n').map(|(i, _)| i + 1).collect();
-    let partial_line = !text.is_empty() && !text.ends_with('\n');
-    if partial_line {
-        lf.push(text.len());
-    }
-    if score_policy.is_some() && let Some(doc) = &markdown {
-        score = code::score::markdown(text, doc);
-    }
-    if score_policy == Some(true) && body.is_some() && path.ends_with(".t") && score.is_none() && code::score::suite_nesting::perl_source(text) {
-        let (_, perl_base, perl_test) = code::score_file(Language::Perl, text, path, None, true);
-        test_score = perl_test.or(perl_base);
-    }
-    Local {
-        test_score,
-        code,
-        score,
-        markdown,
-        lf,
-        partial_line,
-    }
+    Facts::All.read(path, body, None)
 }
 
 struct Captured {
@@ -87,25 +43,44 @@ struct Captured {
     local: Option<Local>,
     prior: Option<usize>,
 }
-type Slot = Option<Captured>;
+mod capture_table;
+mod source_capture;
+use capture_table::{CaptureTable, Work};
+use source_capture::SourceCapture;
 type Identify<'a> = dyn Fn(
         usize,
         &ObservedPath,
         Option<&str>,
-        Option<usize>,
+        PriorRow,
     ) -> io::Result<(Option<usize>, Option<crate::domain::BlobId>)>
     + Sync
     + 'a;
 pub(crate) trait Previous: Sync {
+    fn compilation_database(&self) -> Option<usize> {
+        self.entries()
+            .iter()
+            .position(|f| code::compilation_database(f.path()))
+    }
     fn compatible(&self, _kind: usize) -> bool {
         true
     }
     fn entries(&self) -> &[Entry];
     fn extent(&self, product: usize) -> std::ops::Range<u64>;
     fn copy_bytes(&self, range: std::ops::Range<u64>, out: &mut dyn io::Write) -> io::Result<()>;
+    fn same_bytes(&self, range: std::ops::Range<u64>, expected: &[u8]) -> io::Result<bool>;
     fn local(&self, id: usize, decode_code: bool, decode_markdown: bool) -> io::Result<Local>;
-    fn markdown_record(&self, _id: usize) -> io::Result<Option<std::ops::Range<u64>>> { Ok(None) }
-    fn source_end_word(&self, _file: usize, _end: usize) -> io::Result<Option<u64>> { Ok(None) }
+    fn markdown_record(&self, _id: usize) -> io::Result<Option<std::ops::Range<u64>>> {
+        Ok(None)
+    }
+    fn source_end_word(&self, _file: usize, _end: usize) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+    fn graph_reader(
+        &self,
+        kind: usize,
+    ) -> io::Result<Box<dyn crate::domain::content_lookup::ExtentRead + '_>> {
+        Ok(Box::new(std::io::Cursor::new(self.product(kind)?)))
+    }
     fn product(&self, kind: usize) -> io::Result<Vec<u8>>;
 }
 mod worker;
@@ -113,476 +88,374 @@ pub(crate) use worker::Worker;
 pub(crate) type RankLane =
     Box<dyn FnOnce(crate::domain::ranked::FreshRank) -> io::Result<Worker<u64>> + Send>;
 
-pub(crate) type ProvenanceLane<'a> = Box<dyn FnOnce(&[ObservedPath]) -> io::Result<()> + Send + 'a>;
+pub(crate) type ProvenanceLane<'a> =
+    Box<dyn FnOnce(&[ObservedPath], &[Option<BlobId>]) + Send + 'a>;
 
 pub(crate) struct Output {
+    pub(crate) paths: PathOrder,
     pub(crate) dir: Directory,
     pub(crate) files: Vec<Entry>,
     pub(crate) rank_write: Option<Worker<u64>>,
     pub(crate) retired: Vec<Local>,
+    pub(crate) sdk_catalog: Option<usize>,
     pub(crate) sdk_receipts: Vec<code::CReceipt>,
 }
-pub(crate) fn build(
-    root: &Path,
-    obs: &mut [ObservedPath],
-    read: &(impl Fn(&Path, &str, [u64; 7]) -> io::Result<Option<String>> + Sync),
-    previous: Option<&dyn Previous>,
-    forward_known: bool,
-    identify: &Identify,
-    w: &mut impl ExtentSink,
-    rank_lane: Option<RankLane>,
-    provenance_lane: Option<ProvenanceLane<'_>>,
-) -> io::Result<Output> {
-    build_with_allowance(
-        root,
-        obs,
-        read,
-        previous,
-        forward_known,
-        identify,
-        w,
-        source::source_allowance(),
-        rank_lane,
-        provenance_lane,
-    )
+/// Facts already checked against this predecessor during refresh. Rows before
+/// the prefix have both the same path and verified-identical input bytes.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct Predecessor<'a> {
+    pub previous: Option<&'a dyn Previous>,
+    pub forward_known: bool,
+    pub verified_prefix: usize,
 }
-fn build_with_allowance(
-    root: &Path,
-    obs: &mut [ObservedPath],
-    read: &(impl Fn(&Path, &str, [u64; 7]) -> io::Result<Option<String>> + Sync),
-    previous: Option<&dyn Previous>,
-    forward_known: bool,
-    identify: &Identify,
-    w: &mut impl ExtentSink,
-    allowance: usize,
-    rank_lane: Option<RankLane>,
-    provenance_lane: Option<ProvenanceLane<'_>>,
-) -> io::Result<Output> {
-    let reuse: Vec<Option<usize>> = obs
-        .iter()
-        .enumerate()
-        .map(|(index, o)| {
-            let entries = previous?.entries();
-            let id = if entries
-                .get(index)
-                .is_some_and(|entry| entry.path() == o.path)
-            {
-                index
-            } else {
-                entries.binary_search_by(|e| e.path().cmp(&o.path)).ok()?
-            };
-            (entries[id].stamp() == o.stamp).then_some(id)
-        })
-        .collect();
-    let stable_paths = previous.is_some_and(|p| {
-        p.entries().len() == obs.len()
-            && p.entries()
-                .iter()
-                .zip(obs.iter())
-                .all(|(entry, file)| entry.path() == file.path)
-    });
-    let reuse_markdown = previous.is_some_and(|p| p.compatible(MD));
-    let rewrite_rank = previous.is_some_and(|p| !p.compatible(RANK));
-    let read_all_text = rewrite_rank || previous.is_some_and(|p| !p.compatible(CONTENT));
-    let share_markdown = stable_paths && reuse_markdown;
-    let mut config = c_project::Refresh::plan(previous, obs, &reuse)?;
-    let keep_graph =
-        !config.invalidates_graph() && incremental::graph_unchanged(previous, obs, &reuse);
-    let width = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(obs.len().max(1));
-    let retained = allowance / 2;
-    let capture_credit = allowance.saturating_sub(retained).max(1);
-    let pool = Pool::new(retained);
-    let mut slots: Vec<Slot> = (0..obs.len()).map(|_| None).collect();
-    let prepared = if let Some(previous) = previous
-        .filter(|_| stable_paths && forward_known && !keep_graph && !config.invalidates_graph())
-    {
-        script_edit::prepare(previous, obs, &reuse, &pool, capture_credit, identify)?
-    } else {
-        None
-    };
-    let mut old_body = None;
-    let mut verified_graph = None;
-    let mut end_patch = None;
-    if let Some(edit) = prepared {
-        verified_graph = Some((edit.id, edit.same_graph));
-        end_patch = edit.end_patch;
-        slots[edit.id] = Some(edit.capture);
-        old_body = Some((edit.id, edit.old_text));
+
+/// The repository supplies the observation and identity callbacks as one capture source.
+pub(crate) struct Inputs<'a> {
+    pub root: &'a Path,
+    pub predecessor: Predecessor<'a>,
+    pub read: &'a source_capture::Reader<'a>,
+    pub identify: &'a Identify<'a>,
+}
+#[derive(Default)]
+pub(crate) struct Lanes<'a> {
+    pub rank: Option<RankLane>,
+    pub provenance: Option<ProvenanceLane<'a>>,
+}
+impl Inputs<'_> {
+    pub fn build(
+        self,
+        obs: &mut [ObservedPath],
+        w: &mut impl ExtentSink,
+        lanes: Lanes<'_>,
+    ) -> io::Result<Output> {
+        self.with_allowance(obs, w, lanes, source::source_allowance())
     }
-    let keep_graph = keep_graph || verified_graph.is_some_and(|(_, equal)| equal);
-    {
-        let mut jobs = capture::Jobs::new(capture_credit);
-        let direct =
-            previous.filter(|_| forward_known && keep_graph && share_markdown && !read_all_text);
-        for (index, ((o, slot), &prior)) in obs.iter_mut().zip(&mut slots).zip(&reuse).enumerate() {
-            if slot.is_some() {
-                continue;
-            }
-            if let (Some(p), Some(id)) = (direct, prior) {
-                let (prior, blob) = identify(index, o, None, Some(id))?;
-                *slot = Some(Captured {
-                    blob,
-                    source: None,
-                    local: Some(p.local(id, false, false)?),
-                    prior,
-                });
-                continue;
-            }
-            jobs.push(o.stamp[2], (index, o, slot, prior));
+    fn with_allowance(
+        self,
+        obs: &mut [ObservedPath],
+        w: &mut impl ExtentSink,
+        lanes: Lanes<'_>,
+        allowance: usize,
+    ) -> io::Result<Output> {
+        let captured = self.capture(obs, allowance)?;
+        captured.seal(self.root, obs, w, lanes)
+    }
+}
+
+mod product_writer;
+use product_writer::{CatalogWriter, GraphInputs, GraphPlan, ProductPlan, ProductReuse};
+
+/// Retained sources and concurrent capture jobs share this build's allowance.
+struct CaptureBudget {
+    width: usize,
+    capture_credit: usize,
+    pool: Pool,
+}
+
+impl CaptureBudget {
+    fn new(allowance: usize, files: usize) -> Self {
+        let width = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(files.max(1));
+        let retained = allowance / 2;
+        let capture_credit = allowance.saturating_sub(retained).max(1);
+        Self {
+            width,
+            capture_credit,
+            pool: Pool::new(retained),
         }
-        jobs.run(width, |(index, o, slot, prior)| {
-            // A graph-preserving edit has no consumer for the retained
-            // source bodies until their bytes reach the new segment.
-            let refresh_markdown = !reuse_markdown && markdown::is_markdown(&o.path);
-            let forwarded = forward_known
-                && keep_graph
-                && prior.is_some()
-                && !read_all_text
-                && !refresh_markdown;
-            let captured = o.captured.take();
-            let body = if forwarded {
-                None
-            } else {
-                match captured {
-                    Some(text) => text,
-                    None => read(root, &o.path, o.stamp)?,
-                }
-            };
-            let (prior, blob) = identify(index, o, body.as_deref(), prior)?;
-            let regenerated_md = if prior.is_some() && refresh_markdown {
-                body.as_deref().map(|text| Parsed::parse(&o.path, text))
-            } else {
-                None
-            };
-            let source = body.map(|text| pool.retain(text)).transpose()?;
-            let same_path = prior.filter(|&id| previous.unwrap().entries()[id].path() == o.path);
-            let defer =
-                !forwarded && c_project::is_c(&o.path) && config.reparse(&o.path, same_path);
-            let facts = if defer {
-                None
-            } else if let Some(id) = same_path {
-                let p = previous.unwrap();
-                let mut local = p.local(
-                    id,
-                    !keep_graph,
-                    reuse_markdown && (!share_markdown || rewrite_rank),
-                )?;
-                if refresh_markdown {
-                    local.markdown = regenerated_md;
-                }
-                if p.entries()[id].path() != o.path
-                    && let Some(doc) = &mut local.markdown
-                {
-                    doc.relocate(&o.path);
-                }
-                Some(local)
-            } else {
-                match &source {
-                    Some(Source::Scratch(_)) => None,
-                    source => Some(analyze(&o.path, source.as_ref().map(|s| s.text(None)))),
-                }
-            };
-            *slot = Some(Captured {
-                blob,
-                source,
-                local: facts,
-                prior,
-            });
-            Ok(())
+    }
+}
+
+/// Capture reads, predecessor rows and limits belong to one verified path order.
+struct CapturePlan<'a> {
+    inputs: &'a Inputs<'a>,
+    paths: PathOrder,
+    reuse: Vec<Option<usize>>,
+    config: c_project::Refresh,
+    reads: CaptureReads,
+    budget: CaptureBudget,
+}
+
+impl<'a> CapturePlan<'a> {
+    fn new(inputs: &'a Inputs<'a>, obs: &[ObservedPath], allowance: usize) -> io::Result<Self> {
+        let predecessor = inputs.predecessor;
+        let (paths, reuse) =
+            PathOrder::compare(predecessor.previous, obs, predecessor.verified_prefix);
+        let config = c_project::Refresh::plan(predecessor.previous, obs, &reuse, &paths)?;
+        let reads = CaptureReads::plan(predecessor, &paths);
+        Ok(Self {
+            inputs,
+            paths,
+            reuse,
+            config,
+            reads,
+            budget: CaptureBudget::new(allowance, obs.len()),
+        })
+    }
+}
+
+/// These product requirements determine which retained rows need source text
+/// or decoded Markdown during capture.
+struct CaptureReads {
+    searchable: incremental::Compatibility,
+    forward_known: bool,
+    share_markdown: bool,
+    decode_markdown: bool,
+    refresh_markdown: bool,
+}
+
+impl CaptureReads {
+    fn plan(predecessor: Predecessor<'_>, paths: &PathOrder) -> Self {
+        let reuse_markdown = predecessor.previous.is_some_and(|p| p.compatible(MD));
+        let searchable = incremental::Compatibility::inspect(predecessor.previous);
+        let rewrite_rank = predecessor.previous.is_some() && !searchable.rank;
+        let rewrite_content = predecessor.previous.is_some() && !searchable.content;
+        let share_markdown = paths.stable() && reuse_markdown;
+        Self {
+            searchable,
+            forward_known: predecessor.forward_known && !rewrite_rank && !rewrite_content,
+            share_markdown,
+            decode_markdown: reuse_markdown && (!share_markdown || rewrite_rank),
+            refresh_markdown: !reuse_markdown,
+        }
+    }
+}
+
+struct DeferredLocals<'a> {
+    root: &'a Path,
+    obs: &'a [ObservedPath],
+    sources: &'a [Option<Source>],
+    backing: Option<&'a source::Mapping>,
+    previous: Option<&'a dyn Previous>,
+    reuse: &'a [Option<usize>],
+    width: usize,
+    capture_credit: usize,
+}
+
+impl DeferredLocals<'_> {
+    fn complete(
+        &self,
+        config: &mut c_project::Refresh,
+        mut parsed: Vec<Option<Local>>,
+        evidence_reuse: &mut std::borrow::Cow<'_, [Option<usize>]>,
+    ) -> io::Result<Vec<Local>> {
+        self.invalidate_evidence(config, &parsed, evidence_reuse);
+        if config.rewrite_catalog() || parsed.iter().any(Option::is_none) {
+            self.resolve(config, &mut parsed, evidence_reuse)?;
+        }
+        Ok(parsed.into_iter().map(|row| row.expect("completed parser row")).collect())
+    }
+
+    fn resolve(
+        &self,
+        config: &mut c_project::Refresh,
+        parsed: &mut [Option<Local>],
+        evidence_reuse: &mut std::borrow::Cow<'_, [Option<usize>]>,
+    ) -> io::Result<()> {
+        let project = config.prepare(self.root, self.obs, self.sources, self.backing);
+        if config.refine(project.as_ref()) {
+            self.restore_locals(config, parsed, evidence_reuse)?;
+        }
+        let mut pending = capture::Jobs::new(self.capture_credit);
+        for (id, slot) in parsed
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+        {
+            let job = local_job::Job::new(
+                slot,
+                &self.obs[id].path,
+                self.sources[id].as_ref().map(|s| s.text(self.backing)),
+                project.as_ref(),
+            );
+            pending.push(self.obs[id].stamp[2], job);
+        }
+        pending.run_steps(self.width, |mut job| {
+            Ok((!job.advance(project.as_ref())).then_some(job))
         })?;
+        config.save_observations(project, self.obs, parsed, evidence_reuse);
+        Ok(())
     }
-    let backing = pool.seal()?;
-    let mut sources = Vec::with_capacity(slots.len());
-    let mut blobs = Vec::with_capacity(slots.len());
-    let mut parsed = Vec::with_capacity(slots.len());
-    let mut reused_local = Vec::with_capacity(slots.len());
-    for slot in slots.into_iter().map(Option::unwrap) {
-        sources.push(slot.source);
-        blobs.push(slot.blob);
-        parsed.push(slot.local);
-        reused_local.push(slot.prior);
-    }
-    // Ranked path tokens and qualified postings incorporate the current path.
-    let reuse: Vec<_> = reused_local
-        .iter()
-        .zip(obs.iter())
-        .map(|(&id, o)| id.filter(|&id| previous.unwrap().entries()[id].path() == o.path))
-        .collect();
-    let share_graph = verified_graph.is_some_and(|(_, equal)| equal)
-        || !config.invalidates_graph() && incremental::graph_unchanged(previous, obs, &reuse);
-    if keep_graph && !share_graph {
-        return Err(io::Error::other(
-            "a verified binding input changed during capture",
-        ));
-    }
-    let mut evidence_reuse = std::borrow::Cow::Borrowed(reused_local.as_slice());
-    if config.invalidates_graph() || config.catalog.is_some() {
+
+    fn invalidate_evidence(
+        &self,
+        config: &c_project::Refresh,
+        parsed: &[Option<Local>],
+        evidence_reuse: &mut std::borrow::Cow<'_, [Option<usize>]>,
+    ) {
+        if !config.invalidates_graph() && config.catalog.is_none() {
+            return;
+        }
         for (i, local) in parsed.iter().enumerate() {
-            if local.is_none() && reused_local[i].is_some() && c_project::is_c(&obs[i].path) {
+            let missing_retained_local = local.is_none() && evidence_reuse[i].is_some();
+            if missing_retained_local && config.observes(&self.obs[i].path) {
                 evidence_reuse.to_mut()[i] = None;
             }
         }
     }
-    if parsed.iter().any(Option::is_none) || config.rewrite_catalog() {
-        let project = config.catalog.is_some().then(|| {
-            code::CProject::new(
-                root,
-                obs.iter()
-                    .zip(&sources)
-                    .filter(|(o, _)| c_project::database(&o.path))
-                    .filter_map(|(o, s)| {
-                        Some((o.path.as_str(), s.as_ref()?.text(backing.as_ref())))
-                    }),
-                |path| {
-                    let i = obs.binary_search_by(|o| o.path.as_str().cmp(path)).ok()?;
-                    Some((
-                        obs[i].path.as_str(),
-                        sources[i].as_ref()?.text(backing.as_ref()),
-                    ))
-                },
-            )
-        });
-        let jobs = std::sync::Mutex::new(
-            parsed
-                .iter_mut()
-                .enumerate()
-                .filter(|(_, f)| f.is_none())
-                .collect::<Vec<_>>(),
+
+    fn restore_locals(
+        &self,
+        config: &c_project::Refresh,
+        parsed: &mut [Option<Local>],
+        evidence_reuse: &mut std::borrow::Cow<'_, [Option<usize>]>,
+    ) -> io::Result<()> {
+        for (id, slot) in parsed.iter_mut().enumerate() {
+            if slot.is_none()
+                && let Some(old) = self.reuse[id]
+                && !config.requires_analysis(&self.obs[id].path, Some(old))
+            {
+                *slot = Some(
+                    self.previous
+                        .expect("retained source")
+                        .local(old, true, true)?,
+                );
+                evidence_reuse.to_mut()[id] = Some(old);
+            }
+        }
+        Ok(())
+    }
+}
+
+struct CapturedProject<'a> {
+    table: CaptureTable,
+    backing: Option<source::Mapping>,
+    paths: PathOrder,
+    previous: Option<&'a dyn Previous>,
+    graph: GraphReuse<'a>,
+    config: c_project::Refresh,
+    reads: CaptureReads,
+    width: usize,
+    capture_credit: usize,
+}
+impl<'a> Inputs<'a> {
+    fn capture(
+        &self,
+        obs: &mut [ObservedPath],
+        allowance: usize,
+    ) -> io::Result<CapturedProject<'a>> {
+        let plan = CapturePlan::new(self, obs, allowance)?;
+        let mut graph = GraphReuse::predict(
+            self.predecessor.previous,
+            plan.paths.stable() && !plan.config.invalidates_graph(),
+            obs,
+            &plan.reuse,
         );
-        std::thread::scope(|scope| {
-            let count = width.min(jobs.lock().unwrap().len());
-            let workers: Vec<_> = (0..count)
-                .map(|_| {
-                    scope.spawn(|| {
-                        loop {
-                            let job = jobs.lock().unwrap().pop();
-                            let Some((i, facts)) = job else { break };
-                            *facts = Some(analyze_with_project(
-                                &obs[i].path,
-                                sources[i].as_ref().map(|s| s.text(backing.as_ref())),
-                                project.as_ref(),
-                            ));
-                        }
-                    })
-                })
-                .collect();
-            for worker in workers {
-                worker
-                    .join()
-                    .map_err(|_| io::Error::other("mapped analysis worker failed"))?
-            }
-            Ok::<_, io::Error>(())
-        })?;
-        if let Some((id, project)) = config.catalog.zip(project) {
-            let dependencies = config.merge(project.consulted(), obs);
-            code::CProject::put_dependencies(
-                &mut parsed[id].as_mut().unwrap().code,
-                dependencies,
-                config.receipts.clone(),
-            );
-            evidence_reuse.to_mut()[id] = None;
-        }
-    }
-    let locals: Vec<_> = parsed.into_iter().map(Option::unwrap).collect();
-    let units: Vec<_> = obs
-        .iter()
-        .zip(&locals)
-        .zip(&sources)
-        .map(|((o, l), source)| Unit {
-            path: &o.path,
-            text: source.as_ref().map_or("", |s| s.text(backing.as_ref())),
-            analysis: &l.code,
+        let mut table = CaptureTable::new(obs.len());
+        graph.prepare(&plan, obs, &mut table)?;
+        let capture = SourceCapture::new(&plan, graph.retain_during_capture());
+        capture.run(obs, &mut table, graph.prepared_row())?;
+        let CapturePlan {
+            paths,
+            config,
+            reads,
+            budget,
+            ..
+        } = plan;
+        let CaptureBudget {
+            width,
+            capture_credit,
+            pool,
+        } = budget;
+        Ok(CapturedProject {
+            table,
+            backing: pool.seal()?,
+            paths,
+            previous: self.predecessor.previous,
+            graph,
+            config,
+            reads,
+            width,
+            capture_credit,
         })
-        .collect();
-    let mut dir = Directory::default();
-    let start = w.offset();
-    // Workers borrow the immutable capture until their product is ready. The
-    // primary writer emits independent products before joining those workers.
-    let before = incremental::edited_sources(previous, &units, &reuse, capture_credit, old_body)?;
-    // Facts can survive a changed source. Reuse graph extents only after proving
-    // both parser evidence and the source slices consumed by binding are equal.
-    if end_patch.is_none() && let Some((id, true)) = verified_graph {
-        evidence_reuse.to_mut()[id] = Some(id);
     }
-    let share_graph = share_graph
-        || !config.invalidates_graph()
-            && verified_graph.is_none()
-            && incremental::same_binding_inputs(previous, &units, &before, &mut evidence_reuse)?;
-    let (mut files, rank_write) = std::thread::scope(|scope| -> io::Result<_> {
-        let batches = if previous.is_none() && backing.is_none() {
-            evidence_batches::plan(&units, width, capture_credit).map(|(ranges, cap)| {
-                ranges
-                    .into_iter()
-                    .map(|range| {
-                        let slice = &units[range.clone()];
-                        let bodies = &sources[range.clone()];
-                        (
-                            range,
-                            scope.spawn(move || evidence_batches::encode(slice, bodies, cap)),
-                        )
-                    })
-                    .collect()
-            })
-        } else {
-            None
+}
+impl CapturedProject<'_> {
+    fn seal(
+        mut self,
+        root: &Path,
+        obs: &[ObservedPath],
+        w: &mut impl ExtentSink,
+        lanes: Lanes<'_>,
+    ) -> io::Result<Output> {
+        let previous = self.previous;
+        let table = &mut self.table;
+        let reuse = self.paths.at_same_path(&table.retained_rows);
+        let retained_graph = self.graph.verify(obs, &reuse)?;
+        let mut evidence_reuse = std::borrow::Cow::Borrowed(table.retained_rows.as_slice());
+        let deferred = DeferredLocals {
+            root,
+            obs,
+            sources: &table.sources,
+            backing: self.backing.as_ref(),
+            previous,
+            reuse: &reuse,
+            width: self.width,
+            capture_credit: self.capture_credit,
         };
-        let bind = (!share_graph).then(|| {
-            scope.spawn(|| -> io::Result<_> {
-                let names = ForwardNames::forward(&units);
-                let bases = graph::declaration_bases(&units);
-                std::thread::scope(|scope| {
-                    let symbols = scope.spawn(|| {
-                        let mut bytes = Vec::new();
-                        graph::encode_symbols(&units, &names, &bases, &mut bytes)?;
-                        Ok::<_, io::Error>(bytes)
-                    });
-                    let mut relations = Vec::new();
-                    graph::encode_relations(&units, &names, &bases, &mut relations)?;
-                    let symbols = symbols
-                        .join()
-                        .map_err(|_| io::Error::other("symbol worker failed"))??;
-                    Ok((symbols, relations))
-                })
-            })
-        });
-        let trigrams = scope.spawn(|| incremental::trigrams(previous, &units, &reuse, &before));
-        let rank = scope.spawn(|| -> io::Result<_> {
-            let rank = incremental::ranked(previous, &units, &locals, &reuse, &before)?;
-            match (rank_lane, rank) {
-                (None, rank) => Ok((Some(rank), None)),
-                (Some(emit), incremental::Rank::Bulk(rank)) => Ok((None, Some(emit(rank)?))),
-                _ => Err(io::Error::other("rank lane requires a fresh build")),
-            }
-        });
-        let mut files = Vec::with_capacity(obs.len());
-        let mut writer = retained::Run::new(previous, w);
-        for (id, ((o, unit), source)) in obs.iter().zip(&units).zip(&sources).enumerate() {
-            let off = writer.offset() - start;
-            let bytes = if let Some(old_id) = reused_local[id] {
-                let p = previous.unwrap();
-                let old = &p.entries()[old_id];
-                if let Some(range) = &old.bytes {
-                    let base = p.extent(SOURCE).start;
-                    writer.borrow(base + range.start..base + range.end)?;
-                    Some(off..writer.offset() - start)
-                } else {
-                    None
-                }
-            } else if source.is_some() {
-                writer.bytes(unit.text.as_bytes())?;
-                Some(off..writer.offset() - start)
-            } else {
-                None
-            };
-            files.push(Entry {
-                blob: blobs[id],
-                score: locals[id].score.clone(),
-            test_score: locals[id].test_score.clone(),
-                catalog_row: 0..0,
-                original_stamp: None,
-                observation: Observation {
-                    path: o.path.clone(),
-                    stamp: o.stamp,
-                },
-                bytes,
-                line_ends: Vec::new(),
-                evidence: 0..0,
-            });
-        }
-        writer.flush()?;
-        dir.0[SOURCE - 1] = start..w.offset();
-        let start = w.offset();
-        if share_markdown {
-            markdown_delta::write(w, previous.unwrap(), &files, &locals, &reuse)?;
-        } else {
-            catalog::write_markdown(w, &locals)?;
-        }
-        dir.0[MD - 1] = start..w.offset();
-        let offsets = if let Some(batches) = batches {
-            evidence_batches::write(w, batches, &locals, &files, &evidence_reuse)?
-        } else {
-            retained::evidence(w, previous, &evidence_reuse, &locals, &files)?
+        let locals = deferred.complete(
+            &mut self.config,
+            std::mem::take(&mut table.parsed),
+            &mut evidence_reuse,
+        )?;
+        let units = captured_units(obs, &locals, &table.sources, self.backing.as_ref());
+        let before = incremental::edited_sources(
+            previous.filter(|_| self.paths.stable()),
+            &reuse,
+            self.capture_credit,
+            self.graph.take_old_body(),
+        )?;
+        let graph = self.graph.plan_products(
+            retained_graph,
+            &self.config,
+            GraphInputs { units: &units, before: before.as_ref() },
+            &mut evidence_reuse,
+        )?;
+        let catalog = CatalogWriter {
+            previous,
+            obs,
+            units: &units,
+            table,
+            locals: &locals,
         };
-        let start = w.offset();
-        catalog::write(w, previous, &mut files, &locals, &reuse, &offsets)?;
-        dir.0[FILES - 1] = start..w.offset();
-        // Identity rows are complete after capture. Verify their pinned commit
-        // while the remaining immutable products reach their private segments.
-        let observed = &*obs;
-        let provenance = provenance_lane.map(|finish| scope.spawn(move || finish(observed)));
-        let (paths, content) = trigrams
-            .join()
-            .map_err(|_| io::Error::other("posting worker failed"))??;
-        let start = w.offset();
-        paths.seal(&mut *w, previous, PATHGRAM)?;
-        dir.0[PATHGRAM - 1] = start..w.offset();
-        let start = w.offset();
-        content.seal(&mut *w, previous, CONTENT)?;
-        dir.0[CONTENT - 1] = start..w.offset();
-        let names = bind
-            .map(|job| {
-                job.join()
-                    .map_err(|_| io::Error::other("binding worker failed"))
-            })
-            .transpose()?;
-        if let Some(graph) = names {
-            let (symbols, relations) = graph?;
-            let start = w.offset();
-            w.write_all(&symbols)?;
-            dir.0[SYMBOLS - 1] = start..w.offset();
-            let start = w.offset();
-            w.write_all(&relations)?;
-            dir.0[REL - 1] = start..w.offset();
-        } else {
-            let p = previous.unwrap();
-            for kind in [SYMBOLS, REL] {
-                let start = w.offset();
-                let extent = p.extent(kind);
-                if kind == SYMBOLS && let Some((at, end)) = end_patch {
-                    retained::range(p, w, extent.start..at)?;
-                    w.write_all(&end.to_le_bytes())?;
-                    retained::range(p, w, at + 8..extent.end)?;
-                } else {
-                    retained::range(p, w, extent)?;
-                }
-                dir.0[kind - 1] = start..w.offset();
-            }
+        let sealed = ProductPlan {
+            catalog,
+            paths: &self.paths,
+            reuse: ProductReuse {
+                source: &reuse,
+                evidence: &evidence_reuse,
+                markdown: self.reads.share_markdown,
+            },
+            before: before.as_ref(),
+            graph,
+            searchable: self.reads.searchable,
+            evidence_width: (previous.is_none() && self.backing.is_none()).then_some(self.width),
+            capture_credit: self.capture_credit,
         }
-        let ranked = rank
-            .join()
-            .map_err(|_| io::Error::other("ranking worker failed"))??;
-        let start = w.offset();
-        let (ranked, separate) = ranked;
-        if let Some(ranked) = ranked {
-            ranked.write_to(&mut *w, previous)?;
-        }
-        dir.0[RANK - 1] = start..w.offset();
-        if let Some(provenance) = provenance {
-            provenance
-                .join()
-                .map_err(|_| io::Error::other("provenance worker failed"))??;
-        }
-        Ok((files, separate))
-    })?;
-    drop(units);
-    drop(sources);
-    drop(backing);
-    let mut retired = locals;
-    for (f, local) in files.iter_mut().zip(&mut retired) {
-        if local.partial_line {
-            local.lf.pop();
-        }
-        f.line_ends = std::mem::take(&mut local.lf);
+        .write(w, lanes)?;
+        drop(units);
+        drop((self.table.sources, self.backing));
+        Ok(sealed.finish(self.paths, locals, self.config))
     }
-    Ok(Output {
-        dir,
-        files,
-        rank_write,
-        retired,
-        sdk_receipts: config.receipts,
-    })
+}
+
+fn captured_units<'a>(
+    observations: &'a [ObservedPath],
+    locals: &'a [Local],
+    sources: &'a [Option<Source>],
+    backing: Option<&'a source::Mapping>,
+) -> Vec<Unit<'a>> {
+    observations
+        .iter()
+        .zip(locals)
+        .zip(sources)
+        .map(|((observed, local), source)| Unit {
+            path: &observed.path,
+            text: source.as_ref().map_or("", |source| source.text(backing)),
+            analysis: &local.code,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -605,6 +478,83 @@ mod tests {
         fn offset(&self) -> u64 {
             self.0.len() as u64
         }
+    }
+
+    #[test]
+    fn primary_failure_waits_for_borrowed_provenance_and_owned_rank_work() {
+        use std::sync::{Arc, atomic::AtomicBool, mpsc};
+        struct FailingSink {
+            started: mpsc::Receiver<()>,
+            release: mpsc::Sender<()>,
+        }
+        impl io::Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                // Both workers are alive before the main catalog fails.
+                for _ in 0..2 {
+                    self.started
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("product worker started");
+                }
+                for _ in 0..2 {
+                    self.release.send(()).unwrap();
+                }
+                Err(io::Error::other("primary catalog failed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl ExtentSink for FailingSink {
+            fn offset(&self) -> u64 {
+                0
+            }
+        }
+        let (started, events) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let proceed = Arc::new(std::sync::Mutex::new(proceed));
+        let rank_release = proceed.clone();
+        let rank_started = started.clone();
+        let rank_done = Arc::new(AtomicBool::new(false));
+        let rank_finished = rank_done.clone();
+        let provenance_done = AtomicBool::new(false);
+        let mut sink = FailingSink {
+            started: events,
+            release,
+        };
+        let lanes = Lanes {
+            rank: Some(Box::new(move |_| {
+                Worker::start(move || {
+                    rank_started.send(()).unwrap();
+                    rank_release.lock().unwrap().recv().unwrap();
+                    rank_finished.store(true, Ordering::Release);
+                    Ok(0)
+                })
+            })),
+            provenance: Some(Box::new(|obs, blobs| {
+                assert_eq!(obs.len(), blobs.len());
+                started.send(()).unwrap();
+                proceed.lock().unwrap().recv().unwrap();
+                provenance_done.store(true, Ordering::Release);
+            })),
+        };
+        let mut obs = [ObservedPath {
+            path: "main.rs".into(),
+            stamp: [0; 7],
+            captured: Some(Some("fn main() {}".into())),
+        }];
+        let build = Inputs {
+            root: Path::new("."),
+            predecessor: Default::default(),
+            read: &|_, _, _| unreachable!(),
+            identify: &|_, _, _, _| Ok((None, None)),
+        };
+        let error = build
+            .with_allowance(&mut obs, &mut sink, lanes, 4096)
+            .err()
+            .expect("write should fail");
+        assert_eq!(error.to_string(), "primary catalog failed");
+        assert!(rank_done.load(Ordering::Acquire));
+        assert!(provenance_done.load(Ordering::Acquire));
     }
 
     #[test]
@@ -635,29 +585,25 @@ mod tests {
                 })
                 .collect();
             let counts = fixture.map(|_| AtomicUsize::new(0));
-            let read = |_: &Path, path: &str, _: [u64; 7]| {
-                let i = fixture.iter().position(|(name, _)| *name == path).unwrap();
+            let read = |i: usize, file: &ObservedPath, prior: Option<usize>| {
+                assert_eq!(file.path, fixture[i].0);
+                assert!(prior.is_none());
                 counts[i].fetch_add(1, Ordering::Relaxed);
                 Ok(fixture[i].1.map(String::from))
             };
             let mut sink = MemorySink::default();
-            let Output { dir, .. } = build_with_allowance(
-                Path::new("."),
-                &mut obs,
-                &read,
-                None,
-                false,
-                &|_, _, text, id| {
+            let Output { dir, .. } = Inputs {
+                root: Path::new("."),
+                read: &read,
+                predecessor: Predecessor::default(),
+                identify: &|_, _, text, id| {
                     Ok((
-                        id,
+                        id.unchanged(),
                         text.map(|s| crate::adapters::repository::raw_blob_id(s.as_bytes(), false)),
                     ))
                 },
-                &mut sink,
-                allowance,
-                None,
-                None,
-            )
+            }
+            .with_allowance(&mut obs, &mut sink, Lanes::default(), allowance)
             .unwrap();
             assert_eq!(counts.map(AtomicUsize::into_inner), [0, 1, 1, 1, 1, 1, 1]);
             (dir.0, sink.0)
@@ -669,4 +615,4 @@ mod tests {
 }
 
 mod memory;
-pub(crate) use memory::{MemoryQuery, memory_index};
+pub(crate) use memory::{MemoryBytes, MemoryQuery, memory_index};

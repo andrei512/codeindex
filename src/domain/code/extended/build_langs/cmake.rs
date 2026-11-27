@@ -1,6 +1,6 @@
-use crate::domain::code::lexer::cmake_bracket as bracket;
-use super::{Facts, simple, span, target};
+use super::{Facts, UseMode, simple, span, target};
 use crate::domain::code::Analysis;
+use crate::domain::code::lexer::bracket_literal as bracket;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Form {
@@ -11,185 +11,281 @@ enum Form {
     Close,
 }
 #[derive(Clone, Copy)]
-struct Arg<'a> {
-    text: &'a str,
+pub(in crate::domain::code) struct Arg<'a> {
+    pub(in crate::domain::code) text: &'a str,
     form: Form,
 }
 
+impl<'a> Arg<'a> {
+    fn literal(&self) -> Option<&'a str> {
+        matches!(self.form, Form::Word | Form::Quoted).then_some(self.text)
+    }
+}
 fn tokens(mut s: &str) -> Vec<Arg<'_>> {
     let mut out = Vec::new();
-    while !s.is_empty() {
+    while let Some(&first) = {
         s = s.trim_start_matches(char::is_whitespace);
-        let Some(&c) = s.as_bytes().first() else {
-            break;
-        };
-        if c == b'#' {
-            s = if let Some((_, end)) = bracket(&s[1..]) {
-                &s[1 + end..]
-            } else {
-                s.split_once('\n').map_or("", |(_, rest)| rest)
-            };
-            continue;
-        }
-        if let Some((_, end)) = bracket(s) {
-            out.push(Arg {
-                text: &s[..end],
-                form: Form::Bracket,
-            });
-            s = &s[end..];
-            continue;
-        }
-        if c == b'(' || c == b')' {
-            out.push(Arg {
-                text: &s[..1],
-                form: if c == b'(' { Form::Open } else { Form::Close },
-            });
-            s = &s[1..];
-            continue;
-        }
-        let quoted = c == b'"';
-        let start = usize::from(quoted);
-        let mut escaped = false;
-        let mut end = s.len();
-        let mut consumed = end;
-        for (i, ch) in s[start..].char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if quoted && ch == '"'
-                || !quoted && (ch.is_whitespace() || matches!(ch, '(' | ')' | '#'))
-            {
-                end = start + i;
-                consumed = end + usize::from(quoted);
-                break;
-            }
-        }
-        out.push(Arg {
-            text: &s[start..end],
-            form: if quoted { Form::Quoted } else { Form::Word },
-        });
-        s = &s[consumed..];
+        s.as_bytes().first()
+    } {
+        let (tail, argument) = item(s, first);
+        s = tail;
+        out.extend(argument);
     }
     out
 }
 
-pub(super) fn analyze(source: &str) -> Analysis {
-    let tokens = tokens(source);
-    let mut f = Facts::default();
-    let mut owners = Vec::new();
-    let mut i = 0;
-    while i + 1 < tokens.len() {
-        if tokens[i].form != Form::Word || tokens[i + 1].form != Form::Open {
-            i += 1;
-            continue;
+fn item(s: &str, first: u8) -> (&str, Option<Arg<'_>>) {
+    if first == b'#' {
+        return (after_comment(s), None);
+    }
+    let (argument, width) = read_argument(s, first);
+    (&s[width..], Some(argument))
+}
+
+fn read_argument(s: &str, first: u8) -> (Arg<'_>, usize) {
+    if let Some((_, end)) = bracket(s) {
+        return (
+            Arg {
+                text: &s[..end],
+                form: Form::Bracket,
+            },
+            end,
+        );
+    }
+    let form = match first {
+        b'(' => Form::Open,
+        b')' => Form::Close,
+        _ => return argument(s, first == b'"'),
+    };
+    (
+        Arg {
+            text: &s[..1],
+            form,
+        },
+        1,
+    )
+}
+
+fn after_comment(s: &str) -> &str {
+    if let Some((_, end)) = bracket(&s[1..]) {
+        return &s[1 + end..];
+    }
+    s.split_once('\n').map_or("", |(_, rest)| rest)
+}
+
+fn argument(s: &str, quoted: bool) -> (Arg<'_>, usize) {
+    let start = usize::from(quoted);
+    let end = super::super::unescaped_chars(&s[start..])
+        .find(|&(_, ch)| argument_end(ch, quoted))
+        .map_or(s.len(), |(i, _)| start + i);
+    let consumed = end + usize::from(quoted && end < s.len());
+
+    (
+        Arg {
+            text: &s[start..end],
+            form: if quoted { Form::Quoted } else { Form::Word },
+        },
+        consumed,
+    )
+}
+
+fn argument_end(ch: char, quoted: bool) -> bool {
+    if quoted {
+        ch == '"'
+    } else {
+        ch.is_whitespace() || matches!(ch, '(' | ')' | '#')
+    }
+}
+
+fn next_command<'t, 's>(
+    remaining: &mut &'t [Arg<'s>],
+) -> Option<(&'s str, &'t [Arg<'s>], &'s str)> {
+    let start = remaining
+        .windows(2)
+        .position(|p| p[0].form == Form::Word && p[1].form == Form::Open)?;
+    let name = remaining[start].text;
+    let args = &remaining[start + 2..];
+    let mut depth = 1usize;
+    let end = args.iter().position(|arg| {
+        match arg.form {
+            Form::Open => depth += 1,
+            Form::Close => depth -= 1,
+            _ => (),
         }
-        let cmd = tokens[i].text;
-        let mut depth = 1usize;
-        let start = i + 2;
-        i = start;
-        while i < tokens.len() {
-            match tokens[i].form {
-                Form::Open => depth += 1,
-                Form::Close => depth -= 1,
-                _ => (),
-            }
-            if depth == 0 {
-                break;
-            }
-            i += 1;
+        depth == 0
+    })?;
+    *remaining = &args[end + 1..];
+    Some((name, &args[..end], args[end].text))
+}
+
+/// Navigation and CTest consume the same borrowed CMake command and argument spans.
+pub(in crate::domain::code) struct Commands<'a>(Vec<Arg<'a>>);
+impl<'a> Commands<'a> {
+    pub(in crate::domain::code) fn read(source: &'a str) -> Self {
+        Self(tokens(source))
+    }
+    pub(in crate::domain::code) fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&'a str, &[Arg<'a>], &'a str)> {
+        let mut remaining = &self.0[..];
+        std::iter::from_fn(move || next_command(&mut remaining))
+    }
+}
+
+fn callable(
+    f: &mut Facts<String>,
+    source: &str,
+    args: &[Arg],
+    name: Option<&str>,
+) -> Option<usize> {
+    let own = name.filter(|s| simple(s)).map(|s| {
+        f.declare(
+            format!("f:{}", s.to_ascii_lowercase()),
+            span(source, s),
+            "function_definition",
+        )
+    });
+
+    for arg in args
+        .iter()
+        .skip(1)
+        .filter(|a| a.form == Form::Word && simple(a.text))
+    {
+        f.declare(
+            format!("v:{own:?}:{}", arg.text),
+            span(source, arg.text),
+            "parameter",
+        );
+    }
+    own
+}
+
+pub(in crate::domain::code) fn analyze(source: &str) -> Analysis {
+    let mut scope = Scope {
+        source,
+        facts: Facts::default(),
+        owners: Vec::new(),
+    };
+    for (name, args, _) in Commands::read(source).iter() {
+        scope.command(name, args);
+    }
+    scope.facts.finish()
+}
+
+struct Scope<'a> {
+    source: &'a str,
+    facts: Facts,
+    owners: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Callable,
+    End,
+    Build { alias: bool },
+    Set,
+    Dependencies,
+    Properties,
+    Target,
+    Other,
+}
+
+const TARGET_OPERATIONS: &[&str] = &[
+    "target_sources",
+    "target_compile_definitions",
+    "target_compile_features",
+    "target_compile_options",
+    "target_include_directories",
+    "target_link_directories",
+    "target_link_options",
+    "target_precompile_headers",
+];
+
+impl Command {
+    fn read(op: &str) -> Self {
+        match op {
+            "function" | "macro" => Self::Callable,
+            "endfunction" | "endmacro" => Self::End,
+            "add_executable" | "add_library" => Self::Build { alias: true },
+            "add_custom_target" => Self::Build { alias: false },
+            "set" | "option" => Self::Set,
+            "target_link_libraries" | "add_dependencies" => Self::Dependencies,
+            _ => Self::target_operation(op),
         }
-        if i == tokens.len() {
-            break;
+    }
+
+    fn target_operation(op: &str) -> Self {
+        if op == "set_target_properties" {
+            return Self::Properties;
         }
-        let args = &tokens[start..i];
-        i += 1;
+        if TARGET_OPERATIONS.contains(&op) {
+            return Self::Target;
+        }
+        Self::Other
+    }
+}
+
+impl Scope<'_> {
+    fn command(&mut self, cmd: &str, args: &[Arg]) {
         let op = cmd.to_ascii_lowercase();
-        let first = args
-            .first()
-            .filter(|a| matches!(a.form, Form::Quoted | Form::Word))
-            .map(|a| a.text);
-        let owner = owners.last().copied().flatten();
-        if matches!(&*op, "function" | "macro") {
-            let own = first.filter(|s| simple(s)).map(|s| {
-                f.declare(
-                    format!("f:{}", s.to_ascii_lowercase()),
-                    span(source, s),
-                    "function_definition",
-                )
-            });
-            owners.push(own);
-            for arg in args
-                .iter()
-                .skip(1)
-                .filter(|a| a.form == Form::Word && simple(a.text))
-            {
-                f.declare(
-                    format!("v:{own:?}:{}", arg.text),
-                    span(source, arg.text),
-                    "parameter",
+        let first = args.first().and_then(Arg::literal);
+        let owner = self.owners.last().copied().flatten();
+        let command = Command::read(&op);
+        let (arg_owner, variable) = match command {
+            Command::Callable => {
+                self.owners
+                    .push(callable(&mut self.facts, self.source, args, first));
+                return;
+            }
+            Command::End => {
+                self.owners.pop();
+                return;
+            }
+            Command::Build { .. } => (self.build_target(first).or(owner), None),
+            Command::Set => (owner, assignment_name(first, args)),
+            _ => {
+                self.facts.usage(
+                    format!("f:{op}"),
+                    span(self.source, cmd),
+                    owner,
+                    UseMode::EarlierCall,
                 );
+                (owner, None)
             }
-            continue;
-        }
-        if matches!(&*op, "endfunction" | "endmacro") {
-            owners.pop();
-            continue;
-        }
-        let mut arg_owner = owner;
-        let mut variable = None;
-        let properties = args
-            .iter()
-            .position(|a| a.text == "PROPERTIES")
-            .unwrap_or(args.len());
-        if matches!(&*op, "add_executable" | "add_library" | "add_custom_target") {
-            if let Some(s) = first.filter(|s| target(s)) {
-                arg_owner = Some(f.declare(format!("t:{s}"), span(source, s), "build_target"));
-            }
-        } else if matches!(&*op, "set" | "option") {
-            if args.len() > 1 && args.last().is_none_or(|v| v.text != "PARENT_SCOPE") {
-                variable = first.filter(|s| simple(s));
-            }
-        } else {
-            f.usage(format!("f:{op}"), span(source, cmd), owner, true, true);
-        }
-        let target_owner = if matches!(op.as_str(), "target_link_libraries" | "add_dependencies") {
-            first
-                .and_then(|name| f.names.get(&format!("t:{name}")))
-                .and_then(|ids| match &ids[..] {
-                    [id] => Some(*id),
-                    _ => None,
-                })
-        } else {
-            None
         };
-        for (j, arg) in args
+        self.argument_uses(
+            command,
+            args,
+            Owners {
+                lexical: owner,
+                argument: arg_owner,
+            },
+        );
+        if let Some(name) = variable {
+            self.facts.declare(
+                format!("v:{owner:?}:{name}"),
+                span(self.source, name),
+                "variable_declarator",
+            );
+        }
+    }
+
+    fn build_target(&mut self, name: Option<&str>) -> Option<usize> {
+        let name = name.filter(|name| target(name))?;
+        Some(
+            self.facts
+                .declare(format!("t:{name}"), span(self.source, name), "build_target"),
+        )
+    }
+
+    fn argument_uses(&mut self, command: Command, args: &[Arg], owners: Owners) {
+        let (targets, dependency_owner) = target_arguments(command, args, &self.facts);
+        for (j, s) in args
             .iter()
             .enumerate()
-            .filter(|(_, a)| matches!(a.form, Form::Word | Form::Quoted))
+            .filter_map(|(i, a)| Some((i, a.literal()?)))
         {
-            let s = arg.text;
-            let target_ref = match &*op {
-                "target_link_libraries" | "add_dependencies" => true,
-                "add_library" | "add_executable" => {
-                    j == 2 && args.get(1).is_some_and(|a| a.text == "ALIAS")
-                }
-                "set_target_properties" => j < properties,
-                "target_sources"
-                | "target_compile_definitions"
-                | "target_compile_features"
-                | "target_compile_options"
-                | "target_include_directories"
-                | "target_link_directories"
-                | "target_link_options"
-                | "target_precompile_headers" => j == 0,
-                _ => false,
-            };
-            if target_ref
+            if targets.contains(&j)
                 && target(s)
                 && !matches!(
                     s,
@@ -197,40 +293,87 @@ pub(super) fn analyze(source: &str) -> Analysis {
                 )
             {
                 let owner = if j == 0 {
-                    arg_owner
+                    owners.argument
                 } else {
-                    target_owner.or(arg_owner)
+                    dependency_owner.or(owners.argument)
                 };
-                f.usage(format!("t:{s}"), span(source, s), owner, false, false);
+                self.facts.usage(
+                    format!("t:{s}"),
+                    span(self.source, s),
+                    owner,
+                    UseMode::Reference,
+                );
             }
-            let mut offset = 0;
-            while let Some(pos) = s[offset..].find("${") {
-                let pos = offset + pos;
-                offset = pos + 2;
-                if s[..pos].bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0 {
-                    continue;
-                }
-                let Some(end) = s[offset..].find('}') else {
-                    break;
-                };
-                let name = &s[offset..offset + end];
-                if simple(name) {
-                    let local = format!("v:{owner:?}:{name}");
-                    // A function can inherit a variable from its caller. Bind inside
-                    // functions only when this lexical body supplies its own value.
-                    if f.names.contains_key(&local) {
-                        f.usage(local, span(source, name), arg_owner, false, true);
-                    }
-                }
-            }
-        }
-        if let Some(name) = variable {
-            f.declare(
-                format!("v:{owner:?}:{name}"),
-                span(source, name),
-                "variable_declarator",
-            );
+            self.variable_uses(s, owners);
         }
     }
-    f.finish()
+    fn variable_uses(&mut self, text: &str, owners: Owners) {
+        for name in variable_names(text) {
+            let local = format!("v:{:?}:{name}", owners.lexical);
+            // Only a value supplied in this lexical body proves a local binding.
+            if self.facts.names.contains_key(&local) {
+                self.facts.usage(
+                    local,
+                    span(self.source, name),
+                    owners.argument,
+                    UseMode::EarlierReference,
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Owners {
+    lexical: Option<usize>,
+    argument: Option<usize>,
+}
+
+fn assignment_name<'a>(first: Option<&'a str>, args: &[Arg]) -> Option<&'a str> {
+    if args.len() <= 1 || args.last().is_some_and(|arg| arg.text == "PARENT_SCOPE") {
+        return None;
+    }
+    first.filter(|name| simple(name))
+}
+
+fn variable_names(s: &str) -> impl Iterator<Item = &str> {
+    let mut close = 0;
+    s.match_indices("${")
+        .filter(|(open, _)| s[..*open].bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 0)
+        .map_while(move |(open, _)| {
+            let start = open + 2;
+            if close < start {
+                close = start + s[start..].find('}')?;
+            }
+            Some(&s[start..close])
+        })
+        .filter(|name| simple(name))
+}
+
+/// CMake commands designate targets by argument position. The remaining
+/// arguments may still contain variable expansions.
+fn target_arguments(
+    command: Command,
+    args: &[Arg<'_>],
+    facts: &Facts,
+) -> (std::ops::Range<usize>, Option<usize>) {
+    let positions = match command {
+        Command::Dependencies => {
+            let owner = args
+                .first()
+                .and_then(Arg::literal)
+                .and_then(|name| facts.unique(&format!("t:{name}")));
+            return (0..args.len(), owner);
+        }
+        Command::Build { alias: true } if args.get(1).is_some_and(|a| a.text == "ALIAS") => 2..3,
+        Command::Properties => {
+            0..args
+                .iter()
+                .position(|a| a.text == "PROPERTIES")
+                .unwrap_or(args.len())
+        }
+        Command::Target => 0..1,
+        _ => 0..0,
+    };
+    (positions, None)
 }

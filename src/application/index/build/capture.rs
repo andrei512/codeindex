@@ -1,4 +1,5 @@
 //! Schedule file captures within their shared transient byte allowance.
+mod resumable;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap},
@@ -53,8 +54,17 @@ impl<T: Send> Jobs<T> {
             return Ok(());
         }
         let workers = width.min(self.count);
+        if workers == 1 {
+            return run_workers([self.by_size], "capture worker failed", |groups| {
+                groups
+                    .into_iter()
+                    .rev()
+                    .flat_map(|(_, group)| group)
+                    .try_for_each(&process)
+            });
+        }
         if self.fits_concurrently(workers) {
-            run_workers(self.lanes(workers), |lane| {
+            run_workers(self.lanes(workers), "capture worker failed", |lane| {
                 lane.into_iter().try_for_each(&process)
             })
         } else {
@@ -63,7 +73,7 @@ impl<T: Send> Jobs<T> {
                 available: self.allowance,
             });
             let ready = Condvar::new();
-            run_workers(0..workers, |_| {
+            run_workers(0..workers, "capture worker failed", |_| {
                 while let Some((job, _credit)) = reserve(&state, &ready) {
                     process(job)?;
                 }
@@ -91,21 +101,26 @@ impl<T: Send> Jobs<T> {
 
 fn run_workers<W: Send>(
     work: impl IntoIterator<Item = W>,
+    panic_message: &'static str,
     run: impl Fn(W) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
+    let mut work = work.into_iter();
+    let Some(first) = work.next() else {
+        return Ok(());
+    };
+    let inline = || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(first)))
+            .unwrap_or_else(|_| Err(io::Error::other(panic_message)))
+    };
     thread::scope(|scope| {
         let run = &run;
-        let handles: Vec<_> = work
-            .into_iter()
-            .map(|item| scope.spawn(move || run(item)))
-            .collect();
-        // Join every worker. A second panic left for scope teardown would
-        // otherwise hide the first worker's error.
-        let mut result = Ok(());
+        let handles: Vec<_> = work.map(|item| scope.spawn(move || run(item))).collect();
+        // Join every worker, including after an inline error or panic.
+        let mut result = inline();
         for handle in handles {
             let finished = handle
                 .join()
-                .unwrap_or_else(|_| Err(io::Error::other("capture worker failed")));
+                .unwrap_or_else(|_| Err(io::Error::other(panic_message)));
             result = result.and(finished);
         }
         result
@@ -117,10 +132,7 @@ fn reserve<'a, T>(
     ready: &'a Condvar,
 ) -> Option<(T, Reservation<'a, T>)> {
     let mut queue = state.lock().unwrap();
-    loop {
-        if queue.by_size.is_empty() {
-            return None;
-        }
+    while !queue.by_size.is_empty() {
         if let Some((job, credit)) = queue.take() {
             return Some((
                 job,
@@ -133,6 +145,7 @@ fn reserve<'a, T>(
         }
         queue = ready.wait(queue).unwrap();
     }
+    None
 }
 
 struct Queue<T> {

@@ -1,0 +1,182 @@
+{
+  "Go testing": {
+    "path": "sample_test.go",
+    "outer": "package sample\nimport \"testing\"\nfunc TestSuite(t *testing.T) {\n  %\n}",
+    "wrapper": "t.Run(\"GROUP\", func(t *testing.T) {\n  %\n})",
+    "test": "t.Run(\"leaf\", func(t *testing.T) {\n  %\n})",
+    "setup": "t.Cleanup(func() {\n  %\n})",
+    "branch": "if true {\n  %\n}",
+    "action": "t.Log(\"ok\")"
+  },
+  "pytest": {
+    "path": "test_example.py",
+    "outer": "%",
+    "wrapper": "class TestGROUP:\n    %",
+    "test": "def test_leaf(*args):\n    %",
+    "setup": "def setup_method(*args):\n    %",
+    "branch": "if True:\n    %",
+    "action": "assert True"
+  },
+  "unittest subTest": {
+    "path": "test_example.py",
+    "outer": "import unittest\nclass Example(unittest.TestCase):\n    def test_leaf(self):\n        %",
+    "wrapper": "with self.subTest(group=\"GROUP\"):\n    %",
+    "test": "%",
+    "setup": "",
+    "branch": "if True:\n    %",
+    "action": "self.assertTrue(True)"
+  },
+  "JUnit Jupiter": {
+    "path": "ExampleTest.java",
+    "outer": "import org.junit.jupiter.api.*;\nclass ExampleTest {\n  %\n}",
+    "wrapper": "@Nested class GROUP {\n  %\n}",
+    "test": "@Test void leaf() {\n  %\n}",
+    "setup": "@BeforeEach void setup() {\n  %\n}",
+    "branch": "if (true) {\n  %\n}",
+    "action": "Assertions.assertTrue(true);"
+  },
+  "Kotest DescribeSpec": {
+    "path": "ExampleTest.kt",
+    "outer": "import io.kotest.core.spec.style.DescribeSpec\nclass ExampleTest : DescribeSpec({\n  %\n})",
+    "wrapper": "describe(\"GROUP\") {\n  %\n}",
+    "test": "it(\"leaf\") {\n  %\n}",
+    "setup": "beforeTest {\n  %\n}",
+    "branch": "if (true) {\n  %\n}",
+    "action": "check(true)"
+  },
+  "Swift Testing": {
+    "path": "SampleTests.swift",
+    "outer": "import Testing\n@Suite struct Root {\n  %\n}",
+    "wrapper": "@Suite struct GROUP {\n  %\n}",
+    "test": "@Test func leaf() {\n  %\n}",
+    "setup": "init() {\n  %\n}",
+    "branch": "if true {\n  %\n}",
+    "action": "#expect(true)"
+  },
+  "XCTest activities": {
+    "path": "SampleTests.swift",
+    "outer": "import XCTest\nclass Root: XCTestCase {\n  func testLeaf() {\n    %\n  }\n}",
+    "wrapper": "XCTContext.runActivity(named: \"GROUP\") { _ in\n  %\n}",
+    "test": "%",
+    "setup": "",
+    "branch": "if true {\n  %\n}",
+    "action": "XCTAssertTrue(true)"
+  },
+  "Rust test modules": {
+    "path": "src/lib.rs",
+    "outer": "#[cfg(test)]\nmod tests {\n    %\n}",
+    "wrapper": "mod GROUP {\n    %\n}",
+    "test": "#[test]\nfn leaf() {\n    %\n}",
+    "setup": "",
+    "branch": "if true {\n    %\n}",
+    "action": "assert!(true);"
+  },
+  "NUnit": {
+    "path": "TestSuite.cs",
+    "outer": "using NUnit.Framework;\n[TestFixture] public class Root {\n  %\n}",
+    "wrapper": "[TestFixture] public class GROUP {\n  %\n}",
+    "test": "[Test] public void Leaf() {\n  %\n}",
+    "setup": "[SetUp] public void Setup() {\n  %\n}",
+    "branch": "if (true) {\n  %\n}",
+    "action": "Assert.That(true);"
+  },
+  "Boost.Test": {
+    "path": "test/sample.cpp",
+    "outer": "#include <boost/test/unit_test.hpp>\n%",
+    "wrapper": "BOOST_AUTO_TEST_SUITE(GROUP)\n%\nBOOST_AUTO_TEST_SUITE_END()",
+    "test": "BOOST_AUTO_TEST_CASE(leaf) {\n  %\n}",
+    "setup": "",
+    "branch": "if (true) {\n  %\n}",
+    "action": "BOOST_TEST(true);"
+  },
+  "Pest": {
+    "path": "tests/SampleTest.php",
+    "outer": "<?php\n%",
+    "wrapper": "describe('GROUP', function () {\n  %\n});",
+    "test": "it('leaf', function () {\n  %\n});",
+    "setup": "beforeEach(function () {\n  %\n});",
+    "branch": "if (true) {\n  %\n}",
+    "action": "expect(true)->toBeTrue();"
+  },
+  "Ginkgo": {
+    "path": "sample_test.go",
+    "outer": "package sample\nimport . \"github.com/onsi/ginkgo/v2\"\nvar _ = Describe(\"suite\", func() {\n  %\n})",
+    "wrapper": "Context(\"GROUP\", func() {\n  %\n})",
+    "test": "It(\"leaf\", func() {\n  %\n})",
+    "setup": "BeforeEach(func() {\n  %\n})",
+    "branch": "if true {\n  %\n}",
+    "action": "println(\"ok\")"
+  },
+  "JUnit 4 Enclosed": {
+    "path": "ExampleTest.java",
+    "outer": "import org.junit.*;\nimport org.junit.runner.RunWith;\nimport org.junit.experimental.runners.Enclosed;\n@RunWith(Enclosed.class) public class ExampleTest {\n %\n}",
+    "wrapper": "@RunWith(Enclosed.class) public static class GROUP {\n %\n}",
+    "test": "public static class Leaf {\n @Test public void leaf() {\n  %\n }\n}",
+    "setup": "",
+    "branch": "if (true) {\n  %\n}",
+    "action": "Assert.assertTrue(true);"
+  },
+  "XCTest Objective-C activities": {
+    "path": "SampleTests.m",
+    "outer": "#import <XCTest/XCTest.h>\n@interface SampleTests : XCTestCase\n@end\n@implementation SampleTests\n- (void)testLeaf {\n %\n}\n@end",
+    "wrapper": "[XCTContext runActivityNamed:@\"GROUP\" block:^(id<XCTActivity> activity) {\n %\n}];",
+    "test": "%",
+    "setup": "",
+    "branch": "if (true) {\n  %\n}",
+    "action": "XCTAssertTrue(YES);"
+  },
+  "GoogleTest namespaces": {
+    "path": "tests/sample.cpp",
+    "outer": "#include <gtest/gtest.h>\n%",
+    "wrapper": "namespace GROUP {\n %\n}",
+    "test": "TEST(Example, Leaf) {\n %\n}",
+    "setup": "",
+    "branch": "if (true) {\n  %\n}",
+    "action": "EXPECT_TRUE(true);"
+  },
+  "Web Platform Tests steps": {
+    "path": "tests/sample.html",
+    "outer": "<script src=\"/resources/testharness.js\"></script>\n<script>\nasync_test(t => {\n %\n t.done();\n});\n</script>",
+    "wrapper": "t.step(() => {\n %\n});",
+    "test": "%",
+    "setup": "",
+    "branch": "if (true) {\n  %\n}",
+    "action": "assert_true(true);"
+  },
+  "NixOS Python subtests": {
+    "path": "tests/sample.nix",
+    "outer": "{ pkgs }: pkgs.testers.runNixOSTest {\n name = \"sample\";\n nodes.machine = {};\n testScript = ''\n  %\n '';\n}",
+    "wrapper": "with subtest(\"GROUP\"):\n    %",
+    "test": "%",
+    "setup": "",
+    "branch": "if True:\n    %",
+    "action": "assert True"
+  },
+  "ShellSpec": {
+    "path": "spec/sample_spec.sh",
+    "outer": "Describe \"root\"\n %\nEnd",
+    "wrapper": "Context \"GROUP\"\n %\nEnd",
+    "test": "It \"leaf\"\n %\n When call echo \"$input\"\n The output should eq 1\nEnd",
+    "setup": "",
+    "branch": "if true; then\n %\nfi",
+    "action": "input=1"
+  },
+  "Test2::V0": {
+    "path": "t/sample.t",
+    "outer": "use Test2::V0;\n%\ndone_testing;",
+    "wrapper": "subtest 'GROUP' => sub {\n  %\n};",
+    "test": "subtest 'leaf' => sub {\n  %\n};",
+    "setup": "",
+    "branch": "if (1) {\n  %\n}",
+    "action": "ok(1);"
+  },
+  "JUnit Jupiter Kotlin": {
+    "path": "ExampleTest.kt",
+    "outer": "import org.junit.jupiter.api.*\nclass ExampleTest {\n %\n}",
+    "wrapper": "@Nested inner class GROUP {\n %\n}",
+    "test": "@Test fun leaf() {\n %\n}",
+    "setup": "@BeforeEach fun setup() {\n %\n}",
+    "branch": "if (true) {\n  %\n}",
+    "action": "check(true)"
+  }
+}

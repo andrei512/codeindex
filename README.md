@@ -36,6 +36,33 @@ The native index stores file-local measurements for every supported language. cx
 
 The numeric model is independently calibrated against published Python examples. Accuracy varies with the language and rule. [Public evaluation and reproduction instructions](benchmarks/README.md#maintainability-score-accuracy)
 
+### Project scoring policy
+
+Run `cx --score . --ignore-score-policy --json` for the original thresholds and coverage. This keeps the normal test-code rules. Use `--ignore-test-rules` independently for comparisons against the production-code scorer. The [refactoring skill](.claude/skills/refactor-with-cx/SKILL.md) describes how to use findings, reference searches, tests and benchmarks together.
+
+Place policy for a repository in its root `.cxconfig`. In a plain folder, put it in the directory from which you run cx. Sections match whole repository-relative paths. The last matching assignment for each rule wins. A whole-file exclusion takes precedence over every rule. Each assignment needs a reason.
+
+```ini
+[generated/**]
+file = off # Regenerated from the protocol schema.
+
+[src/**]
+length = 60 # Keep hand-maintained units below sixty token-bearing lines.
+```
+
+Rule IDs are `complexity`, `length`, `conditions`, `regions`, `depth`, `parameters`, `duplication` and `oracle`. Set a rule to a positive inclusive threshold or `off`. For a local exception, put a directive on its own line in a language comment. The same directive text works in Python with `#`, in Rust with `//`, in CSS with `/* … */`, and in Markdown with an HTML comment.
+
+```rust
+// cx-score: begin depth -- The state transition order mirrors the wire protocol.
+fn decode_frame() { /* ... */ }
+// cx-score: end depth
+```
+
+Use `ignore-file RULE -- reason` for a file or `begin RULE -- reason` and `end RULE` around a region. Use `all` for all rules. Regions nest and close in reverse order. Marker lines identify the boundaries and earn no score weight. Markdown section lengths omit the markers. A finding belongs to its reported line, usually the declaration for a unit metric or the condition for a compound expression. Place the opening marker above the declaration to suppress a unit finding. Inline suppression applies after project settings. Malformed directives produce a score-query error with their location.
+
+Whole-file and all-rule region exclusions remove their scored lines from the weighted average. Single-rule exceptions suppress the matching findings. Inspect applied policy and reasons with `--json`. Search and navigation continue to use the same source.
+
+
 ## Search from the shell
 
 The examples below describe this checkout. The design target, including differences from current behavior, is in the [CLI invocation contract](docs/boxes/cli/invocation.md).
@@ -239,3 +266,9 @@ Run `cx --help` for all commands or `cx --cx help references` for a single comma
 ## License
 
 Codeindex is MIT-licensed. The bundled Unicode tables carry their own notice in `src/domain/pattern/unicode/LICENSE-UNICODE`.
+
+## Upgrading to 0.2.4
+
+Rust library callers of `write_envelope` now pass `EnvelopeHeader { kind, generation, root, len }` between the file and input arguments. Callers of `RankedIndex::search_extent` now pass the extent, an `ExtentCatalog { count, path, source }`, and the query. These are source-breaking changes for callers of those two APIs.
+
+The Rust scorer distinguishes declarative macro tags from match arms and handles unnamed arguments in foreign function signatures. Existing checkpoints refresh affected scoring data on use.

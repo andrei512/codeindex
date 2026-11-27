@@ -20,6 +20,12 @@ pub(super) fn contains(ranges: &[(char, char)], c: char) -> bool {
         .get(ranges.partition_point(|&(_, end)| end < c))
         .is_some_and(|&(start, _)| start <= c)
 }
+pub(crate) fn punctuation_or_symbol(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_punctuation();
+    }
+    contains(general_category::PUNCTUATION, c) || contains(general_category::SYMBOL, c)
+}
 pub(crate) fn letter_mark_or_number(c: char) -> bool {
     if c.is_ascii() {
         return c.is_ascii_alphanumeric();
@@ -28,8 +34,11 @@ pub(crate) fn letter_mark_or_number(c: char) -> bool {
         || contains(general_category::MARK, c)
         || contains(general_category::NUMBER, c)
 }
-pub(super) fn word(c: char) -> bool {
-    contains(perl_word::PERL_WORD, c)
+pub(super) fn word(c: char, ascii_only: bool) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    !ascii_only && contains(perl_word::PERL_WORD, c)
 }
 pub(super) fn decimal(c: char) -> bool {
     contains(perl_decimal::DECIMAL_NUMBER, c)
@@ -88,39 +97,38 @@ fn category(name: &str) -> Option<Set> {
         _ => lookup(general_category::BY_NAME, value("General_Category", name)?).map(Set::chars),
     }
 }
-fn named(kind: &str, v: &str) -> Option<Set> {
-    let table: &[(&str, Ranges)] = match kind {
-        "General_Category" => return category(v),
-        "Script" => script::BY_NAME,
-        "Script_Extensions" => script_extension::BY_NAME,
-        "Grapheme_Cluster_Break" => grapheme_cluster_break::BY_NAME,
-        "Sentence_Break" => sentence_break::BY_NAME,
-        "Word_Break" => word_break::BY_NAME,
-        "Age" => {
-            let rank = |s: &str| {
-                let (a, b) = s.strip_prefix('V')?.split_once('_')?;
-                Some((a.parse::<u8>().ok()?, b.parse::<u8>().ok()?))
-            };
-            let max = rank(value(kind, v)?)?;
-            let mut pairs = vec![];
-            for &(name, ranges) in age::BY_NAME {
-                if rank(name)? <= max {
-                    pairs.extend(ranges.iter().map(|&(a, b)| (a as u32, b as u32)))
-                }
-            }
-            return Some(Set::ranges(pairs));
+const NAMED_CLASSES: &[(&str, (&str, &[(&str, Ranges)]))] = &[
+    ("Grapheme_Cluster_Break", ("Grapheme_Cluster_Break", grapheme_cluster_break::BY_NAME)),
+    ("Script", ("Script", script::BY_NAME)),
+    ("Script_Extensions", ("Script", script_extension::BY_NAME)),
+    ("Sentence_Break", ("Sentence_Break", sentence_break::BY_NAME)),
+    ("Word_Break", ("Word_Break", word_break::BY_NAME)),
+];
+
+fn named(kind: &str, name: &str) -> Option<Set> {
+    match kind {
+        "General_Category" => category(name),
+        "Age" => through_age(name),
+        _ => {
+            let (namespace, table) = lookup(NAMED_CLASSES, kind)?;
+            lookup(table, value(namespace, name)?).map(Set::chars)
         }
-        _ => return None,
+    }
+}
+
+fn through_age(name: &str) -> Option<Set> {
+    let rank = |s: &str| {
+        let (a, b) = s.strip_prefix('V')?.split_once('_')?;
+        Some((a.parse::<u8>().ok()?, b.parse::<u8>().ok()?))
     };
-    let canon = value(
-        if kind == "Script_Extensions" {
-            "Script"
-        } else {
-            kind
-        },
-        v,
-    )?;
-    lookup(table, canon).map(Set::chars)
+    let max = rank(value("Age", name)?)?;
+    let mut pairs = vec![];
+    for &(name, ranges) in age::BY_NAME {
+        if rank(name)? <= max {
+            pairs.extend(ranges.iter().map(|&(a, b)| (a as u32, b as u32)))
+        }
+    }
+    Some(Set::ranges(pairs))
 }
 pub(super) fn property(query: &str) -> Option<Set> {
     if let Some((k, v)) = query.split_once([':', '=']) {
@@ -136,4 +144,20 @@ pub(super) fn property(query: &str) -> Option<Set> {
         return Some(Set::chars(ranges));
     }
     category(&v).or_else(|| named("Script", &v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_class_agrees_with_unicode_ranges_and_ascii_mode_for_every_scalar() {
+        let mut ranges = perl_word::PERL_WORD.iter().peekable();
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            while ranges.next_if(|range| range.1 < c).is_some() {}
+            let unicode = ranges.peek().is_some_and(|range| range.0 <= c);
+            assert_eq!(word(c, false), unicode, "Unicode {c:?}");
+            assert_eq!(word(c, true), unicode && c.is_ascii(), "ASCII {c:?}");
+        }
+    }
 }

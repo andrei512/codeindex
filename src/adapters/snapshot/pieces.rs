@@ -1,7 +1,7 @@
 //! A packed index still sees one logical address space. A retained span names
 //! immutable physical bytes directly, even after hundreds of publications.
 use super::{Envelope, FileKind, SegmentWriter};
-use crate::application::index::layout::ExtentSink;
+use crate::application::index::{build::MemoryBytes, layout::ExtentSink};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -30,6 +30,10 @@ struct Piece {
     key: u64,
     offset: u64,
 }
+fn logical_end(spans: &[Piece]) -> u64 {
+    spans.last().map_or(0, |piece| piece.end)
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Map {
     spans: Vec<Piece>,
@@ -44,8 +48,9 @@ impl Map {
         Ok(m)
     }
     fn len(&self) -> u64 {
-        self.spans.last().map_or(0, |s| s.end)
+        logical_end(&self.spans)
     }
+
     fn push(&mut self, key: u64, offset: u64, len: u64) -> io::Result<()> {
         if len == 0 {
             return Ok(());
@@ -53,11 +58,9 @@ impl Map {
         let start = self.len();
         let end = start.checked_add(len).ok_or_else(invalid)?;
         offset.checked_add(len).ok_or_else(invalid)?;
-        let n = self.spans.len();
-        let last_start = if n >= 2 { self.spans[n - 2].end } else { 0 };
-        if let Some(last) = self.spans.last_mut()
+        if let Some((last, earlier)) = self.spans.split_last_mut()
             && last.key == key
-            && last.offset.checked_add(start - last_start) == Some(offset)
+            && last.offset.checked_add(start - logical_end(earlier)) == Some(offset)
         {
             last.end = end;
         } else {
@@ -75,11 +78,7 @@ impl Map {
         }
         let mut at = range.start;
         let first = self.spans.partition_point(|s| s.end <= at);
-        let mut start = if first == 0 {
-            0
-        } else {
-            self.spans[first - 1].end
-        };
+        let mut start = logical_end(&self.spans[..first]);
         for s in &self.spans[first..] {
             if at == range.end {
                 break;
@@ -93,19 +92,30 @@ impl Map {
         Ok(())
     }
     pub fn append_rank(&mut self, generation: u64, range: Range<u64>) -> io::Result<()> {
-        if generation == 0 || generation >= LEGACY || self.len() != range.start || range.end <= range.start {
+        let key = rank_segment_key(generation)?;
+        let length = self.checked_append(range)?;
+        self.push(key, 0, length)
+    }
+    fn checked_append(&self, range: Range<u64>) -> io::Result<u64> {
+        if self.len() != range.start || range.is_empty() {
             return Err(invalid());
         }
-        self.push(LEGACY | generation, 0, range.end - range.start)
+        Ok(range.end - range.start)
     }
+
+    #[cfg(test)]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.spans.len() * 24);
+        let mut bytes = Vec::new();
+        self.encode_into(&mut bytes);
+        bytes
+    }
+    pub(super) fn encode_into(&self, bytes: &mut Vec<u8>) {
+        bytes.reserve(self.spans.len() * 24);
         for p in &self.spans {
             for v in [p.end, p.key, p.offset] {
                 bytes.extend(v.to_le_bytes());
             }
         }
-        bytes
     }
     pub fn decode(bytes: &[u8], id: u64, len: u64) -> io::Result<Self> {
         let (rows, tail) = bytes.as_chunks::<24>();
@@ -116,7 +126,7 @@ impl Map {
         for r in rows {
             let word = |i| u64::from_le_bytes(r[i..i + 8].try_into().unwrap());
             let (end, key, offset) = (word(0), word(8), word(16));
-            if end <= m.len() || key & !LEGACY == 0 || key & !LEGACY > id {
+            if end <= m.len() || !(1..=id).contains(&(key & !LEGACY)) {
                 return Err(invalid());
             }
             m.push(key, offset, end - m.len())?;
@@ -128,45 +138,82 @@ impl Map {
     }
 }
 
+fn rank_segment_key(generation: u64) -> io::Result<u64> {
+    (1..LEGACY).contains(&generation).then_some(LEGACY | generation).ok_or_else(invalid)
+}
+
+struct SegmentDescriptors<'a> {
+    cache: &'a Path,
+    retained: BTreeMap<u64, Envelope>,
+    selected: BTreeMap<u64, Envelope>,
+}
+
+impl SegmentDescriptors<'_> {
+    fn descriptor(&mut self, key: u64) -> io::Result<&Envelope> {
+        use std::collections::btree_map::Entry;
+        match self.selected.entry(key) {
+            Entry::Occupied(slot) => Ok(slot.into_mut()),
+            Entry::Vacant(slot) => {
+                let envelope = self.retained.remove(&key)
+                    .map_or_else(|| open_segment(self.cache, key), Ok)?;
+                Ok(slot.insert(envelope))
+            }
+        }
+    }
+}
+
+fn open_segment(cache: &Path, key: u64) -> io::Result<Envelope> {
+    Envelope::open(File::open(cache.join(name(key)))?, FileKind::Segment, key & !LEGACY)
+}
+
+pub(super) type Retired = std::collections::btree_map::IntoKeys<u64, Envelope>;
+
 pub(super) struct Segments {
-    memory: Option<Vec<u8>>,
+    memory: Option<MemoryBytes>,
     pub map: Map,
     files: BTreeMap<u64, Envelope>,
     cache: std::sync::OnceLock<super::read_cache::ReadCache>,
 }
 impl Segments {
-    pub(super) fn memory(bytes: Vec<u8>) -> Self {
+    pub(super) fn memory(bytes: MemoryBytes) -> Self {
         Self { memory: Some(bytes), map: Map::default(), files: Default::default(), cache: Default::default() }
     }
     pub fn open(cache: &Path, map: Map) -> io::Result<Self> {
-        let mut files = BTreeMap::new();
+        Self::replace(cache, map, None).map(|(selected, _)| selected)
+    }
+
+    /// Segment keys name immutable files. Transfer the predecessor's validated
+    /// descriptors under the writer lease, opening only newly referenced parts.
+    pub fn replace(cache: &Path, map: Map, previous: Option<Self>) -> io::Result<(Self, Retired)> {
+        let mut descriptors = SegmentDescriptors {
+            cache,
+            retained: previous.map(|prior| prior.files).unwrap_or_default(),
+            selected: BTreeMap::new(),
+        };
         let mut prev = 0;
         for s in &map.spans {
             let len = s.end - prev;
             prev = s.end;
-            if let std::collections::btree_map::Entry::Vacant(slot) = files.entry(s.key) {
-                slot.insert(Envelope::open(
-                    File::open(cache.join(name(s.key)))?,
-                    FileKind::Segment,
-                    s.key & !LEGACY,
-                )?);
-            }
-            if s.offset
-                .checked_add(len)
-                .is_none_or(|n| n > files[&s.key].payload_len())
+            let envelope = descriptors.descriptor(s.key)?;
+            if s.offset.checked_add(len).is_none_or(|n| n > envelope.payload_len())
             {
                 return Err(invalid());
             }
         }
-        Ok(Self {
+        Ok((Self {
             memory: None,
             map,
-            files,
+            files: descriptors.selected,
             cache: Default::default(),
-        })
+        }, descriptors.retained.into_keys()))
     }
     pub fn keys(&self) -> impl Iterator<Item = u64> + '_ {
         self.files.keys().copied()
+    }
+    pub(super) fn memory_range(&self, range: Range<u64>) -> io::Result<Option<&[u8]>> {
+        let Some(bytes) = &self.memory else { return Ok(None) };
+        let (head, tail) = bytes.slices(range)?;
+        Ok(tail.is_empty().then_some(head))
     }
     pub fn visit_cached(
         &self,
@@ -187,7 +234,10 @@ impl Segments {
         mut consume: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         if let Some(bytes) = &self.memory {
-            return consume(bytes.get(r.start as usize..r.end as usize).ok_or_else(invalid)?);
+            let (head, tail) = bytes.slices(r)?;
+            consume(head)?;
+            if !tail.is_empty() { consume(tail)?; }
+            return Ok(());
         }
         self.map.slices(r, |key, physical| {
             self.files[&key].visit(physical, &mut consume)
@@ -283,6 +333,30 @@ impl ExtentSink for Writer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn publication_transfers_retained_file_descriptors() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("cx-held-segment-{}",std::process::id()));
+        let file = File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        // Keep the temporary inode alive by descriptor alone.
+        std::fs::remove_file(path).unwrap();
+        let mut writer = SegmentWriter::new(file).unwrap();
+        writer.write_all(b"kept").unwrap();
+        let file = writer.finish(1).unwrap();
+        let fd = file.as_raw_fd();
+        let envelope = Envelope::open(file,FileKind::Segment,1).unwrap();
+        let mut map = Map::default();
+        map.push(1,0,4).unwrap();
+        let old = Segments {
+            files:BTreeMap::from([(1,envelope)]), map:map.clone(), memory:None, cache:Default::default()
+        };
+        let (mut retained,retired) = Segments::replace(&dir,map,Some(old)).unwrap();
+        assert_eq!(retired.len(),0);
+        let file=retained.files.remove(&1).unwrap().into_file();
+        assert_eq!(file.as_raw_fd(),fd);
+    }
+
     #[test]
     fn slicing_crosses_physical_files_and_coalesces_neighbors(){
         let mut map=Map::default();

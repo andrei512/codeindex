@@ -81,6 +81,19 @@ pub(crate) fn version() -> Result<String, String> {
         if jit == 0 { "not " } else { "" }
     ))
 }
+pub(super) fn literal(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 4);
+    quoted.push_str(r"\Q");
+    for (i, part) in text.split(r"\E").enumerate() {
+        if i != 0 {
+            quoted.push_str(r"\E\\E\Q");
+        }
+        quoted.push_str(part);
+    }
+    quoted.push_str(r"\E");
+    quoted
+}
+
 pub(super) struct Pcre {
     api: &'static Api,
     code: NonNull<c_void>,
@@ -99,26 +112,69 @@ impl Drop for Data<'_> {
         unsafe { (self.0.free_data)(self.1.as_ptr()) }
     }
 }
+fn compile_flags(syntax: crate::domain::pattern::CompileOptions, dotall: bool) -> u32 {
+    const MULTILINE: u32 = 0x400;
+    const CASELESS: u32 = 8;
+    const DOTALL: u32 = 0x20;
+    const UNICODE: u32 = 0x80000 | 0x20000;
+    MULTILINE | (u32::from(syntax.fold) * CASELESS) | (u32::from(dotall) * DOTALL)
+        | (u32::from(!syntax.ascii) * UNICODE)
+}
+
+fn compile_pattern(pattern: &str, syntax: crate::domain::pattern::CompileOptions) -> String {
+    let prefix = if syntax.crlf { "(*CRLF)" } else { "" };
+    match syntax.scope {
+        super::MatchScope::Anywhere => format!("{prefix}(?:{pattern})"),
+        super::MatchScope::Word => format!(r"{prefix}(?<!\w)(?:{pattern})(?!\w)"),
+        super::MatchScope::Line => format!("{prefix}^(?:{pattern})$"),
+    }
+}
+
+impl Data<'_> {
+    fn execute(&mut self, code: NonNull<c_void>, text: &str, offset: usize) -> Option<&[usize]> {
+        let data = self.1.as_ptr();
+        let n = unsafe {
+            (self.0.exec)(code.as_ptr(), text.as_ptr(), text.len(), offset, 0, data, std::ptr::null_mut())
+        };
+        if n <= 0 {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts((self.0.vector)(data), n as usize * 2) })
+    }
+}
+
+enum OffsetProjection {
+    Emit,
+    Retry,
+    End,
+}
+
+impl OffsetProjection {
+    fn apply(cursor: &mut crate::domain::pattern::MatchCursor, text: &str, a: usize, b: usize) -> Self {
+        if !(text.is_char_boundary(a) && text.is_char_boundary(b)) {
+            return Self::advance_to_boundary(cursor, text, a..b);
+        }
+        if cursor.consume(text, a, b) { Self::Emit } else { Self::Retry }
+    }
+
+    fn advance_to_boundary(cursor: &mut crate::domain::pattern::MatchCursor, text: &str, span: std::ops::Range<usize>) -> Self {
+        // The UTF-8 renderer needs scalar boundaries in both engines.
+        cursor.offset = text.ceil_char_boundary(span.end.max(cursor.offset + 1));
+        if cursor.offset == text.len() && span.start == span.end { Self::End } else { Self::Retry }
+    }
+}
+
 impl Pcre {
     pub fn new(
         pattern: &str,
-        fold: bool,
+        syntax: crate::domain::pattern::CompileOptions,
         dotall: bool,
-        unicode: bool,
-        crlf: bool,
     ) -> Result<Self, String> {
         let api = api()?;
         let mut error = 0;
         let mut offset = 0;
-        let opts = 0x400
-            | if fold { 8 } else { 0 }
-            | if dotall { 0x20 } else { 0 }
-            | if unicode { 0x80000 | 0x20000 } else { 0 };
-        let pattern = if crlf {
-            format!("(*CRLF)(?:{pattern})")
-        } else {
-            format!("(?:{pattern})")
-        };
+        let opts = compile_flags(syntax, dotall);
+        let pattern = compile_pattern(pattern, syntax);
         let p = unsafe {
             (api.compile)(
                 pattern.as_ptr(),
@@ -140,8 +196,8 @@ impl Pcre {
         Ok(Self { api, code })
     }
     pub fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
-        self.captures(text, 0)
-            .filter_map(|groups| groups.into_iter().next().flatten())
+        self.map_matches(text, 0, |slots| slots[0]..slots[1])
+            .filter(|span| span.start <= span.end)
     }
     pub fn id(&self, name: &str) -> Option<usize> {
         name.parse().ok().or_else(|| {
@@ -153,65 +209,43 @@ impl Pcre {
     pub fn captures<'a>(
         &'a self,
         text: &'a str,
-        mut cursor: usize,
+        start: usize,
     ) -> impl Iterator<Item = Vec<Option<Range<usize>>>> + 'a {
-        let data =
+        self.map_matches(text, start, move |slots| {
+            slots
+                .chunks_exact(2)
+                .map(|s| {
+                    (s[0] != usize::MAX
+                        && s[0] <= s[1]
+                        && text.is_char_boundary(s[0])
+                        && text.is_char_boundary(s[1]))
+                    .then_some(s[0]..s[1])
+                })
+                .collect()
+        })
+    }
+
+    fn map_matches<'a, T>(
+        &'a self,
+        text: &'a str,
+        start: usize,
+        mut project: impl FnMut(&[usize]) -> T + 'a,
+    ) -> impl Iterator<Item = T> + 'a {
+        let mut cursor = crate::domain::pattern::MatchCursor::new(start);
+        let mut data =
             NonNull::new(unsafe { (self.api.data)(self.code.as_ptr(), std::ptr::null_mut()) })
                 .map(|p| Data(self.api, p));
-        let mut previous = None;
         std::iter::from_fn(move || {
-            loop {
-                if cursor > text.len() {
-                    return None;
-                }
-                let d = data.as_ref()?.1.as_ptr();
-                let n = unsafe {
-                    (self.api.exec)(
-                        self.code.as_ptr(),
-                        text.as_ptr(),
-                        text.len(),
-                        cursor,
-                        0,
-                        d,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if n <= 0 {
-                    return None;
-                }
-                let slots =
-                    unsafe { std::slice::from_raw_parts((self.api.vector)(d), n as usize * 2) };
-                let (a, b) = (slots[0], slots[1]);
-                // cx's UTF-8 renderer needs scalar boundaries in both engines.
-                if !text.is_char_boundary(a) || !text.is_char_boundary(b) {
-                    cursor = text.ceil_char_boundary(b.max(cursor + 1));
-                    if cursor == text.len() && a == b {
-                        return None;
-                    }
-                    continue;
-                }
-                let duplicate = a == b && previous == Some(b);
-                previous = Some(b);
-                cursor = if a == b {
-                    b + text[b..].chars().next().map_or(1, char::len_utf8)
-                } else {
-                    b
-                };
-                if !duplicate {
-                    return Some(
-                        slots
-                            .chunks_exact(2)
-                            .map(|s| {
-                                (s[0] != usize::MAX
-                                    && s[0] <= s[1]
-                                    && text.is_char_boundary(s[0])
-                                    && text.is_char_boundary(s[1]))
-                                .then_some(s[0]..s[1])
-                            })
-                            .collect(),
-                    );
+            let data = data.as_mut()?;
+            while cursor.offset <= text.len() {
+                let slots = data.execute(self.code, text, cursor.offset)?;
+                match OffsetProjection::apply(&mut cursor, text, slots[0], slots[1]) {
+                    OffsetProjection::Emit => return Some(project(slots)),
+                    OffsetProjection::Retry => {}
+                    OffsetProjection::End => return None,
                 }
             }
+            None
         })
     }
 }

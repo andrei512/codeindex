@@ -26,6 +26,20 @@ fn edges<'a>(a: &Analysis, s: &'a str) -> Vec<(&'a str, Option<&'a str>, Option<
 }
 
 #[test]
+fn scoring_and_object_syntax_share_delimiter_recovery() {
+    let fragments = ["(", ")", "[", "]", "{", "}", "name", "\"{\""];
+    for a in fragments {
+        for b in fragments {
+            for c in fragments {
+                let source = format!("{a} {b} {c}");
+                let syntax = Syntax::new(Language::Go, &source);
+                assert_eq!(syntax.pair, crate::domain::code::script::paired_for_score(&syntax.t), "{source}");
+            }
+        }
+    }
+}
+
+#[test]
 fn declarations_calls_owners_and_opaque_literals_in_all_seven_languages() {
     for (lang, src, target, caller) in [
         (
@@ -161,6 +175,19 @@ fn type_references_and_multicomponent_selectors_keep_source_spans() {
 }
 
 #[test]
+fn grouped_go_value_specs_bind_each_name_and_skip_initializer_commas() {
+    let src = "package p\nvar (\na, b = 1, 2\nc, d = b, a\n)\nconst (\nx, y = 3, 4\n)\nfunc total() int { return b + d + y }";
+    let facts = analyze(Language::Go, src);
+    assert_eq!(
+        symbol_names(&facts, src),
+        ["a", "b", "c", "d", "x", "y", "total"]
+    );
+    let markers = ["a, b", "b =", "c, d", "d =", "x, y", "y =", "total()"];
+    let positions: Vec<_> = facts.declarations.iter().map(|d| d.span.start).collect();
+    assert_eq!(positions, markers.map(|anchor| src.find(anchor).unwrap()));
+}
+
+#[test]
 fn go_grouped_types_and_generic_receivers_are_named() {
     let s = "package p\ntype (\n Meter struct { Value int }\n Reader interface{}\n)\nfunc (m *Meter) Count() int { return 1 }\nfunc identity[T any](v T) T { return v }";
     let a = analyze(Language::Go, s);
@@ -168,6 +195,26 @@ fn go_grouped_types_and_generic_receivers_are_named() {
         symbol_names(&a, s),
         ["Meter", "Reader", "Count", "identity"]
     );
+}
+
+#[test]
+fn go_receiver_lookup_accepts_later_types_and_keeps_distinct_method_owners() {
+    let src = concat!(
+        "package p\n",
+        "func (a *Alpha) step() {}\n",
+        "func (b Beta) step() {}\n",
+        "func (a *Alpha) run() { a.step() }\n",
+        "func (b Beta) run() { b.step() }\n",
+        "type (\nAlpha struct{}\nBeta struct{}\n)\n",
+    );
+    let a = analyze(Language::Go, src);
+    let targets: Vec<_> = a.direct.iter().filter_map(|(row, targets)| {
+        let use_span = &a.calls[*row].span;
+        if &src[use_span.clone()] != "step" { return None; }
+        let [id] = targets.as_slice() else { panic!("ambiguous method") };
+        Some(a.declarations[*id].span.start)
+    }).collect();
+    assert_eq!(targets, [src.find("step()").unwrap(), src.find("Beta) step").unwrap() + 6]);
 }
 
 #[test]
@@ -286,4 +333,35 @@ fn php_reopened_namespace_uses_the_same_function_table() {
         a.declarations[targets[0]].span.start,
         src.find("work").unwrap()
     );
+}
+
+#[test]
+fn incomplete_php_declaration_keeps_the_type_at_a_shared_name_token() {
+    let source = "<?php const class T = 0;";
+    let facts = analyze(Language::Php, source);
+    let kinds: Vec<_> = facts.declarations.iter()
+        .filter(|d| &source[d.span.clone()] == "T")
+        .map(|d| d.kind)
+        .collect();
+    assert_eq!(kinds, ["class_declaration"]);
+}
+
+#[test]
+fn qualified_static_calls_require_an_unambiguous_local_class_and_public_implementation() {
+    for (lang, header) in [(Language::Hack, "<?hh"), (Language::Php, "<?php")] {
+        let src = format!("{header}
+namespace A; class Box {{ public static function same() {{}} }}
+            namespace B; class Box {{ public static function same() {{}} private static function hidden() {{}} public final function instance() {{}} }}
+            function run() {{ Box::same(); Box::hidden(); Box::instance(); Other\\Box::same(); $box::same(); }}");
+        let a = analyze(lang, &src);
+        let resolved: Vec<_> = a.direct.iter().map(|(call, targets)| {
+            (a.calls[*call].span.start, a.declarations[targets[0]].span.start)
+        }).collect();
+        assert_eq!(resolved, [(src.find("Box::same()").unwrap() + 5, src.rfind("function same").unwrap() + 9)]);
+    }
+    let private = "<?php class Box { private static function secret() {} public function inside() { Box::secret(); } } Box::secret();";
+    let a = analyze(Language::Php, private);
+    assert_eq!(edges(&a, private), [("secret", Some("inside"), Some("secret")), ("secret", None, None)]);
+    let src = "<?hh class Box { public static function same(): void {} } function run<reify Box>(): void { Box::same(); }";
+    assert!(analyze(Language::Hack, src).direct.is_empty());
 }

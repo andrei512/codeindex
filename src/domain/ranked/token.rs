@@ -1,12 +1,29 @@
 use super::unicode::RANGES;
 use std::ops::Range;
 
-const MAX_KEY: usize = 32768;
+pub(super) const MAX_KEY: usize = 32768;
 
 /// Emits a borrowed, normalized key and the complete span of its original spelling.
 /// SQLite caps key *bytes*, including when the cap falls inside a scalar.
 pub(super) fn tokenize(text: &str, emit: impl FnMut(&[u8], Range<usize>)) {
     tokenize_with(text, &mut Vec::new(), emit);
+}
+
+fn normalized(c: char) -> (u8, Option<char>) {
+    if c.is_ascii() {
+        (
+            u8::from(c.is_ascii_alphanumeric() || c == '_'),
+            Some(c.to_ascii_lowercase()),
+        )
+    } else {
+        let scalar = match c as u32 {
+            0xfffe | 0xffff => 0xfffd,
+            n => n,
+        };
+        let index = RANGES.partition_point(|&(lower, _, _)| lower <= scalar) - 1;
+        let (_, kind, delta) = RANGES[index];
+        (kind, char::from_u32((scalar as i32 + delta) as u32))
+    }
 }
 
 pub(super) fn tokenize_with(
@@ -17,28 +34,8 @@ pub(super) fn tokenize_with(
     key.clear();
     let mut start = None;
     for (i, c) in text.char_indices() {
-        let (kind, folded) = if c.is_ascii() {
-            (
-                u8::from(c.is_ascii_alphanumeric() || c == '_'),
-                Some(c.to_ascii_lowercase()),
-            )
-        } else {
-            let scalar = match c as u32 {
-                0xfffe | 0xffff => 0xfffd,
-                n => n,
-            };
-            let index = RANGES.partition_point(|&(lower, _, _)| lower <= scalar) - 1;
-            let (_, kind, delta) = RANGES[index];
-            (kind, char::from_u32((scalar as i32 + delta) as u32))
-        };
-        if kind == 1 || (kind == 2 && start.is_some()) {
-            start.get_or_insert(i);
-            if let Some(folded) = folded.filter(|_| key.len() < MAX_KEY) {
-                let mut buffer = [0; 4];
-                let bytes = folded.encode_utf8(&mut buffer).as_bytes();
-                key.extend_from_slice(&bytes[..bytes.len().min(MAX_KEY - key.len())]);
-            }
-        } else if let Some(begin) = start.take() {
+        let boundary = !append_word_char(c, i, &mut start, key);
+        if let Some(begin) = start.take_if(|_| boundary) {
             emit(key, begin..i);
             key.clear();
         }
@@ -48,31 +45,80 @@ pub(super) fn tokenize_with(
     }
 }
 
+fn append_word_char(c: char, at: usize, start: &mut Option<usize>, key: &mut Vec<u8>) -> bool {
+    let (kind, folded) = normalized(c);
+    let continues_word = kind == 2 && start.is_some();
+    if kind == 1 || continues_word {
+        start.get_or_insert(at);
+        append_scalar(key, folded);
+        true
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn append_scalar(key: &mut Vec<u8>, folded: Option<char>) {
+    let Some(folded) = folded.filter(|_| key.len() < MAX_KEY) else { return };
+    let mut buffer = [0; 4];
+    let bytes = folded.encode_utf8(&mut buffer).as_bytes();
+    key.extend_from_slice(&bytes[..bytes.len().min(MAX_KEY - key.len())]);
+}
+
+/// Camel-case transitions and underscore separators share the same part ranges
+/// in the ASCII and Unicode paths. Each scanner uses its own character predicates.
+#[derive(Default)]
+struct Parts {
+    begin: usize,
+}
+impl Parts {
+    fn split(&mut self, at: usize, underscore: bool) -> Option<Range<usize>> {
+        let range = self.begin..at;
+        self.begin = at + usize::from(underscore);
+        (!range.is_empty()).then_some(range)
+    }
+    fn tail(self, end: usize) -> Option<Range<usize>> {
+        (self.begin > 0 && self.begin < end).then_some(self.begin..end)
+    }
+}
 /// Identifier splitting follows Rust's character predicates, independently of
 /// unicode61's frozen token character set. Each emitted part borrows the source.
 pub(super) fn identifier_parts(text: &str, mut emit: impl FnMut(usize, &str)) {
     for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let base = word.as_ptr() as usize - text.as_ptr() as usize;
-        let mut start = 0;
-        let mut previous = ' ';
-        let mut chars = word.char_indices().peekable();
-        while let Some((at, c)) = chars.next() {
-            if c == '_'
-                || (c.is_uppercase()
-                    && (previous.is_lowercase()
-                        || (previous.is_uppercase()
-                            && chars.peek().is_some_and(|(_, next)| next.is_lowercase()))))
-            {
-                if at > start {
-                    emit(base + start, &word[start..at]);
-                }
-                start = at + usize::from(c == '_');
-            }
-            previous = c;
+        unicode_parts(word, |part| emit(base + part.start, &word[part]));
+    }
+}
+/// An upper-case letter follows a lower-case letter or ends an acronym
+/// immediately before a lower-case letter (as in HTTPServer).
+fn starts_camel_part<T: Copy>(
+    previous: T,
+    next: Option<T>,
+    upper: impl Fn(T) -> bool,
+    lower: impl Fn(T) -> bool,
+) -> bool {
+    lower(previous) || upper(previous) && next.is_some_and(lower)
+}
+fn unicode_parts(word: &str, mut emit: impl FnMut(Range<usize>)) {
+    let mut parts = Parts::default();
+    let mut previous = ' ';
+    let mut chars = word.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let boundary = c == '_'
+            || c.is_uppercase()
+                && starts_camel_part(
+                    previous,
+                    chars.peek().map(|(_, ch)| *ch),
+                    char::is_uppercase,
+                    char::is_lowercase,
+                );
+        if boundary && let Some(part) = parts.split(at, c == '_') {
+            emit(part);
         }
-        if start > 0 && start < word.len() {
-            emit(base + start, &word[start..]);
-        }
+        previous = c;
+    }
+    if let Some(part) = parts.tail(word.len()) {
+        emit(part);
     }
 }
 
@@ -80,9 +126,11 @@ pub(super) fn identifier_parts(text: &str, mut emit: impl FnMut(usize, &str)) {
 /// separates words for both tokenizers. A word touching Unicode uses each
 /// tokenizer's original, independent classification and folding rules.
 pub(super) fn ranked_words(text: &str, mut emit: impl FnMut(bool, &[u8], Range<usize>)) {
-    let mut key = Vec::new();
-    let mut word =
-        |start, end, special| emit_word(&text[start..end], start, special, &mut key, &mut emit);
+    let mut output = RankedTokens {
+        key: Vec::new(),
+        emit: &mut emit,
+    };
+    let mut word = |start, end, special| output.word(&text[start..end], start, special);
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
@@ -94,40 +142,54 @@ pub(super) fn ranked_words(text: &str, mut emit: impl FnMut(bool, &[u8], Range<u
         target_feature = "neon",
         target_endian = "little"
     )))]
-    scan_scalar(text, &mut word);
+    scalar_range(text.as_bytes(), 0, PendingWord::default(), &mut word);
 }
 
-#[cfg(not(all(
-    target_arch = "aarch64",
-    target_feature = "neon",
-    target_endian = "little"
-)))]
-fn scan_scalar(text: &str, emit: &mut impl FnMut(usize, usize, bool)) {
-    let bytes = text.as_bytes();
+// Shared by the scalar scanner and the trailing bytes after a SIMD block.
+fn word_byte(b: u8) -> bool {
+    !b.is_ascii() || b.is_ascii_alphanumeric() || b == b'_'
+}
 
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if bytes[cursor].is_ascii()
-            && !bytes[cursor].is_ascii_alphanumeric()
-            && bytes[cursor] != b'_'
-        {
-            cursor += 1;
-            continue;
+fn needs_subtokens(b: u8) -> bool {
+    !b.is_ascii() || b.is_ascii_uppercase() || b == b'_'
+}
+
+#[derive(Default)]
+struct PendingWord {
+    start: Option<usize>,
+    special: bool,
+}
+
+impl PendingWord {
+    fn observe(&mut self, byte: u8, at: usize, emit: &mut impl FnMut(usize, usize, bool)) {
+        if word_byte(byte) {
+            self.start.get_or_insert(at);
+            self.special |= needs_subtokens(byte);
+        } else {
+            self.finish(at, emit);
         }
-        let start = cursor;
-
-        let mut camel_or_snake = false;
-        while cursor < bytes.len() {
-            let c = bytes[cursor];
-            if c.is_ascii() && !c.is_ascii_alphanumeric() && c != b'_' {
-                break;
-            }
-
-            camel_or_snake |= !c.is_ascii() || c == b'_' || c.is_ascii_uppercase();
-            cursor += 1;
-        }
-        emit(start, cursor, camel_or_snake);
     }
+
+    #[inline]
+    fn finish(&mut self, at: usize, emit: &mut impl FnMut(usize, usize, bool)) {
+        if let Some(start) = self.start.take() {
+            emit(start, at, self.special);
+            self.special = false;
+        }
+    }
+}
+
+/// Finish a scalar range, including a word carried in from a SIMD block.
+fn scalar_range(
+    bytes: &[u8],
+    base: usize,
+    mut pending: PendingWord,
+    emit: &mut impl FnMut(usize, usize, bool),
+) {
+    for (i, &b) in bytes.iter().enumerate() {
+        pending.observe(b, base + i, emit);
+    }
+    pending.finish(base + bytes.len(), emit);
 }
 
 /// One bit per nibble marks the sixteen input bytes. Little-endian lane order
@@ -186,78 +248,98 @@ fn scan_neon(bytes: &[u8], emit: &mut impl FnMut(usize, usize, bool)) {
         }
         special |= flagged != 0;
     }
-    for (i, &b) in tail.iter().enumerate() {
-        let at = blocks.len() * 16 + i;
-        let word = !b.is_ascii() || b.is_ascii_alphanumeric() || b == b'_';
-        if word {
-            if !in_word {
-                start = at;
-            }
-            special |= !b.is_ascii() || b.is_ascii_uppercase() || b == b'_';
-        } else if in_word {
-            emit(start, at, special);
-            special = false;
+    scalar_range(
+        tail,
+        blocks.len() * 16,
+        PendingWord { start: in_word.then_some(start), special },
+        emit,
+    );
+}
+
+fn ascii_parts(
+    word: &[u8],
+    key: &[u8],
+    start: usize,
+    emit: &mut impl FnMut(bool, &[u8], Range<usize>),
+) {
+    let mut parts = Parts::default();
+    let mut part = |range: Range<usize>| {
+        let span = start + range.start..start + range.end;
+        emit(true, &key[range], span);
+    };
+    for (i, &b) in word.iter().enumerate() {
+        let boundary = b == b'_'
+            || i > 0
+                && b.is_ascii_uppercase()
+                && starts_camel_part(
+                    word[i - 1],
+                    word.get(i + 1).copied(),
+                    |b| b.is_ascii_uppercase(),
+                    |b| b.is_ascii_lowercase(),
+                );
+        if boundary && let Some(range) = parts.split(i, b == b'_') {
+            part(range);
         }
-        in_word = word;
     }
-    if in_word {
-        emit(start, bytes.len(), special);
+    if let Some(range) = parts.tail(word.len()) {
+        part(range);
     }
 }
 
-fn emit_word(
-    word: &str,
-    start: usize,
-    camel_or_snake: bool,
-    key: &mut Vec<u8>,
-    emit: &mut impl FnMut(bool, &[u8], Range<usize>),
-) {
-    let cursor = start + word.len();
-    // Keep scratch bounded for generated identifiers that occupy most of a file.
-    if (camel_or_snake && !word.is_ascii()) || (camel_or_snake && word.len() > MAX_KEY) {
-        tokenize_with(word, key, |k, span| {
-            emit(false, k, start + span.start..start + span.end)
+struct RankedTokens<'a, F> {
+    key: Vec<u8>,
+    emit: &'a mut F,
+}
+impl<F: FnMut(bool, &[u8], Range<usize>)> RankedTokens<'_, F> {
+    fn folded(&mut self, text: &str, start: usize, part: bool) {
+        tokenize_with(text, &mut self.key, |key, span| {
+            (self.emit)(part, key, start + span.start..start + span.end)
         });
-        identifier_parts(word, |base, part| {
-            tokenize_with(part, key, |k, span| {
-                emit(true, k, start + base + span.start..start + base + span.end)
-            })
-        });
-        return;
     }
-    let word = word.as_bytes();
-    if !camel_or_snake {
-        emit(false, &word[..word.len().min(MAX_KEY)], start..cursor);
-        return;
-    }
-    key.clear();
-    key.extend_from_slice(word);
-    key.make_ascii_lowercase();
-    emit(false, &key[..key.len().min(MAX_KEY)], start..cursor);
-    let mut begin = 0;
-    for (i, &b) in word.iter().enumerate() {
-        if b == b'_'
-            || (i > 0
-                && b.is_ascii_uppercase()
-                && (word[i - 1].is_ascii_lowercase()
-                    || (word[i - 1].is_ascii_uppercase()
-                        && word.get(i + 1).is_some_and(u8::is_ascii_lowercase))))
-        {
-            if begin < i {
-                emit(
-                    true,
-                    &key[begin..i.min(begin + MAX_KEY)],
-                    start + begin..start + i,
-                );
-            }
-            begin = i + usize::from(b == b'_');
+    fn word(&mut self, word: &str, start: usize, camel_or_snake: bool) {
+        let span = start..start + word.len();
+        if !camel_or_snake {
+            let bytes = word.as_bytes();
+            (self.emit)(false, &bytes[..bytes.len().min(MAX_KEY)], span);
+            return;
         }
+        // Unicode and oversized generated identifiers use bounded scratch.
+        if !word.is_ascii() || word.len() > MAX_KEY {
+            self.folded(word, start, false);
+            identifier_parts(word, |base, part| self.folded(part, start + base, true));
+            return;
+        }
+        let bytes = word.as_bytes();
+        self.key.clear();
+        self.key.extend_from_slice(bytes);
+        self.key.make_ascii_lowercase();
+        (self.emit)(false, &self.key, span);
+        ascii_parts(bytes, &self.key, start, self.emit);
     }
-    if begin > 0 && begin < word.len() {
-        emit(
-            true,
-            &key[begin..key.len().min(begin + MAX_KEY)],
-            start + begin..cursor,
-        );
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    target_feature = "neon",
+    target_endian = "little"
+))]
+#[test]
+fn simd_word_boundaries_match_scalar_for_every_tail_alignment() {
+    for prefix in 0..16 {
+        for count in [0, 1, 15, 16, 17, 31, 32] {
+            let text = format!(
+                "{}aBC_Δ..word{} _tail",
+                ".".repeat(prefix),
+                "X".repeat(count)
+            );
+            let mut simd = Vec::new();
+            scan_neon(text.as_bytes(), &mut |a, b, flag| simd.push((a, b, flag)));
+            let mut scalar = Vec::new();
+            scalar_range(text.as_bytes(), 0, PendingWord::default(), &mut |a, b, flag| {
+                scalar.push((a, b, flag))
+            });
+            assert_eq!(simd, scalar, "{text}");
+        }
     }
 }

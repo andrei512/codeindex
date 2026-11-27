@@ -1,4 +1,4 @@
-use super::query::{Invocation, Outcome, evaluate};
+use super::query::{CallerOutput, IndexedMode, Invocation, Outcome};
 use crate::adapters::snapshot::Pin;
 use std::{
     ffi::OsString,
@@ -7,7 +7,6 @@ use std::{
 };
 mod help;
 mod search_args;
-pub(crate) use help::{argument_error, is_command};
 pub(crate) fn name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -32,156 +31,246 @@ pub fn run(
         .is_some_and(|arg| arg == super::watcher::INTERNAL_ARG)
     {
         args.next();
-        return match (args.next(), args.next()) {
-            (Some(root), None)
-                if super::watcher::serve(std::path::Path::new(&root), &mut out).is_ok() =>
-            {
-                ExitCode::SUCCESS
-            }
-            _ => ExitCode::FAILURE,
-        };
+        return serve_watcher(args, &mut out);
     }
-    let Ok(mut args) = args
+    let Ok(args) = args
         .map(OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
     else {
         let _ = writeln!(err, "invalid non-UTF-8 argument");
         return ExitCode::from(2);
     };
-    let result = if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h" || flag == "--cx")
-    {
-        help::overview(&mut out)
-    } else if args.as_slice() == ["--cx", "intro"] {
-        help::intro(&mut out)
-    } else if let [ns, verb, name] = args.as_slice()
-        && ns == "--cx"
-        && verb == "help"
-    {
-        match help::command(name, &mut out) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                let _ = writeln!(
-                    err,
-                    "unknown command '{name}'. Run 'cx --help' to list commands."
-                );
-                return ExitCode::from(2);
-            }
-            Err(e) => Err(e),
+    if let Some(action) = Startup::select(&args) {
+        return action.write(&mut out, &mut err);
+    }
+    run_search(args, &mut out, &mut err)
+}
+
+enum Startup<'a> {
+    Overview,
+    Intro,
+    Help(&'a str),
+    PcreVersion,
+    Version,
+}
+
+impl<'a> Startup<'a> {
+    fn select(args: &'a [String]) -> Option<Self> {
+        match args {
+            [flag] => Self::flag(flag),
+            [ns, tail @ ..] if ns == "--cx" => Self::advanced(tail),
+            _ => None,
         }
-    } else if args.as_slice() == ["--pcre2-version"] {
-        match super::query::pcre_version() {
-            Ok(v) => writeln!(out, "{v}"),
-            Err(e) => {
-                let _ = writeln!(err, "{e}");
-                return ExitCode::FAILURE;
-            }
+    }
+
+    fn flag(flag: &str) -> Option<Self> {
+        match flag {
+            "--help" | "-h" | "--cx" => Some(Self::Overview),
+            "--pcre2-version" => Some(Self::PcreVersion),
+            "--version" => Some(Self::Version),
+            _ => None,
         }
-    } else if args.as_slice() == ["--version"] {
-        writeln!(out, "cx {}", env!("CARGO_PKG_VERSION"))
-    } else {
-        let indexed = args.first().is_some_and(|arg| {
-            matches!(
-                arg.as_str(),
-                "--score" | "--cx" | "-k" | "--keywords" | "--symbol" | "--reference" | "--refs"
-            )
-        });
-        if !indexed && let Err(e) = search_args::expand(&mut args, &mut err) {
-            let _ = writeln!(err, "{}: {e}", name());
-            return ExitCode::from(2);
+    }
+
+    fn advanced(tail: &'a [String]) -> Option<Self> {
+        match tail {
+            [verb] if verb == "intro" => Some(Self::Intro),
+            [verb, name] if verb == "help" => Some(Self::Help(name)),
+            _ => None,
         }
-        if args.is_empty() {
-            let _ = writeln!(err, "cx: a search pattern is required");
-            return ExitCode::from(2);
-        }
-        if std::io::IsTerminal::is_terminal(&std::io::stdout())
-            && !matches!(
-                args[0].as_str(),
-                "--score" | "--cx" | "-k" | "--keywords" | "--symbol" | "--reference" | "--refs"
-            )
-        {
-            args.insert(0, "--cx-terminal".into());
-            if std::env::var_os("NO_COLOR").is_none()
-                && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
-            {
-                args.insert(0, "--cx-terminal-color".into());
-            }
-        }
-        let req = match Invocation::parse(&args) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = writeln!(err, "{}: {e}", name());
-                return ExitCode::from(2);
-            }
+    }
+
+    fn write(self, out: &mut impl Write, err: &mut impl Write) -> ExitCode {
+        let result = match self {
+            Self::Overview => help::overview(out),
+            Self::Intro => help::intro(out),
+            Self::Help(command) => match help::command(command, out) {
+                Ok(false) => return unknown_help(command, err),
+                result => result.map(|_| ()),
+            },
+            Self::PcreVersion => return pcre_banner(out, err),
+            Self::Version => writeln!(out, "cx {}", env!("CARGO_PKG_VERSION")),
         };
-        if let super::query::Request::Lines(lines) = &req.request {
-            if let Some(list) = lines.type_listing() {
-                return if out
-                    .write_all(list.as_bytes())
-                    .and_then(|_| out.flush())
-                    .is_ok()
-                {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::from(2)
-                };
-            }
-            use std::os::unix::fs::FileTypeExt;
-            let piped = std::fs::metadata("/dev/stdin")
-                .is_ok_and(|m| m.is_file() || m.file_type().is_fifo() || m.file_type().is_socket());
-            if lines.explicit_stdin() || piped && lines.stdin_only() {
-                use std::io::Read;
-                let mut input = Vec::new();
-                if let Err(e) = std::io::stdin().read_to_end(&mut input) {
-                    let _ = writeln!(err, "{}: {e}", name());
-                    return ExitCode::from(2);
-                }
-                let (text, hit) = lines.stream(&input);
-                if out.write_all(&text).and_then(|_| out.flush()).is_err() {
-                    return ExitCode::from(2);
-                }
-                return ExitCode::from(u8::from(!hit));
-            }
+        finish_startup(result, out, err)
+    }
+}
+
+fn unknown_help(command: &str, err: &mut impl Write) -> ExitCode {
+    let _ = writeln!(err, "unknown command '{command}'. Run 'cx --help' to list commands.");
+    ExitCode::from(2)
+}
+
+fn pcre_banner(out: &mut impl Write, err: &mut impl Write) -> ExitCode {
+    let version = match super::query::pcre_version() {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            return ExitCode::FAILURE;
         }
-        return match (|| -> io::Result<ExitCode> {
-            let cwd = std::env::current_dir()?;
-            let is_lines = matches!(req.request, super::query::Request::Lines(_));
-            let mut result = Outcome::default();
-            let root = super::repository::find_worktree(&cwd)?
-                .filter(|root| !is_lines || super::repository::usable_marker(root));
-            let answer = if let Some(root) = root {
-                if !matches!(&req.request, super::query::Request::Lines(lines) if lines.requires_caller())
-                    && let Some(code) =
-                        super::watcher::query(&root, &cwd, &args, &mut out, &mut err)?
-                {
-                    return Ok(code);
-                }
-                evaluate(&Pin::refresh_root(root, None)?, req, &cwd, &mut result)?
-            } else {
-                super::query::plain(req, &cwd, &mut result)?
-            };
-            err.write_all(result.diagnostics.as_bytes())?;
-            if answer.is_empty() {
-                return Ok(ExitCode::from(result.code));
-            }
-            out.write_all(&answer)?;
-            if !is_lines {
-                writeln!(out)?;
-            }
-            Ok(ExitCode::from(result.code))
-        })() {
-            Ok(code) if out.flush().is_ok() => code,
-            Ok(_) => ExitCode::FAILURE,
-            Err(e) => {
-                let _ = writeln!(err, "{}: {e}", name());
-                ExitCode::from(2)
-            }
-        };
     };
+    let result = writeln!(out, "{version}");
+    finish_startup(result, out, err)
+}
+
+fn finish_startup(result: io::Result<()>, out: &mut impl Write, err: &mut impl Write) -> ExitCode {
     match result.and_then(|_| out.flush()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(err, "{}: {error}", name());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn serve_watcher(mut args: impl Iterator<Item = OsString>, out: &mut impl Write) -> ExitCode {
+    let (Some(root), None) = (args.next(), args.next()) else {
+        return ExitCode::FAILURE;
+    };
+    match super::watcher::serve(std::path::Path::new(&root), out) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::FAILURE,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SearchMode {
+    Indexed(IndexedMode),
+    Pattern,
+    InspectPattern,
+}
+
+impl SearchMode {
+    fn apply_terminal(self, args: &mut Vec<String>) {
+        if matches!(self, Self::Indexed(_)) || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            return;
+        }
+        let color = std::env::var_os("NO_COLOR").is_none()
+            && std::env::var_os("TERM").is_none_or(|term| term != "dumb");
+        let terminal = color.then(|| "--cx-terminal-color".into()).into_iter()
+            .chain(std::iter::once("--cx-terminal".into()));
+        args.splice(..0, terminal);
+    }
+
+    fn prepare(args: &mut Vec<String>, err: &mut impl Write) -> io::Result<Self> {
+        if let Some(kind) = args.first().and_then(|arg| IndexedMode::from_flag(arg)) {
+            return Ok(Self::Indexed(kind));
+        }
+        Ok(if search_args::expand(args, err)? {
+            Self::InspectPattern
+        } else {
+            Self::Pattern
+        })
+    }
+}
+
+fn run_search(mut args: Vec<String>, out: &mut impl Write, err: &mut impl Write) -> ExitCode {
+    let result =
+        SearchMode::prepare(&mut args, err).and_then(|mode| execute(&mut args, mode, out, err));
+    match result {
+        Ok(code) if out.flush().is_ok() => code,
+        Ok(_) => ExitCode::FAILURE,
         Err(e) => {
             let _ = writeln!(err, "{}: {e}", name());
-            ExitCode::FAILURE
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn execute(
+    args: &mut Vec<String>,
+    mode: SearchMode,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<ExitCode> {
+    use super::{query::LineOptions, repository};
+    let indexed = matches!(mode, SearchMode::Indexed(_));
+    if args.is_empty() {
+        let _ = writeln!(err, "cx: a search pattern is required");
+        return Ok(ExitCode::from(2));
+    }
+    mode.apply_terminal(args);
+    let options = if matches!(mode, SearchMode::InspectPattern) {
+        let options = LineOptions::parse(args).map_err(io::Error::other)?;
+        if let Some(output) = options.caller_output() {
+            return caller_output(output, options, out, err);
+        }
+        Some(options)
+    } else {
+        None
+    };
+    // A malformed query still gets its argument diagnostic if discovery also fails.
+    let location = std::env::current_dir().and_then(|cwd| {
+        let root = repository::find_worktree(&cwd)?
+            .filter(|path| indexed || repository::usable_marker(path));
+        Ok((cwd, root))
+    });
+    if let Some(code) = try_watcher(options.as_ref(), &location, args, (out, err))? {
+        return Ok(code);
+    }
+    let req = invocation(args, mode, options).map_err(io::Error::other)?;
+    write_answer(req, location?, indexed, (out, err))
+}
+
+fn invocation<'a>(
+    args: &'a [String],
+    mode: SearchMode,
+    options: Option<super::query::LineOptions<'a>>,
+) -> Result<Invocation<'a>, String> {
+    match (options, mode) {
+        (Some(options), _) => Invocation::lines(&args[0], options),
+        (_, SearchMode::Indexed(kind)) => Invocation::indexed(args, kind),
+        _ => Invocation::pattern(&args[0], args),
+    }
+}
+
+fn write_answer(
+    req: Invocation<'_>,
+    (cwd, root): (std::path::PathBuf, Option<std::path::PathBuf>),
+    indexed: bool,
+    (out, err): (&mut impl Write, &mut impl Write),
+) -> io::Result<ExitCode> {
+    let mut outcome = Outcome::default();
+    let answer = match root {
+        Some(root) => req.after_refresh(Pin::refresh_root(root, None).as_ref(), &cwd, &mut outcome)?,
+        None => super::query::plain(req, &cwd, &mut outcome)?,
+    };
+    err.write_all(outcome.diagnostics.as_bytes())?;
+    out.write_all(&answer)?;
+    if indexed && !answer.is_empty() {
+        writeln!(out)?;
+    }
+    Ok(ExitCode::from(outcome.code))
+}
+
+fn try_watcher(
+    options: Option<&super::query::LineOptions<'_>>,
+    location: &io::Result<(std::path::PathBuf, Option<std::path::PathBuf>)>,
+    args: &[String],
+    (out, err): (&mut impl Write, &mut impl Write),
+) -> io::Result<Option<ExitCode>> {
+    let Ok((cwd, Some(root))) = location else { return Ok(None) };
+    if options.is_some_and(super::query::LineOptions::requires_caller) {
+        return Ok(None);
+    }
+    super::watcher::query(super::watcher::CallerQuery { root, cwd, args }, (out, err))
+}
+
+fn caller_output(output: CallerOutput, options: super::query::LineOptions, out: &mut impl Write, err: &mut impl Write) -> io::Result<ExitCode> {
+    let lines = options.finish().map_err(io::Error::other)?;
+    match output {
+        CallerOutput::Types => {
+            out.write_all(lines.type_listing().expect("type listing was requested").as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        CallerOutput::Empty => Ok(ExitCode::FAILURE),
+        CallerOutput::Stdin => {
+            use std::io::Read;
+            err.write_all(lines.stdin_warnings()?.as_bytes())?;
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input)?;
+            let (text, hit) = lines.stream(&input);
+            out.write_all(&text)?;
+            Ok(ExitCode::from(u8::from(!hit)))
         }
     }
 }

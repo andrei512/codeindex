@@ -1,6 +1,7 @@
 //! Written Rust syntax and declaration-backed navigation. Separate source scopes,
 //! crate/module names, and nominal receiver types constrain binding. Proc-macro
 //! expansion and compiler-derived trait obligations remain outside this profile.
+pub(in crate::domain::code) mod analyzer;
 mod binding;
 mod bindings;
 mod cargo;
@@ -9,7 +10,7 @@ mod extract;
 #[cfg(test)]
 mod tests;
 use binding::Resolver;
-pub(super) use binding::resolve;
+pub(super) use binding::Prepared;
 pub(super) use extract::{analyze, analyze_paired};
 mod generics;
 mod identity;
@@ -58,14 +59,25 @@ impl Scope {
             .push((at, child));
     }
 }
+type ModulePaths = Vec<(Vec<config::Predicate>, String)>;
 enum Module {
     Inline(usize),
     File(Option<String>),
+    Paths(ModulePaths),
+    InlinePaths(usize, ModulePaths),
 }
 struct Lookup {
     scope: usize,
     ns: Namespace,
     path: Vec<String>,
+}
+impl Lookup {
+    fn spelling<'a>(&'a self, written: &'a str) -> (&'a str, &'a [String]) {
+        self.path
+            .split_first()
+            .map(|(head, tail)| (head.as_str(), tail))
+            .unwrap_or_else(|| (name(written), &[]))
+    }
 }
 #[derive(Default)]
 pub(super) struct Evidence {
@@ -133,199 +145,299 @@ fn ident(s: &str) -> bool {
                 | "macro_rules"
         )
 }
-fn declaration(
-    a: &mut Analysis,
-    e: &mut Evidence,
-    t: &[Token],
-    i: usize,
-    scope: usize,
-    kind: &'static str,
-    visibility: usize,
-    ns: Namespace,
-) -> usize {
-    let id = a.declarations.len();
-    a.declarations.push(Declaration {
-        span: t[i].span.clone(),
-        kind,
-    });
-    e.scopes[scope]
-        .names
-        .entry(name(t[i].text).to_owned())
-        .or_default()
-        .push(Binding {
-            decl: id,
-            visibility,
-            local: matches!(kind, "parameter" | "local_binding"),
-            ns,
-        });
-    id
+struct Delimiters {
+    mates: Vec<usize>,
+    balanced: bool,
 }
 
-pub(super) fn matches(t: &[Token]) -> Vec<usize> {
+fn delimiters(t: &[Token]) -> Delimiters {
+    let mut balanced = true;
     let mut pairs = vec![usize::MAX; t.len()];
     let mut stack = Vec::new();
     for (i, token) in t.iter().enumerate() {
         match token.text {
             "(" | "[" | "{" => stack.push((i, token.text)),
             ")" | "]" | "}" => {
-                if let Some((j, open)) = stack.pop() {
-                    if matches!((open, token.text), ("(", ")") | ("[", "]") | ("{", "}")) {
-                        pairs[i] = j;
-                        pairs[j] = i;
-                    }
+                if let Some((j, open)) = stack.pop()
+                    && matches!((open, token.text), ("(", ")") | ("[", "]") | ("{", "}"))
+                {
+                    pairs[i] = j;
+                    pairs[j] = i;
+                } else {
+                    balanced = false;
                 }
             }
             _ => {}
         }
     }
-    pairs
+    Delimiters {
+        mates: pairs,
+        balanced: balanced && stack.is_empty(),
+    }
 }
-fn has_type_assignment(t: &[Token], mut i: usize) -> bool {
-    let mut depth = 0usize;
-    while i < t.len() {
-        match word(t, i) {
-            "<" | "(" | "[" => depth += 1,
-            ">" | ")" | "]" => depth = depth.saturating_sub(1),
-            "=" if depth == 0 => return true,
-            ";" | "}" => return false,
+// Both trait arguments and turbofish calls consume nested angle brackets.
+pub(super) fn after_angles(t: &[Token], pairs: &[usize], open: usize) -> Option<usize> {
+    let mut depth = 1;
+    let close = top_level(t, pairs, open + 1..t.len(), |i, token| {
+        match token {
+            "<" => depth += 1,
+            ">" if generic_close(t, i) => depth -= 1,
+            ";" | "}" => return true,
             _ => {}
         }
-        i += 1;
-    }
-    false
+        depth == 0
+    });
+    (depth == 0).then_some(close + 1)
 }
-fn until(t: &[Token], pairs: &[usize], mut i: usize, targets: &[&str]) -> usize {
-    while i < t.len() {
-        if targets.contains(&t[i].text)
-            && !(word(t, i) == ":" && (word(t, i + 1) == ":" || i > 0 && word(t, i - 1) == ":"))
-        {
-            break;
+
+// Expression paths spell generic arguments with an explicit :: before <.
+fn expression_arguments(t: &[Token], pairs: &[usize], after: usize) -> usize {
+    if (word(t, after), word(t, after + 1), word(t, after + 2)) == (":", ":", "<") {
+        after_angles(t, pairs, after + 2).unwrap_or(after)
+    } else {
+        after
+    }
+}
+
+fn preceding_segment(t: &[Token], i: usize) -> Option<usize> {
+    let previous = i.checked_sub(3)?;
+    (word(t, i - 2) == ":" && word(t, i - 1) == ":").then_some(previous)
+}
+
+fn path_segment(s: &str) -> bool {
+    ident(s) || matches!(s, "self" | "Self" | "crate" | "super")
+}
+
+// The lexer emits the characters of -> separately. Its greater-than token
+// never closes generic arguments, even inside a nested function-trait bound.
+fn generic_close(t: &[Token], i: usize) -> bool {
+    word(t, i) == ">" && (i == 0 || word(t, i - 1) != "-")
+}
+/// Only a top-level equals assigns the alias. Equalities inside generic
+/// defaults and associated type constraints belong to the signature.
+fn type_rhs(t: &[Token], pairs: &[usize], start: usize) -> Option<usize> {
+    let mut angles = 0usize;
+    let at = top_level(t, pairs, start..t.len(), |i, token| match token {
+        "<" => {
+            angles += 1;
+            false
         }
-        if matches!(t[i].text, "(" | "[" | "{") && pairs[i] != usize::MAX {
-            i = pairs[i] + 1;
-        } else {
+        ">" if generic_close(t, i) => {
+            angles = angles.saturating_sub(1);
+            false
+        }
+        "=" => angles == 0,
+        ";" | "}" => true,
+        _ => false,
+    });
+    (word(t, at) == "=").then_some(at + 1)
+}
+fn top_level(
+    tokens: &[Token],
+    pairs: &[usize],
+    range: std::ops::Range<usize>,
+    mut stop: impl FnMut(usize, &str) -> bool,
+) -> usize {
+    let mut at = range.start;
+    while at < range.end {
+        let token = tokens[at].text;
+        if stop(at, token) {
+            return at;
+        }
+        at = next_top_level(pairs, at, token);
+    }
+    range.end
+}
+
+fn next_top_level(pairs: &[usize], at: usize, token: &str) -> usize {
+    match token {
+        "(" | "[" | "{" => after_group(pairs, at).unwrap_or(at + 1),
+        _ => at + 1,
+    }
+}
+
+// Index immediately after a matched delimiter. Callers choose their own
+// recovery for a truncated or unmatched group.
+fn after_group(pairs: &[usize], open: usize) -> Option<usize> {
+    pairs.get(open)?.checked_add(1)
+}
+
+fn until_before(t: &[Token], pairs: &[usize], mut range: std::ops::Range<usize>, targets: &[&str]) -> usize {
+    range.end = range.end.min(t.len());
+    top_level(t, pairs, range, |i, token| targets.contains(&token) && !path_colon(t, i))
+}
+
+fn path_colon(tokens: &[Token], at: usize) -> bool {
+    word(tokens, at) == ":"
+        && (word(tokens, at + 1) == ":" || word(tokens, at.wrapping_sub(1)) == ":")
+}
+
+fn until(t: &[Token], pairs: &[usize], start: usize, targets: &[&str]) -> usize {
+    if start > t.len() {
+        return start;
+    }
+    until_before(t, pairs, start..t.len(), targets)
+}
+
+impl Evidence {
+    fn record_use(
+        &mut self,
+        analysis: &mut Analysis,
+        span: std::ops::Range<usize>,
+        is_call: bool,
+        lookup: Lookup,
+    ) -> usize {
+        let id = analysis.calls.len();
+        analysis.calls.push(Call {
+            span,
+            is_call,
+            owner: self.scopes[lookup.scope].owner,
+        });
+        self.uses.push(lookup);
+        id
+    }
+}
+
+enum ImportEvent<'a, 'prefix> {
+    Occurrence(&'a Token<'a>),
+    Binding {
+        spelling: &'prefix str,
+        offset: usize,
+    },
+    Glob(usize),
+}
+
+fn import_segment(spelling: &str) -> bool {
+    ident(spelling) || matches!(spelling, "self" | "super" | "crate")
+}
+
+struct ImportTree {
+    prefix: Vec<String>,
+    levels: Vec<usize>,
+}
+
+impl ImportTree {
+    fn scan<'a>(tokens: &'a [Token<'a>], mut emit: impl FnMut(ImportEvent<'a, '_>, &[String])) {
+        let mut tree = Self {
+            prefix: Vec::new(),
+            levels: vec![0],
+        };
+        let mut i = 0;
+        while let Some(token) = tokens.get(i) {
+            match token.text {
+                "{" | "}" | "," => tree.group_boundary(token.text),
+                "*" if !tree.prefix.is_empty() => {
+                    emit(ImportEvent::Glob(token.span.start), &tree.prefix)
+                }
+                spelling if import_segment(spelling) => {
+                    i = tree.segment(tokens, i, &mut emit);
+                }
+                _ => {}
+            }
             i += 1;
         }
     }
-    i
+
+    fn group_boundary(&mut self, spelling: &str) {
+        match spelling {
+            "{" => self.levels.push(self.prefix.len()),
+            "}" => {
+                self.levels.pop();
+                self.reset_group();
+            }
+            _ => self.reset_group(),
+        }
+    }
+
+    fn reset_group(&mut self) {
+        self.prefix.truncate(*self.levels.last().unwrap_or(&0));
+    }
+
+    fn segment<'a>(
+        &mut self,
+        tokens: &'a [Token<'a>],
+        i: usize,
+        emit: &mut impl FnMut(ImportEvent<'a, '_>, &[String]),
+    ) -> usize {
+        let token = &tokens[i];
+        let spelling = token.text;
+        if spelling != "self" || self.prefix.is_empty() {
+            self.prefix.push(name(spelling).to_owned());
+        }
+        if ident(spelling) || spelling == "self" {
+            emit(ImportEvent::Occurrence(token), &self.prefix);
+        }
+        match word(tokens, i + 1) {
+            ":" => i,
+            "as" => self.alias(tokens, i + 2, emit),
+            _ => {
+                self.last_binding(token, emit);
+                i
+            }
+        }
+    }
+
+    fn last_binding<'a>(
+        &self,
+        token: &Token<'a>,
+        emit: &mut impl FnMut(ImportEvent<'a, '_>, &[String]),
+    ) {
+        let Some(spelling) = self.prefix.last().filter(|name| !name.is_empty()) else {
+            return;
+        };
+        emit(ImportEvent::Binding { spelling, offset: token.span.start }, &self.prefix);
+    }
+
+    fn alias<'a>(
+        &self,
+        tokens: &'a [Token<'a>],
+        at: usize,
+        emit: &mut impl FnMut(ImportEvent<'a, '_>, &[String]),
+    ) -> usize {
+        let Some(alias) = tokens.get(at) else {
+            return at;
+        };
+        if ident(alias.text) {
+            emit(ImportEvent::Occurrence(alias), &self.prefix);
+        }
+        if !alias.text.is_empty() {
+            emit(
+                ImportEvent::Binding {
+                    spelling: alias.text,
+                    offset: alias.span.start,
+                },
+                &self.prefix,
+            );
+        }
+        at
+    }
 }
 
-// Each group carries the prefix accumulated before its open brace.
-fn imports(t: &[Token], scope_id: usize, e: &mut Evidence, a: &mut Analysis) {
-    let mut prefix = Vec::<String>::new();
-    let mut levels = vec![0];
-    let mut i = 0;
-    while i < t.len() {
-        match t[i].text {
-            "{" => levels.push(prefix.len()),
-            "}" => {
-                levels.pop();
-                prefix.truncate(*levels.last().unwrap_or(&0));
-            }
-            "," => prefix.truncate(*levels.last().unwrap_or(&0)),
-            ":" => {}
-            "*" if !prefix.is_empty() => {
-                e.scopes[scope_id]
-                    .globs
-                    .push((t[i].span.start, prefix.clone()));
-            }
-            s if ident(s) || matches!(s, "self" | "super" | "crate") => {
-                if s != "self" || prefix.is_empty() {
-                    prefix.push(name(s).to_owned());
-                }
-                if ident(s) || s == "self" {
-                    let path = prefix.clone();
-                    a.calls.push(Call {
-                        span: t[i].span.clone(),
-                        owner: e.scopes[scope_id].owner,
-                        is_call: false,
-                    });
-                    e.uses.push(Lookup {
-                        scope: scope_id,
-                        ns: Namespace::Either,
-                        path,
-                    });
-                }
-                if t.get(i + 1).is_none_or(|n| n.text != ":") {
-                    let local = if word(t, i + 1) == "as" {
-                        i += 2;
-                        if i < t.len() && ident(t[i].text) {
-                            a.calls.push(Call {
-                                span: t[i].span.clone(),
-                                owner: e.scopes[scope_id].owner,
-                                is_call: false,
-                            });
-                            e.uses.push(Lookup {
-                                scope: scope_id,
-                                ns: Namespace::Either,
-                                path: prefix.clone(),
-                            });
-                        }
-                        word(t, i)
-                    } else {
-                        prefix.last().map_or("", String::as_str)
-                    };
-                    if !local.is_empty() {
-                        e.scopes[scope_id]
-                            .imports
-                            .entry(name(local).into())
-                            .or_default()
-                            .push((t[i].span.start, prefix.clone()));
-                    }
-                }
-            }
-            _ => {}
+fn imports(t: &[Token], scope: usize, evidence: &mut Evidence, analysis: &mut Analysis) {
+    ImportTree::scan(t, |event, prefix| match event {
+        ImportEvent::Occurrence(token) => {
+            evidence.record_use(
+                analysis,
+                token.span.clone(),
+                false,
+                Lookup {
+                    scope,
+                    ns: Namespace::Either,
+                    path: prefix.to_vec(),
+                },
+            );
         }
-        i += 1;
-    }
-}
-fn bind_pattern(
-    a: &mut Analysis,
-    e: &mut Evidence,
-    t: &[Token],
-    excluded: &mut [bool],
-    scope: usize,
-    range: std::ops::Range<usize>,
-    kind: &'static str,
-    visibility: usize,
-) {
-    let stop = range.end;
-    let alternatives = t
-        .get(range.clone())
-        .is_some_and(|tokens| tokens.iter().any(|token| token.text == "|"));
-    let mut first = HashMap::new();
-    for i in range {
-        let s = word(t, i);
-        let previous = if i > 0 { word(t, i - 1) } else { "" };
-        if !(ident(s) || s == "self")
-            || !name(s).starts_with(|c: char| c == '_' || c.is_lowercase())
-            || matches!(previous, "'" | ".")
-            || i + 1 < stop && word(t, i + 1) == ":"
-            || i > 1 && previous == ":" && word(t, i - 2) == ":"
-        {
-            continue;
+        ImportEvent::Binding { spelling, offset } => {
+            evidence.scopes[scope]
+                .imports
+                .entry(name(spelling).into())
+                .or_default()
+                .push((offset, prefix.to_vec()));
         }
-        if alternatives && let Some(&id) = first.get(s) {
-            let local = a.calls.len();
-            a.calls.push(Call {
-                span: t[i].span.clone(),
-                owner: e.scopes[scope].owner,
-                is_call: false,
-            });
-            e.uses.push(Lookup {
-                scope,
-                ns: Namespace::Value,
-                path: Vec::new(),
-            });
-            e.direct.insert(local, id);
-        } else {
-            let id = declaration(a, e, t, i, scope, kind, visibility, Namespace::Value);
-            if alternatives {
-                first.insert(s, id);
-            }
+        ImportEvent::Glob(offset) => {
+            evidence.scopes[scope].globs.push((offset, prefix.to_vec()));
         }
-        excluded[i] = true;
-    }
+    });
 }
 
 fn new_scope(e: &mut Evidence, parent: usize) -> usize {
@@ -350,6 +462,6 @@ crate::domain::code::cache::record!(Binding { decl, visibility, local, ns });
 
 crate::domain::code::cache::record!(Lookup { scope, ns, path });
 
-impl crate::domain::code::cache::Wire for Namespace{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Value=>{ w.push(0); },Self::Type=>{ w.push(1); },Self::Either=>{ w.push(2); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{match usize::load(r)?{0=>Ok(Self::Value),1=>Ok(Self::Type),2=>Ok(Self::Either),_=>Err(crate::domain::code::cache::bad())}}}
+crate::domain::code::cache::tagged!(Namespace { 0 => Value, 1 => Type, 2 => Either });
 
-impl crate::domain::code::cache::Wire for Module{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Inline(a)=>{ w.push(0); a.save(w);},Self::File(a)=>{ w.push(1); a.save(w);}}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Inline(Wire::load(r)?)),1=>Ok(Self::File(Wire::load(r)?)),_=>Err(crate::domain::code::cache::bad())}}}
+crate::domain::code::cache::tagged!(Module { 0 => Inline(scope), 1 => File(path), 2 => Paths(options), 3 => InlinePaths(scope,options) });

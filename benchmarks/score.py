@@ -33,14 +33,7 @@ def corpus(path):
     return rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=Path("target/release/cx"))
-    parser.add_argument("--dataset", type=Path, help="use a local copy of the pinned JSONL")
-    parser.add_argument("--output", type=Path, help="save summary plus individual errors")
-    args = parser.parse_args()
-    binary = args.binary.resolve()
-    rows = corpus(args.dataset)
+def measure(binary, rows):
     # The checkout contains only the input sources. Keep labels outside cx's index.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "repo"
@@ -53,7 +46,10 @@ def main():
                             env=dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))))
     if result["scored_files"] != len(rows) or len(result["files"]) != len(rows):
         raise ValueError("cx did not score the entire corpus")
-    measured = {r["path"]: r for r in result["files"]}
+    return {r["path"]: r for r in result["files"]}
+
+
+def compare(rows, measured):
     details = []
     hits, extras, misses = Counter(), Counter(), Counter()
     for i, row in enumerate(rows):
@@ -66,12 +62,24 @@ def main():
                 target[rule] += n
         details.append(dict(row=i, name=row["name"], expected=row["score"], actual=observed["score"],
                             error=abs(row["score"] - observed["score"])))
+    return details, dict(matched=hits, missed=misses, extra=extras)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=Path("target/release/cx"))
+    parser.add_argument("--dataset", type=Path, help="use a local copy of the pinned JSONL")
+    parser.add_argument("--output", type=Path, help="save summary plus individual errors")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    rows = corpus(args.dataset)
+    details, counts = compare(rows, measure(binary, rows))
     errors = sorted(r["error"] for r in details)
     report = dict(dataset_sha256=SHA256, binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                   files=len(rows), exact_within_1e_9=sum(e < 1e-9 for e in errors),
                   within_half_point=sum(e <= 0.5 for e in errors), mean_absolute_error=statistics.mean(errors),
                   median_absolute_error=statistics.median(errors), worst_error=max(errors),
-                  findings_by_rule_and_start_line=dict(matched=hits, missed=misses, extra=extras))
+                  findings_by_rule_and_start_line=counts)
     print(json.dumps(report, indent=2))
     if args.output:
         args.output.write_text(json.dumps(dict(report, cases=details), indent=2) + "\n")

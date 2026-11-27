@@ -1,6 +1,7 @@
 //! Resolve simple, explicit install/copy sources in shell installers without
 //! executing a checkout. Only matching source operands contribute evidence.
 use super::{Evidence, Role};
+use crate::domain::code::direct::shell_word::{Quoting, WordChars};
 use crate::domain::pattern::Glob;
 use std::{io, path::Path};
 
@@ -17,48 +18,60 @@ pub(super) fn installer(path: &str) -> bool {
                 .split('/')
                 .any(|p| matches!(p, "functions" | "install" | "installer"))
 }
-fn source_pattern(word: &str) -> Option<Glob> {
-    let unquoted = word.replace('"', "");
-    // Keep literal components and globs; unexpanded variables can only match
-    // within a component. An unknown root still needs a literal subdirectory.
-    let mut iter = unquoted.chars().peekable();
-    let mut pattern = String::new();
-    while let Some(c) = iter.next() {
-        if c != '$' {
-            pattern.push(c);
-            continue;
+// Preserve the quotation on each character until expansion has been classified.
+// An unexpanded variable can match only within a component.
+struct Operand {
+    pattern: String,
+    variable: bool,
+}
+
+impl Operand {
+    fn read(source: &str) -> Option<(Self, usize)> {
+        let mut word = WordChars::new(source);
+        let mut pattern = String::new();
+        let mut variable = false;
+        while let Some((ch, quote)) = word.next() {
+            if ch == '$' && quote != Quoting::Literal {
+                // Read the written name. Quote boundaries can separate two
+                // adjacent segments even if both segments are double-quoted.
+                let len = variable_length(&source[word.consumed()..])?;
+                word.nth(len - 1)?;
+                variable = true;
+                pattern.push('*');
+                continue;
+            }
+            push_pattern_char(&mut pattern, ch, quote)?;
         }
-        if iter.peek() == Some(&'{') {
-            iter.next();
-            let mut ended = false;
-            for c in iter.by_ref() {
-                if c == '}' {
-                    ended = true;
-                    break;
-                }
-                if !(c.is_ascii_alphanumeric() || c == '_') {
-                    return None;
-                }
-            }
-            if !ended {
-                return None;
-            }
-        } else {
-            if !iter
-                .peek()
-                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
-            {
-                return None;
-            }
-            while iter
-                .peek()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
-            {
-                iter.next();
-            }
-        }
-        pattern.push('*');
+        (word.complete() && word.consumed() != 0)
+            .then_some((Self { pattern, variable }, word.consumed()))
     }
+
+    fn destination(&self) -> bool {
+        self.variable || self.pattern.starts_with('/')
+    }
+}
+
+fn push_pattern_char(pattern: &mut String, ch: char, quote: Quoting) -> Option<()> {
+    if ch == '`' && quote != Quoting::Literal {
+        return None;
+    }
+    if quote != Quoting::Bare && matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | ',' | '\\') {
+        pattern.push('\\');
+    }
+    pattern.push(ch);
+    Some(())
+}
+
+fn variable_length(source: &str) -> Option<usize> {
+    let name = source.strip_prefix('{').unwrap_or(source);
+    let len = crate::domain::code::direct::shell_word::name_len(name.as_bytes())?;
+    if name.len() == source.len() {
+        return Some(len);
+    }
+    (name.as_bytes().get(len) == Some(&b'}')).then_some(len + 2)
+}
+
+fn source_pattern(mut pattern: String) -> Option<Glob> {
     if let Some(rest) = pattern.strip_prefix("*/") {
         if !rest.contains('/') || rest.starts_with('*') {
             return None;
@@ -66,11 +79,42 @@ fn source_pattern(word: &str) -> Option<Glob> {
         // The installer's root variable can denote either the repository or a subdirectory.
         pattern = format!("**/{rest}");
     }
-    if !pattern.contains('/') || pattern.starts_with('/') || pattern.contains("..") {
+    if !relative_source(&pattern) || pattern.contains("..") {
         return None;
     }
     Glob::new(pattern.trim_start_matches("./")).ok()
 }
+fn relative_source(pattern: &str) -> bool {
+    pattern.contains('/') && !pattern.starts_with('/')
+}
+
+fn install_operands(line: &str) -> Option<Vec<Operand>> {
+    let (command, mut rest) = line.trim_start().split_once(char::is_whitespace)?;
+    if !matches!(command, "install" | "cp") {
+        return None;
+    }
+    let mut operands = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('#') {
+            break;
+        }
+        let (word, consumed) = Operand::read(rest)?;
+        rest = &rest[consumed..];
+        operands.push(word);
+    }
+    operands.pop()?.destination().then_some(operands)
+}
+
+fn install_sources(text: &str, patterns: &mut Vec<Glob>) {
+    patterns.extend(
+        text.lines()
+            .filter_map(install_operands)
+            .flatten()
+            .filter_map(|operand| source_pattern(operand.pattern)),
+    );
+}
+
 impl Packaging {
     pub fn applies(
         &mut self,
@@ -87,25 +131,7 @@ impl Packaging {
                 let Some(text) = read(Path::new(script))? else {
                     continue;
                 };
-                for line in text.lines() {
-                    let mut words = line.split_whitespace();
-                    let cmd = words.next();
-                    if !matches!(cmd, Some("install" | "cp")) {
-                        continue;
-                    }
-                    let args: Vec<_> = words.take_while(|w| !w.starts_with('#')).collect();
-                    let Some((dest, inputs)) = args.split_last() else {
-                        continue;
-                    };
-                    if !dest.contains('$') && !dest.starts_with('/') {
-                        continue;
-                    }
-                    for src in inputs {
-                        if let Some(g) = source_pattern(src) {
-                            patterns.push(g);
-                        }
-                    }
-                }
+                install_sources(&text, &mut patterns);
             }
             self.sources = Some(patterns);
         }

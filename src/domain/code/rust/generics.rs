@@ -5,113 +5,237 @@ pub(super) struct Scope {
     names: HashMap<String, usize>,
 }
 
-pub(super) fn enter(
-    t: &[Token],
-    pairs: &[usize],
-    index: usize,
-    open: usize,
-    a: &mut Analysis,
-    excluded: &mut [bool],
-    scopes: &mut Vec<Scope>,
-    members: &mut members::Members,
-) {
-    if word(t, open) != "<" {
-        return;
+fn trait_bounds(t: &[Token], pairs: &[usize], after_name: usize) -> Vec<Vec<String>> {
+    let mut traits = Vec::new();
+    if word(t, after_name) == ":" {
+        let mut start = after_name + 1;
+        loop {
+            let bound = members::path(t, start);
+            if bound.is_empty() {
+                break;
+            }
+            start += 1 + 3 * (bound.len() - 1);
+            if word(t, start) == "<" {
+                start = after_angles(t, pairs, start).unwrap_or(t.len());
+            }
+            traits.push(bound);
+            if word(t, start) != "+" {
+                break;
+            }
+            start += 1;
+        }
     }
-    let mut names = HashMap::new();
-    let mut bounds = Vec::new();
-    let mut depth = 1;
-    let mut first = true;
-    let mut i = open + 1;
-    while i < t.len() && depth > 0 {
-        if first && depth == 1 {
-            let life = word(t, i) == "'";
-            let constant = word(t, i) == "const";
-            let at = i + usize::from(life || constant);
-            let s = word(t, at);
-            if ident(s) {
-                let whole = if life {
-                    format!("'{s}")
-                } else {
-                    name(s).to_string()
-                };
-                let start = if life { i } else { at };
-                if !life && !constant {
-                    let mut traits = Vec::new();
-                    if word(t, at + 1) == ":" {
-                        let mut start = at + 2;
-                        loop {
-                            let bound = members::path(t, start);
-                            if bound.is_empty() {
-                                break;
-                            }
-                            start += 1 + 3 * (bound.len() - 1);
-                            if word(t, start) == "<" {
-                                let mut nested = 1usize;
-                                start += 1;
-                                while start < t.len() && nested != 0 {
-                                    match word(t, start) {
-                                        "<" => nested += 1,
-                                        ">" => nested -= 1,
-                                        _ => {}
-                                    }
-                                    start += 1;
-                                }
-                            }
-                            traits.push(bound);
-                            if word(t, start) != "+" {
-                                break;
-                            }
-                            start += 1;
-                        }
-                    }
-                    bounds.push((whole.clone(), traits));
+    traits
+}
+
+#[derive(Default)]
+pub(super) struct Parameters {
+    names: HashMap<String, usize>,
+    bounds: Vec<(String, Vec<Vec<String>>)>,
+}
+
+pub(super) struct ParameterInput<'t, 's> {
+    pub tokens: &'t [Token<'s>],
+    pub pairs: &'t [usize],
+    pub open: usize,
+}
+
+enum Header {
+    Lifetime,
+    Const,
+    Type,
+}
+
+struct Parameter {
+    header: Header,
+    start: usize,
+    name: usize,
+}
+
+impl Parameter {
+    fn read(t: &[Token], start: usize) -> Option<Self> {
+        let header = match word(t, start) {
+            "'" => Header::Lifetime,
+            "const" => Header::Const,
+            _ => Header::Type,
+        };
+        let name = start + usize::from(!matches!(header, Header::Type));
+        ident(word(t, name)).then_some(Self {
+            header,
+            start,
+            name,
+        })
+    }
+}
+
+impl Parameters {
+    fn declare(
+        &mut self,
+        t: &[Token],
+        pairs: &[usize],
+        parameter: Parameter,
+        output: &mut ParameterOutput<'_>,
+    ) {
+        let Parameter {
+            header,
+            start,
+            name: at,
+        } = parameter;
+        let token = word(t, at);
+        let (key, start, kind) = match header {
+            Header::Lifetime => (format!("'{token}"), start, "lifetime_parameter"),
+            Header::Const => {
+                output.excluded[start] = true;
+                (name(token).to_owned(), at, "generic_parameter")
+            }
+            Header::Type => {
+                let key = name(token).to_owned();
+                self.bounds
+                    .push((key.clone(), trait_bounds(t, pairs, at + 1)));
+                (key, at, "generic_parameter")
+            }
+        };
+        output.excluded[at] = true;
+        self.names.insert(key, output.analysis.declarations.len());
+        output.analysis.declarations.push(Declaration {
+            span: t[start].span.start..t[at].span.end,
+            kind,
+        });
+    }
+
+    pub(super) fn read(
+        input: ParameterInput<'_, '_>,
+        mut output: ParameterOutput<'_>,
+    ) -> Option<(Self, usize)> {
+        let ParameterInput {
+            tokens,
+            pairs,
+            open,
+        } = input;
+        if word(tokens, open) != "<" {
+            return None;
+        }
+        let mut result = Self::default();
+        let mut cursor = ParameterCursor {
+            tokens,
+            pairs,
+            at: open + 1,
+            depth: 1,
+            first: true,
+        };
+        while let Some(transition) = cursor.next() {
+            match transition {
+                GenericEvent::Parameter(parameter) => {
+                    result.declare(tokens, pairs, parameter, &mut output)
                 }
-                names.insert(whole, a.declarations.len());
-                a.declarations.push(Declaration {
-                    span: t[start].span.start..t[at].span.end,
-                    kind: if life {
-                        "lifetime_parameter"
-                    } else {
-                        "generic_parameter"
-                    },
-                });
-                excluded[at] = true;
-                if constant {
-                    excluded[i] = true;
+                GenericEvent::Close(after) => {
+                    return (!result.names.is_empty()).then_some((result, after));
                 }
             }
         }
-        first = depth == 1 && word(t, i) == ",";
-        match word(t, i) {
-            "<" => depth += 1,
-            ">" => depth -= 1,
-            "{" | "(" | "[" if pairs[i] != usize::MAX => i = pairs[i],
-            ";" => return,
-            _ => {}
-        }
-        i += 1;
+        None
     }
-    if depth != 0 || names.is_empty() {
-        return;
-    }
-    let open = until(t, pairs, i, &["{", ";", "}"]);
-    let end = if word(t, open) == "{" && pairs[open] != usize::MAX {
-        pairs[open]
-    } else {
-        open
-    };
-    if end > index {
-        for (name, traits) in bounds {
-            let range = t[index].span.start..t.get(end).map_or(usize::MAX, |tok| tok.span.end);
+
+    pub(super) fn scope(
+        self,
+        end: usize,
+        range: std::ops::Range<usize>,
+        members: &mut members::Members,
+    ) -> Scope {
+        for (name, traits) in self.bounds {
             members
                 .bounds
                 .entry(name)
                 .or_default()
-                .push((range, traits));
+                .push((range.clone(), traits));
         }
-        scopes.push(Scope { end, names });
+        Scope {
+            end,
+            names: self.names,
+        }
     }
+}
+
+pub(super) struct ParameterOutput<'a> {
+    pub analysis: &'a mut Analysis,
+    pub excluded: &'a mut [bool],
+}
+
+struct ParameterCursor<'t, 's> {
+    tokens: &'t [Token<'s>],
+    pairs: &'t [usize],
+    at: usize,
+    depth: usize,
+    first: bool,
+}
+
+enum GenericEvent {
+    Parameter(Parameter),
+    Close(usize),
+}
+
+impl ParameterCursor<'_, '_> {
+    fn next(&mut self) -> Option<GenericEvent> {
+        loop {
+            let token = self.tokens.get(self.at)?;
+            match self.step(token.text) {
+                Step::Continue => {}
+                Step::Emit(event) => return Some(event),
+                Step::Stop => return None,
+            }
+        }
+    }
+
+    fn step(&mut self, spelling: &str) -> Step {
+        let index = self.at;
+        let parameter = self
+            .first
+            .then(|| Parameter::read(self.tokens, index))
+            .flatten();
+        self.first = self.depth == 1 && spelling == ",";
+        let advance = self.advance(spelling, index);
+        if let Some(parameter) = parameter {
+            return Step::Emit(GenericEvent::Parameter(parameter));
+        }
+        match advance {
+            Advance::Continue => Step::Continue,
+            Advance::Close => Step::Emit(GenericEvent::Close(self.at)),
+            Advance::Stop => Step::Stop,
+        }
+    }
+
+    fn advance(&mut self, spelling: &str, index: usize) -> Advance {
+        self.at += 1;
+        match spelling {
+            "<" => self.depth += 1,
+            ">" if generic_close(self.tokens, index) => return self.close_angle(),
+            "{" | "(" | "[" if self.pairs[index] != usize::MAX => self.at = self.pairs[index] + 1,
+            ";" => return Advance::Stop,
+            _ => {}
+        }
+        Advance::Continue
+    }
+
+    fn close_angle(&mut self) -> Advance {
+        self.depth -= 1;
+        if self.depth == 0 {
+            Advance::Close
+        } else {
+            Advance::Continue
+        }
+    }
+}
+
+enum Step {
+    Continue,
+    Emit(GenericEvent),
+    Stop,
+}
+
+enum Advance {
+    Continue,
+    Close,
+    Stop,
 }
 
 pub(super) fn target(

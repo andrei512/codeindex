@@ -1,0 +1,22 @@
+[
+  {
+    "file": "unit0.cpp",
+    "directory": ".",
+    "arguments": [
+      "clang++",
+      "-include",
+      "flags0.hpp",
+      "unit0.cpp"
+    ]
+  },
+  {
+    "file": "unit1.cpp",
+    "directory": ".",
+    "arguments": [
+      "clang++",
+      "-include",
+      "flags1.hpp",
+      "unit1.cpp"
+    ]
+  }
+]

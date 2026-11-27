@@ -31,3 +31,7 @@ Three checks answer different questions. Numeric evaluation compares the file sc
 ### Calculation
 
 - [File score calculation](model.md) gives the thresholds, aggregation formula and commands to reproduce the development evaluation.
+
+### Working with a repository
+
+- [Refactor a repository using score findings](refactor.md) shows how to choose work, verify a batch and account for the last few findings.

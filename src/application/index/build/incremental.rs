@@ -1,7 +1,7 @@
 //! Reuse product memberships independently of parser output. Ranked positions
 //! and posting IDs in this codec are generation-relative; edits translate the
 //! retained positions without tokenizing their owning documents again.
-use super::{Local, Previous, retained};
+use super::{Local, Previous, path_order::PathOrder, retained};
 use crate::application::index::layout::{CONTENT, ExtentSink, PATHGRAM, RANK, SOURCE};
 use crate::domain::{
     Document, FileId,
@@ -19,6 +19,14 @@ pub(super) enum Postings {
     Retained(usize),
 }
 
+fn retain_product(
+    previous: Option<&dyn Previous>,
+    out: &mut impl ExtentSink,
+    kind: usize,
+) -> io::Result<()> {
+    let prior = previous.expect("reuse requires a predecessor");
+    retained::range(prior, out, prior.extent(kind))
+}
 impl Postings {
     pub(super) fn seal(
         self,
@@ -31,90 +39,142 @@ impl Postings {
             Self::Built(b) => b.seal_layout(out, kind == CONTENT),
             Self::Merged(m) => m.seal_layout(out, kind == CONTENT),
             Self::Delta(d) => d.write(previous.unwrap(), out),
-            Self::Retained(kind) => {
-                let p = previous.expect("reuse requires a predecessor");
-                retained::range(p, out, p.extent(kind))
-            }
+            Self::Retained(kind) => retain_product(previous, out, kind),
         }
     }
 }
 
 pub(super) fn edited_sources(
     previous: Option<&dyn Previous>,
-    units: &[Unit],
     reuse: &[Option<usize>],
     capture_allowance: usize,
     mut prepared: Option<(usize, String)>,
 ) -> io::Result<Option<BTreeMap<usize, String>>> {
     let Some(p) = previous else { return Ok(None) };
-    if p.entries().len() != units.len()
-        || p.entries()
-            .iter()
-            .zip(units)
-            .any(|(f, u)| f.path() != u.path)
-    {
-        return Ok(None);
-    }
     // Hashing/trigram and ranking producers share old changed sources. On a
     // bulk edit use the ordinary posting merge if that capture would exceed
     // the now-idle worker allowance.
-    let mut available = capture_allowance as u64;
-    for (entry, old) in p.entries().iter().zip(reuse) {
-        if old.is_none()
-            && let Some(r) = &entry.bytes
-        {
-            let Some(left) = available.checked_sub(r.end - r.start) else {
-                return Ok(None);
-            };
-            available = left;
-        }
+    if !fits_old_sources(p, reuse, capture_allowance) {
+        return Ok(None);
     }
     let mut edited = BTreeMap::new();
     let base = p.extent(SOURCE).start;
     for (id, prior) in reuse.iter().enumerate() {
-        if prior.is_none() {
-            if let Some((id, text)) = prepared.take_if(|(file, _)| *file == id) {
-                edited.insert(id, text);
-                continue;
-            }
-            let mut bytes = Vec::new();
-            if let Some(range) = &p.entries()[id].bytes {
-                p.copy_bytes(base + range.start..base + range.end, &mut bytes)?
-            }
-            edited.insert(id, String::from_utf8(bytes).map_err(io::Error::other)?);
+        if prior.is_some() {
+            continue;
         }
+        let text = prepared
+            .take_if(|(file, _)| *file == id)
+            .map_or_else(|| original_source(p, id, base), |(_, text)| Ok(text))?;
+        edited.insert(id, text);
     }
     Ok(Some(edited))
 }
 
-fn postings(
-    previous: Option<&dyn Previous>,
+fn fits_old_sources(prior: &dyn Previous, reuse: &[Option<usize>], allowance: usize) -> bool {
+    prior
+        .entries()
+        .iter()
+        .zip(reuse)
+        .filter(|(_, old)| old.is_none())
+        .filter_map(|(entry, _)| entry.bytes.as_ref())
+        .try_fold(allowance as u64, |available, range| {
+            available.checked_sub(range.end - range.start)
+        })
+        .is_some()
+}
+
+fn original_source(prior: &dyn Previous, id: usize, base: u64) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    if let Some(range) = &prior.entries()[id].bytes {
+        prior.copy_bytes(base + range.start..base + range.end, &mut bytes)?;
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
+}
+
+/// The postings and ranked workers consume the same captured source mapping.
+#[derive(Clone, Copy)]
+struct Reuse<'a> {
+    rows: &'a [Option<usize>],
+    any: bool,
+    same: bool,
+}
+impl<'a> Reuse<'a> {
+    fn remap(&self, previous_count: usize) -> Vec<Option<usize>> {
+        let mut remap = vec![None; previous_count];
+        for (new, old) in self.rows.iter().enumerate() {
+            if let Some(old) = old {
+                remap[*old] = Some(new);
+            }
+        }
+        remap
+    }
+
+    fn inspect(previous: Option<&dyn Previous>, rows: &'a [Option<usize>]) -> Self {
+        let Some(previous) = previous else {
+            return Self {
+                rows,
+                any: false,
+                same: false,
+            };
+        };
+        let mut same = rows.len() == previous.entries().len();
+        let mut any = false;
+        for (id, &row) in rows.iter().enumerate() {
+            any |= row.is_some();
+            same &= row == Some(id);
+            if any && !same {
+                break;
+            }
+        }
+        Self { rows, any, same }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Compatibility {
+    pub content: bool,
+    pub rank: bool,
+}
+
+impl Compatibility {
+    pub fn inspect(previous: Option<&dyn Previous>) -> Self {
+        Self {
+            content: previous.is_some_and(|p| p.compatible(CONTENT)),
+            rank: previous.is_some_and(|p| p.compatible(RANK)),
+        }
+    }
+}
+
+pub(super) struct Products<'a> {
+    previous: Option<&'a dyn Previous>,
+    units: &'a [Unit<'a>],
+    source: Reuse<'a>,
+    compatibility: Compatibility,
+    before: Option<&'a BTreeMap<usize, String>>,
+}
+impl<'a> Products<'a> {
+    pub fn from_plan(plan: &super::ProductPlan<'a>) -> Self {
+        let previous = plan.catalog.previous;
+        Self {
+            previous,
+            units: plan.catalog.units,
+            source: Reuse::inspect(previous, plan.reuse.source),
+            compatibility: plan.searchable,
+            before: plan.before,
+        }
+    }
+}
+
+fn changed_postings(
     product: usize,
     units: &[Unit<'_>],
+    has_previous: bool,
     reuse: &[Option<usize>],
-    before: &Option<BTreeMap<usize, String>>,
-) -> io::Result<Postings> {
-    let previous = previous.filter(|p| p.compatible(product));
-    if let Some(previous) = previous
-        && previous.entries().len() == reuse.len()
-        && reuse.iter().enumerate().all(|(i, id)| *id == Some(i))
-    {
-        return Ok(Postings::Retained(product));
-    }
-    if product == CONTENT
-        && let Some(prior) = previous
-        && let Some(before) = before
-    {
-        return Ok(
-            match super::content_delta::Delta::plan(prior, units, before)? {
-                Some(plan) => Postings::Delta(plan),
-                None => Postings::Retained(CONTENT),
-            },
-        );
-    }
+) -> io::Result<ContentBuilder> {
     let mut builder = ContentBuilder::default();
     for (id, unit) in units.iter().enumerate() {
-        if previous.is_none() || reuse[id].is_none() {
+        if !has_previous || reuse[id].is_none() {
             builder.add(Document {
                 file: FileId(id as u64),
                 text: if product == PATHGRAM {
@@ -125,48 +185,87 @@ fn postings(
             })?;
         }
     }
-    if let Some(previous) = previous
-        && reuse.iter().any(Option::is_some)
-    {
-        let mut remap = vec![None; previous.entries().len()];
-        for (new, &old) in reuse.iter().enumerate() {
-            if let Some(old) = old {
-                remap[old] = Some(new);
+    Ok(builder)
+}
+
+enum PostingRoute<'a> {
+    Build,
+    Retain,
+    Merge(&'a dyn Previous),
+    Delta(&'a dyn Previous, &'a BTreeMap<usize, String>),
+}
+
+impl<'a> PostingRoute<'a> {
+    fn select(
+        previous: Option<&'a dyn Previous>,
+        product: usize,
+        reuse: Reuse<'_>,
+        before: Option<&'a BTreeMap<usize, String>>,
+    ) -> Self {
+        let delta = before.filter(|_| product == CONTENT);
+        match (previous, delta) {
+            (Some(_), _) if reuse.same => Self::Retain,
+            (Some(prior), Some(delta)) => Self::Delta(prior, delta),
+            (Some(prior), _) if reuse.any => Self::Merge(prior),
+            _ => Self::Build,
+        }
+    }
+}
+
+impl Products<'_> {
+    fn postings(
+        &self,
+        previous: Option<&dyn Previous>,
+        product: usize,
+        reuse: Reuse<'_>,
+    ) -> io::Result<Postings> {
+        let units = self.units;
+        match PostingRoute::select(previous, product, reuse, self.before) {
+            PostingRoute::Retain => Ok(Postings::Retained(product)),
+            PostingRoute::Delta(prior, before) => {
+                super::content_delta::Delta::plan(prior, units, before)
+                    .map(|plan| plan.map_or(Postings::Retained(CONTENT), Postings::Delta))
+            }
+            PostingRoute::Build => {
+                changed_postings(product, units, false, reuse.rows).map(Postings::Built)
+            }
+            PostingRoute::Merge(prior) => {
+                let builder = changed_postings(product, units, true, reuse.rows)?;
+                let remap = reuse.remap(prior.entries().len());
+                let bytes = prior.product(product)?;
+                builder
+                    .merge_prior(&ContentRun::open(&bytes)?, &remap)
+                    .map(Postings::Merged)
             }
         }
-        let bytes = previous.product(product)?;
-        return builder
-            .merge_prior(&ContentRun::open(&bytes)?, &remap)
-            .map(Postings::Merged);
     }
-    Ok(Postings::Built(builder))
-}
 
-pub(super) fn trigrams(
-    previous: Option<&dyn Previous>,
-    units: &[Unit<'_>],
-    reuse: &[Option<usize>],
-    before: &Option<BTreeMap<usize, String>>,
-) -> io::Result<(Postings, Postings)> {
-    let Some(prior) = previous else {
-        let (paths, bodies) = super::fresh_postings::build(units)?;
-        return Ok((Postings::Built(paths), bodies));
-    };
-    // Both inventories have the same path ordering. A merge walks them once.
-    let mut old = prior.entries().iter().enumerate().peekable();
-    let paths: Vec<_> = units
-        .iter()
-        .map(|unit| {
-            while old.next_if(|(_, e)| e.path() < unit.path).is_some() {}
-            old.next_if(|(_, e)| e.path() == unit.path).map(|(i, _)| i)
-        })
-        .collect();
-    Ok((
-        postings(previous, PATHGRAM, units, &paths, before)?,
-        postings(previous, CONTENT, units, reuse, before)?,
-    ))
+    pub fn trigrams(&self, paths: &PathOrder) -> io::Result<(Postings, Postings)> {
+        let previous = self.previous;
+        let units = self.units;
+        let Some(prior) = previous else {
+            let (paths, bodies) = super::fresh_postings::build(units)?;
+            return Ok((Postings::Built(paths), bodies));
+        };
+        let path_postings = match paths {
+            PathOrder::Stable if prior.compatible(PATHGRAM) => Postings::Retained(PATHGRAM),
+            PathOrder::Stable => self.postings(None, PATHGRAM, self.source)?,
+            PathOrder::Changed(mapping) => {
+                let compatible = previous.filter(|prior| prior.compatible(PATHGRAM));
+                self.postings(compatible, PATHGRAM, Reuse::inspect(previous, mapping))?
+            }
+            PathOrder::Fresh => unreachable!("a previous generation has a path comparison"),
+        };
+        Ok((
+            path_postings,
+            self.postings(
+                previous.filter(|_| self.compatibility.content),
+                CONTENT,
+                self.source,
+            )?,
+        ))
+    }
 }
-
 pub(super) enum Rank {
     Built(RankedIndex),
     Bulk(ranked::FreshRank),
@@ -197,77 +296,90 @@ impl Rank {
                 }
                 run.flush()
             }
-            Self::Retained(kind) => {
-                let p = previous.expect("reuse requires a predecessor");
-                retained::range(p, out, p.extent(kind))
-            }
+            Self::Retained(kind) => retain_product(previous, out, kind),
         }
     }
 }
 
-pub(super) fn ranked(
-    previous: Option<&dyn Previous>,
-    units: &[Unit<'_>],
+pub(super) fn rank_chunks(local: &Local) -> Vec<ranked::ChunkRange> {
+    ranked::from_sections(&local.line_ends, local.byte_len, |heading| {
+        if let Some(doc) = &local.markdown {
+            for section in doc.sections.iter().skip(1) {
+                heading(section.line);
+            }
+        }
+    })
+}
+
+fn rank_patch(
+    previous: &dyn Previous,
+    units: &[Unit],
     locals: &[Local],
-    reuse: &[Option<usize>],
-    before: &Option<BTreeMap<usize, String>>,
-) -> io::Result<Rank> {
-    let previous = previous.filter(|p| p.compatible(RANK));
-    let chunks_for = |id: usize| {
-        let local = &locals[id];
-        let headings = local.markdown.as_ref().map_or_else(Vec::new, |m| {
-            m.sections.iter().skip(1).map(|s| s.line).collect()
-        });
-        ranked::chunks_from_line_ends(&local.lf, &headings)
-    };
-    let add = |r: &mut RankedIndex, id: usize| {
-        let chunks = chunks_for(id);
-        r.add_file(units[id].path, units[id].text, &chunks);
-    };
-    if let Some(previous) = previous
-        && reuse.iter().any(Option::is_some)
-    {
-        if previous.entries().len() == reuse.len()
-            && reuse.iter().enumerate().all(|(i, old)| *old == Some(i))
-        {
+    before: &BTreeMap<usize, String>,
+) -> io::Result<Option<ranked::patch::Patch>> {
+    let extent = previous.extent(RANK);
+    let edits = before
+        .iter()
+        .map(|(&id, old)| ranked::patch::Edit {
+            file: id,
+            path: units[id].path,
+            old,
+            new: units[id].text,
+            chunks: rank_chunks(&locals[id]),
+        })
+        .collect::<Vec<_>>();
+    ranked::patch::patch(
+        extent.end - extent.start,
+        |r| {
+            let mut bytes = Vec::new();
+            previous.copy_bytes(extent.start + r.start..extent.start + r.end, &mut bytes)?;
+            Ok(bytes)
+        },
+        &edits,
+    )
+}
+
+impl Products<'_> {
+    pub fn ranked(&self, locals: &[Local]) -> io::Result<Rank> {
+        let previous = self
+            .previous
+            .filter(|_| self.compatibility.rank && self.source.any);
+        let units = self.units;
+        let chunks_for = |id: usize| rank_chunks(&locals[id]);
+        if let Some(prior) = previous {
+            return self.reuse_rank(prior, locals, |r, id| {
+                r.add_file(units[id].path, units[id].text, &chunks_for(id));
+            });
+        }
+        fresh_rank(units, chunks_for)
+    }
+    fn reuse_rank(
+        &self,
+        previous: &dyn Previous,
+        locals: &[Local],
+        add: impl FnMut(&mut RankedIndex, usize),
+    ) -> io::Result<Rank> {
+        if self.source.same {
             return Ok(Rank::Retained(RANK));
         }
-        if let Some(before) = before {
-            let extent = previous.extent(RANK);
-            let edits = before
-                .iter()
-                .map(|(&id, old)| {
-                    let l = &locals[id];
-                    let headings = l.markdown.as_ref().map_or_else(Vec::new, |m| {
-                        m.sections.iter().skip(1).map(|s| s.line).collect()
-                    });
-                    ranked::patch::Edit {
-                        file: id,
-                        path: units[id].path,
-                        old,
-                        new: units[id].text,
-                        chunks: ranked::chunks_from_line_ends(&l.lf, &headings),
-                    }
-                })
-                .collect::<Vec<_>>();
-            if let Some(plan) = ranked::patch::patch(
-                extent.end - extent.start,
-                |r| {
-                    let mut bytes = Vec::new();
-                    previous
-                        .copy_bytes(extent.start + r.start..extent.start + r.end, &mut bytes)?;
-                    Ok(bytes)
-                },
-                &edits,
-            )? {
-                return Ok(Rank::Patch(plan));
-            }
+        let patch = self
+            .before
+            .map(|before| rank_patch(previous, self.units, locals, before))
+            .transpose()?
+            .flatten();
+        if let Some(patch) = patch {
+            return Ok(Rank::Patch(patch));
         }
         let bytes = previous.product(RANK)?;
         let prior = RankedIndex::read_from(bytes.as_slice())?;
         drop(bytes);
-        return RankedIndex::refresh(prior, reuse, add).map(Rank::Built);
+        RankedIndex::refresh(prior, self.source.rows, add).map(Rank::Built)
     }
+}
+pub(super) fn fresh_rank(
+    units: &[Unit<'_>],
+    chunks_for: impl Fn(usize) -> Vec<ranked::ChunkRange> + Sync,
+) -> io::Result<Rank> {
     let batch = |start: usize, end: usize| {
         let mut index = ranked::BulkRank::at(start);
         for i in start..end {
@@ -276,13 +388,15 @@ pub(super) fn ranked(
         index
     };
     let bytes: usize = units.iter().map(|u| u.text.len()).sum();
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
     let index = if workers == 1 || bytes < 1024 * 1024 {
         ranked::FreshRank::Single(batch(0, units.len()))
     } else {
         let goal = bytes.div_ceil(workers).max(512 * 1024);
         std::thread::scope(|scope| -> io::Result<ranked::FreshRank> {
-            let (mut start, mut size) = (0,0);
+            let (mut start, mut size) = (0, 0);
             let mut jobs = Vec::new();
             for (i, unit) in units.iter().enumerate() {
                 size += unit.text.len();
@@ -294,60 +408,12 @@ pub(super) fn ranked(
                     size = 0;
                 }
             }
-            let shards = jobs.into_iter().map(|j| j.join().map_err(|_| io::Error::other("rank batch failed"))).collect::<io::Result<_>>()?;
+            let shards = jobs
+                .into_iter()
+                .map(|j| j.join().map_err(|_| io::Error::other("rank batch failed")))
+                .collect::<io::Result<_>>()?;
             ranked::ShardSet::new(shards).map(ranked::FreshRank::Parallel)
         })?
     };
     Ok(Rank::Bulk(index))
-}
-
-pub(super) fn graph_unchanged(
-    prior: Option<&dyn Previous>,
-    observed: &[crate::domain::ObservedPath],
-    reuse: &[Option<usize>],
-) -> bool {
-    prior.is_some_and(|previous| {
-        previous.compatible(crate::application::index::layout::SYMBOLS)
-            && previous.compatible(crate::application::index::layout::REL)
-            && previous.entries().len() == observed.len()
-            && previous
-                .entries()
-                .iter()
-                .zip(observed)
-                .zip(reuse)
-                .enumerate()
-                .all(|(id, ((old, new), reused))| {
-                    old.path() == new.path
-                        && (*reused == Some(id)
-                            || !crate::domain::code::Names::consumes_text(&new.path))
-                })
-    })
-}
-
-pub(super) fn same_binding_inputs(
-    prior: Option<&dyn Previous>,
-    units: &[Unit],
-    edited: &Option<BTreeMap<usize, String>>,
-    evidence_reuse: &mut std::borrow::Cow<'_, [Option<usize>]>,
-) -> io::Result<bool> {
-    use crate::application::index::layout::{REL, SYMBOLS};
-    use crate::domain::code::Names;
-    let (Some(p), Some(edited)) = (prior, edited) else {
-        return Ok(false);
-    };
-    if !p.compatible(SYMBOLS) || !p.compatible(REL) {
-        return Ok(false);
-    }
-    // edited_sources supplies a complete delta only when all paths and ordinals agree.
-    for (&i, old_text) in edited {
-        let unit = &units[i];
-        if !Names::consumes_text(unit.path) {
-            continue;
-        }
-        if !super::script_edit::same_inputs(p, i, unit, old_text)? {
-            return Ok(false);
-        }
-        evidence_reuse.to_mut()[i] = Some(i);
-    }
-    Ok(true)
 }

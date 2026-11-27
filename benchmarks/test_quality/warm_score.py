@@ -15,17 +15,24 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 
 
+def development_rows(path):
+    rows = map(json.loads, path.read_text().splitlines())
+    return (row for row in rows if row["split"] == "dev")
+
+
 def inputs():
-    blobs = {}
-    for group, names in [
-        (HERE.parent / "test_roles", ("assets", "public", "runner")),
-        (HERE, ("conditional", "dev_sample")),
-    ]:
-        for name in names:
-            for line in (group / (name + ".jsonl")).read_text().splitlines():
-                row = json.loads(line)
-                if row["split"] == "dev":
-                    blobs[row["repository"].lower(), row["path"]] = row["sha256"]
+    paths = [
+        HERE.parent / "test_roles" / "assets.jsonl",
+        HERE.parent / "test_roles" / "public.jsonl",
+        HERE.parent / "test_roles" / "runner.jsonl",
+        HERE / "conditional.jsonl",
+        HERE / "dev_sample.jsonl",
+    ]
+    blobs = {
+        (row["repository"].lower(), row["path"]): row["sha256"]
+        for path in paths
+        for row in development_rows(path)
+    }
     for repo in json.loads(
         gzip.decompress((HERE / "results/baseline.json.gz").read_bytes())
     ):
@@ -36,6 +43,31 @@ def inputs():
             if hashlib.sha256(data).hexdigest() != digest:
                 raise ValueError(key)
             yield Path(*key), data
+
+
+def measure_mode(mode, rounds, tmp, query):
+    count = min(9, rounds) if mode == "fresh_baseline" else rounds
+    samples = [[], []]
+    for r in range(count + 1):
+        digests = []
+        for i in [0, 1] if r % 2 == 0 else [1, 0]:
+            suffix = str(r) if mode == "fresh_baseline" else "warm"
+            home = tmp / f"home-{i}-{suffix}"
+            elapsed, digest = query(
+                i, home, mode != "watcher", mode == "fresh_baseline"
+            )
+            digests.append(digest)
+            if r:
+                samples[i].append(elapsed)
+        if digests[0] != digests[1]:
+            raise ValueError(f"{mode}: score output changed")
+    return dict(
+        rounds=count,
+        before_ms=statistics.median(samples[0]),
+        after_ms=statistics.median(samples[1]),
+        paired_delta_ms=statistics.median(b - a for a, b in zip(*samples)),
+        output_sha256=digests[0],
+    )
 
 
 def run():
@@ -75,28 +107,7 @@ def run():
 
         report = {"files": len(files)}
         for mode in ("fresh_baseline", "reopened", "watcher"):
-            count = min(9, args.rounds) if mode == "fresh_baseline" else args.rounds
-            samples = [[], []]
-            for r in range(count + 1):
-                digests = []
-                for i in [0, 1] if r % 2 == 0 else [1, 0]:
-                    suffix = str(r) if mode == "fresh_baseline" else "warm"
-                    home = Path(tmp) / f"home-{i}-{suffix}"
-                    elapsed, digest = query(
-                        i, home, mode != "watcher", mode == "fresh_baseline"
-                    )
-                    digests.append(digest)
-                    if r:
-                        samples[i].append(elapsed)
-                if digests[0] != digests[1]:
-                    raise ValueError(f"{mode}: score output changed")
-            report[mode] = dict(
-                rounds=count,
-                before_ms=statistics.median(samples[0]),
-                after_ms=statistics.median(samples[1]),
-                paired_delta_ms=statistics.median(b - a for a, b in zip(*samples)),
-                output_sha256=digests[0],
-            )
+            report[mode] = measure_mode(mode, args.rounds, Path(tmp), query)
         print(json.dumps(report, indent=2))
 
 

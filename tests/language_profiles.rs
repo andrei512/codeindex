@@ -88,7 +88,6 @@ fn new_language_symbols_survive_reopen_and_follow_edits() {
 
 #[test]
 fn partial_source_and_unicode_leave_all_navigation_spans_valid() {
-    use codeindex::domain::code::{Language, analyze};
     let paths = ["Dockerfile", "a.java", "Makefile", "a.bat", "a.php", "CMakeLists.txt",
         "a.kt", "a.plpgsql", "a.rb", "a.go", "a.m", "a.dart", "a.lua", "Procfile",
         "a.tf", "a.S", "a.nix", "a.mako", "a.pl", "a.hack"];
@@ -96,17 +95,28 @@ fn partial_source_and_unicode_leave_all_navigation_spans_valid() {
         "#", "$", "\\", "function", "<", ">", "/*", "--", ":", "=>", "`", "::", "%"];
     let mut seed = 17u64;
     for _ in 0..128 {
-        let mut source = String::new();
-        for _ in 0..32 {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            source.push_str(atoms[(seed >> 32) as usize % atoms.len()]);
-        }
+        let source = partial_source(&atoms, &mut seed);
         for path in paths {
-            let facts = analyze(Language::for_path(path).unwrap(), &source);
-            for span in facts.declarations.iter().map(|v| &v.span).chain(facts.calls.iter().map(|v| &v.span)) {
-                assert!(source.get(span.clone()).is_some_and(|s| !s.is_empty()), "{path} {source:?} {span:?}");
-            }
-            assert!(facts.calls.iter().all(|c| c.owner.is_none_or(|i| i < facts.declarations.len())));
+            assert_navigation_spans(path, &source);
         }
     }
+}
+
+fn partial_source(atoms: &[&str], seed: &mut u64) -> String {
+    let mut source = String::new();
+    for _ in 0..32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        source.push_str(atoms[(*seed >> 32) as usize % atoms.len()]);
+    }
+    source
+}
+
+fn assert_navigation_spans(path: &str, source: &str) {
+    use codeindex::domain::code::{Language, analyze};
+
+    let facts = analyze(Language::for_path(path).unwrap(), source);
+    for span in facts.declarations.iter().map(|v| &v.span).chain(facts.calls.iter().map(|v| &v.span)) {
+        assert!(source.get(span.clone()).is_some_and(|s| !s.is_empty()), "{path} {source:?} {span:?}");
+    }
+    assert!(facts.calls.iter().all(|c| c.owner.is_none_or(|i| i < facts.declarations.len())));
 }

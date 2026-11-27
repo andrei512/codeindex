@@ -62,7 +62,7 @@ These synthetic cases test where a name is visible and which parts of a file con
 
 **Named reference lookup.** Thirty ambiguous names correctly produce an ambiguity error, then recommend a command whose output omits the byte column required to select a declaration. Two other ambiguous lookups fail earlier because the symbol index misses declarations. For seven unique names, the by-name and positional lookups miss the same expected references. [Named-reference audit](tests/language_named_references.py)
 
-**Semantics at discovery time.** Several languages distinguish the variable used in a call from the implementation invoked at runtime. The callable-parameter fixtures mark navigation to the lexical parameter as a probe until the query contract is settled. Their ordinary direct-call and same-name exclusion checks have exact answers. A separate Hack probe records an unresolved literal class-qualified call.
+**Semantics at discovery time.** Several languages distinguish the variable used in a call from the implementation invoked at runtime. The callable-parameter fixtures mark navigation to the lexical parameter as a probe until the query contract is settled. Their ordinary direct-call and same-name exclusion checks have exact answers. The original Hack probe is now a required check. A same-file call to `Box::emit()` resolves to the class method, and the free call to `emit()` resolves to the free function.
 
 ### Follow-up discovery waves
 

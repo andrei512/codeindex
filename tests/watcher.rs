@@ -124,3 +124,28 @@ fn different_executable_retires_owner_before_reelection() {
     run(&after, "config");
     assert_eq!(endpoint_id(), replacement);
 }
+
+#[test]
+fn watcher_and_local_parse_errors_use_the_invoked_name() {
+    let home =
+        Fixture(std::env::temp_dir().join(format!("cx-watch-errors-{}", std::process::id())));
+    let root = home.0.join("repo");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let alias = home.0.join("cx-alias");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_cx"), &alias).unwrap();
+    let run = |dir: &Path| {
+        Command::new(&alias)
+            .current_dir(dir)
+            .env("HOME", &home.0)
+            .args(["--cx", "regex", "["])
+            .output()
+            .unwrap()
+    };
+    let local = run(&home.0);
+    let watched = run(&root);
+    assert_eq!(local.status.code(), Some(2));
+    assert!(local.stderr.starts_with(b"cx-alias: "));
+    assert_eq!(watched.status, local.status);
+    assert_eq!(watched.stderr, local.stderr);
+    assert!(watched.stdout.is_empty());
+}

@@ -1,15 +1,19 @@
 //! Project-local evidence for written script source directives and protobuf imports.
+use super::cfamily::project::CompileInputs;
 use super::{Analysis, Call, Declaration, Kind, Token};
-use std::collections::HashMap;
 pub(super) mod powershell;
 mod proto;
 mod shell;
+pub(super) mod shell_word;
+pub(super) mod starlark;
+pub(super) use shell::analyze_with_comments as shell_comments;
 pub(super) enum Evidence {
+    Translation(Vec<super::cfamily::translation::Partition>),
     Proto(proto::Evidence),
     Shell(shell::Evidence),
     Powershell(powershell::Evidence),
     Csharp(super::cfamily::csharp::Evidence),
-    CIncludes(HashMap<String, Vec<String>>, Vec<super::CReceipt>),
+    CIncludes(CompileInputs),
 }
 pub(super) fn analyze_proto(t: &[Token]) -> Analysis {
     proto::analyze(t)
@@ -17,14 +21,8 @@ pub(super) fn analyze_proto(t: &[Token]) -> Analysis {
 pub(super) fn analyze_shell(text: &str) -> Analysis {
     shell::analyze(text)
 }
-pub(super) fn resolve(
-    units: &[super::Unit],
-    paths: &HashMap<&str, usize>,
-    names: &mut super::ForwardNames,
-) {
-    proto::resolve(units, paths, names);
-    shell::resolve(units, paths, names);
-}
+pub(super) use proto::{ProtoGraph, ProtoResolver};
+pub(super) use shell::{ShellResolver, SourceEdges};
 
 #[cfg(test)]
 mod tests {
@@ -106,9 +104,57 @@ mod tests {
             .map(|(s, ts)| (&a[2].calls[s.local], ts[0]))
             .collect();
         assert_eq!(matched.len(), 2);
-        for (c, t) in matched {
-            assert_eq!(t.file, if c.is_call { 1 } else { 0 })
+        for (call, t) in matched {
+            assert_eq!(t.file, usize::from(call.is_call));
         }
+    }
+    #[test]
+    fn quoted_command_and_handler_names_retain_their_source_span_and_role() {
+        let text = "hit() { :; }\n'hit'; \"hit\"; : 'hit'; trap 'hit' EXIT\n";
+        let (analyses, names) = bindings(Language::Shell, &[("run.sh", text)]);
+        let mut found = Vec::new();
+        for (site, targets) in &names.targets {
+            let usage = &analyses[0].calls[site.local];
+            assert_eq!(&text[usage.span.clone()], "hit");
+            assert_eq!(analyses[0].declarations[targets[0].local].span.start, 0);
+            found.push((usage.span.start, usage.is_call));
+        }
+        found.sort_unstable();
+        let hits: Vec<_> = text.match_indices("hit").map(|(offset, _)| offset).collect();
+        assert_eq!(found, [(hits[1], true), (hits[2], true), (hits[4], false)]);
+    }
+    #[test]
+    fn declaration_inspection_selects_the_requested_namespace_without_calling() {
+        let text = "both=old\nboth(){ :; }\ndeclare -xp both\ntypeset -xf both\n";
+        let (units, names) = bindings(Language::Shell, &[("run.sh", text)]);
+        let unit = &units[0];
+        let mut targets = Vec::new();
+        for (local, call) in unit.calls.iter().enumerate() {
+            assert!(!call.is_call);
+            let sites = &names.targets[&Site { file: 0, local }];
+            assert_eq!(sites.len(), 1);
+            targets.push(unit.declarations[sites[0].local].span.start);
+        }
+        assert_eq!(targets, [0, text.find("both()").unwrap()]);
+    }
+
+    #[test]
+    fn shell_nested_assignment_is_recorded_before_its_enclosing_word() {
+        let text = "v=${v:=inner}\necho $v\nv=later\necho $v\n";
+        let (analysis, names) = bindings(Language::Shell, &[("run.sh", text)]);
+        let unit = &analysis[0];
+        let mut targets = unit
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| &text[call.span.clone()] == "v")
+            .map(|(local, _)| {
+                let target = names.targets[&Site { file: 0, local }][0];
+                unit.declarations[target.local].span.start
+            });
+        assert_eq!(targets.next(), text.find("v:=inner"));
+        assert_eq!(targets.next(), text.find("v=later"));
+        assert_eq!(targets.next(), None);
     }
     #[test]
     fn subshell_function_body_scopes_quotes_and_heredoc() {
@@ -118,21 +164,16 @@ mod tests {
             n.by_name.keys().map(String::as_str).collect::<Vec<_>>(),
             ["f"]
         );
-        for s in a[0]
+        let inner = text.find("value=inner").unwrap();
+        for (i, s) in a[0]
             .calls
             .iter()
-            .filter(|s| text[s.span.clone()] == *"value")
+            .enumerate()
+            .filter(|(_, s)| text[s.span.clone()] == *"value")
         {
-            let i = a[0].calls.iter().position(|c| c.span == s.span).unwrap();
             let target = n.targets[&Site { file: 0, local: i }][0];
-            assert_eq!(
-                a[0].declarations[target.local].span.start,
-                if s.owner.is_some() {
-                    text.find("value=inner").unwrap()
-                } else {
-                    0
-                }
-            );
+            let expected = s.owner.map_or(0, |_| inner);
+            assert_eq!(a[0].declarations[target.local].span.start, expected);
         }
         assert_eq!(n.targets.len(), 3);
     }
@@ -141,8 +182,12 @@ mod tests {
 impl crate::domain::code::cache::Wire for Evidence {
     fn save(&self, w: &mut impl crate::domain::code::cache::Output) {
         match self {
+            Self::Translation(partition) => {
+                w.push(6);
+                partition.save(w);
+            }
             Self::Proto(a) => {
-                w.push(0);
+                w.push(8);
                 a.save(w);
             }
             Self::Shell(a) => {
@@ -157,23 +202,50 @@ impl crate::domain::code::cache::Wire for Evidence {
                 w.push(3);
                 a.save(w);
             }
-            Self::CIncludes(a, sdk) => {
-                w.push(5);
-                a.save(w);
-                sdk.save(w);
-            }
+            Self::CIncludes(input) => input.save_tagged(w),
         }
     }
     fn load(r: &mut &[u8]) -> std::io::Result<Self> {
         use crate::domain::code::cache::Wire;
         match usize::load(r)? {
-            0 => Ok(Self::Proto(Wire::load(r)?)),
+            6 => Ok(Self::Translation(Wire::load(r)?)),
+            8 => Ok(Self::Proto(Wire::load(r)?)),
             1 => Ok(Self::Shell(Wire::load(r)?)),
             2 => Ok(Self::Powershell(Wire::load(r)?)),
             3 => Ok(Self::Csharp(Wire::load(r)?)),
-            4 => Ok(Self::CIncludes(Wire::load(r)?, Vec::new())),
-            5 => Ok(Self::CIncludes(Wire::load(r)?, Wire::load(r)?)),
+            tag => Self::load_compatible(tag, r),
+        }
+    }
+}
+
+impl Evidence {
+    fn load_compatible(tag: usize, input: &mut &[u8]) -> std::io::Result<Self> {
+        match tag {
+            0 => proto::Evidence::load_legacy(input).map(Self::Proto),
+            4 | 5 | 7 => CompileInputs::load_tagged(tag, input).map(Self::CIncludes),
             _ => Err(crate::domain::code::cache::bad()),
         }
+    }
+}
+
+impl CompileInputs {
+    // Version 4 predates receipts. Version 7 additionally carries the command keys.
+    fn save_tagged(&self, out: &mut impl super::cache::Output) {
+        use super::cache::Wire;
+        out.push(if self.commands.is_some() { 7 } else { 5 });
+        self.paths.save(out);
+        self.receipts.save(out);
+        if let Some(keys) = &self.commands {
+            keys.save(out);
+        }
+    }
+
+    fn load_tagged(tag: usize, input: &mut &[u8]) -> std::io::Result<Self> {
+        use super::cache::Wire;
+        Ok(Self {
+            paths: Wire::load(input)?,
+            receipts: if tag >= 5 { Wire::load(input)? } else { Vec::new() },
+            commands: (tag == 7).then(|| Wire::load(input)).transpose()?,
+        })
     }
 }

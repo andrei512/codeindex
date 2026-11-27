@@ -4,7 +4,7 @@ symbol	flush	work.rb:4
 symbol	run	work.rb:6
 definition	work.rb:7:12	work.rb:2:12	resolved
 references	work.rb:2:12	work.rb:7:12	resolved
-callers	work.rb:2:12	work.rb:7:12	resolved
+callers	work.rb:2:12	work.rb:7:12|run	resolved
 references	work.rb:4:12	-	resolved
 callers	work.rb:4:12	-	resolved
 references	work.rb:11:12	-	resolved

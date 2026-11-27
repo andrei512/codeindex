@@ -1,30 +1,183 @@
 //! Sorted term records have compact delta postings and a fixed-width offset directory.
 //! A miss probes keys only. A hit reads its lists, the chunk directory and retained file spans.
 use super::{
-    storage::{self, FOOTER, invalid},
+    storage::{self, FOOTER, Format, invalid},
     *,
 };
-use std::{collections::HashSet, io};
+use std::{collections::HashMap, io};
+struct Layout {
+    terms_at: u64,
+    bases_at: u64,
+    end: u64,
+    trees: Option<[Range<u64>; 2]>,
+}
+
+#[derive(Clone, Copy)]
+enum RecordTable {
+    File,
+    Term,
+}
+
+fn offsets_end(start: u64, count: usize) -> io::Result<u64> {
+    (count as u64)
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(8))
+        .and_then(|v| v.checked_add(start))
+        .ok_or_else(invalid)
+}
+
 pub(super) struct Directory {
-    pub tree: bool,
+    pub(super) format: Format,
     pub files: usize,
     pub terms: usize,
     pub offset: u64,
     pub(super) rows_end: u64,
-    pub(super) grouped: bool,
     pub tokens: usize,
     pub rows: usize,
 }
-impl Directory {
-    pub(super) fn decode(tail: &[u8; FOOTER as usize]) -> io::Result<Self> {
-        if &tail[..8] != b"RANKDIR2" && &tail[..8] != b"RANKDIR3" && &tail[..8] != b"RANKDIR4" {
+/// Count, byte boundaries, file order and token totals are common to ranked queries and edits.
+pub(super) struct RowBlock<'a> {
+    directory: &'a Directory,
+    data: &'a [u8],
+}
+impl RowBlock<'_> {
+    pub(super) fn visit(self, mut accept: impl FnMut(u64, usize, Row)) -> io::Result<()> {
+        let dir = self.directory;
+        let mut data = self.data;
+        let (mut tokens, mut file) = (0, 0);
+        for _ in 0..dir.rows {
+            let offset = dir.rows_end - data.len() as u64;
+            let row = storage::row(&mut data, tokens, dir.files)?;
+            if row.file < file {
+                return Err(invalid());
+            }
+            file = row.file;
+            let start = tokens;
+            tokens = row.end;
+            accept(offset, start, row);
+        }
+        if tokens != dir.tokens || !data.is_empty() {
             return Err(invalid());
         }
+        Ok(())
+    }
+}
+impl Directory {
+    pub(super) fn row_block<'a>(&'a self, mut bytes: &'a [u8]) -> io::Result<RowBlock<'a>> {
+        if bytes.len() as u64 > self.rows_end
+            || storage::get(&mut bytes)? != self.rows
+            || self.rows > bytes.len() / 9
+        {
+            return Err(invalid());
+        }
+        Ok(RowBlock {
+            directory: self,
+            data: bytes,
+        })
+    }
+
+    pub(super) fn write_tree(
+        &self,
+        out: &mut impl io::Write,
+        files: &[u64],
+        terms: &[u64],
+    ) -> io::Result<()> {
+        directory::write(
+            &[
+                directory::Node::from_offsets(files),
+                directory::Node::from_offsets(terms),
+            ],
+            out,
+        )?;
+        out.write_all(&self.tree_footer())
+    }
+    pub(super) fn tree_footer(&self) -> [u8; FOOTER as usize] {
+        let mut bytes = [0; FOOTER as usize];
+        bytes[..8].copy_from_slice(b"RANKDIR4");
+        for (slot, value) in bytes[8..].chunks_exact_mut(8).zip([
+            self.files as u64,
+            self.terms as u64,
+            self.offset,
+            self.rows_end,
+            self.tokens as u64,
+            self.rows as u64,
+        ]) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn first_file(&self) -> u64 {
+        8 + directory::var_len(self.files)
+    }
+    fn first_term(&self) -> io::Result<u64> {
+        self.rows_end
+            .checked_add(directory::var_len(self.terms))
+            .ok_or_else(invalid)
+    }
+
+    fn check_tree_ends(&self, files_end: u64, terms_end: u64) -> io::Result<()> {
+        if files_end > self.rows_end || terms_end != self.offset {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub(super) fn validate_trees(&self, data: &[u8]) -> io::Result<()> {
+        let [files, terms] = directory::validate(
+            data,
+            [self.first_file(), self.first_term()?],
+            [self.files, self.terms],
+        )?;
+        self.check_tree_ends(files, terms)
+    }
+
+    pub(super) fn load_trees(&self, data: &[u8], base: u64) -> io::Result<directory::Expanded> {
+        let expanded = directory::load(
+            data,
+            base,
+            [self.first_file(), self.first_term()?],
+            [self.files, self.terms],
+        )?;
+        let [files, terms] = &expanded.1;
+        self.check_tree_ends(files[self.files], terms[self.terms])?;
+        Ok(expanded)
+    }
+    fn subtree(&self, trees: &[Range<u64>; 2], table: RecordTable) -> io::Result<directory::Subtree> {
+        let (root, first, count) = match table {
+            RecordTable::File => (&trees[0], self.first_file(), self.files),
+            RecordTable::Term => (&trees[1], self.first_term()?, self.terms),
+        };
+        Ok(directory::Subtree { bytes: root.clone(), count, start: first })
+    }
+
+    fn layout(&self, read: &mut ReadAt<'_>) -> io::Result<Layout> {
+        if self.format == Format::Tree {
+            let mut header = [0; directory::HEADER];
+            read(self.offset, &mut header)?;
+            let ranges = directory::tree_ranges(&header, self.offset)?;
+            return Ok(Layout {
+                terms_at: ranges[1].start,
+                bases_at: 0,
+                end: ranges[1].end,
+                trees: Some(ranges),
+            });
+        }
+        let terms_at = offsets_end(self.offset, self.files)?;
+        let bases_at = offsets_end(terms_at, self.terms)?;
+        let end = if self.format.grouped() { offsets_end(bases_at, self.files)? } else { bases_at };
+        Ok(Layout { terms_at, bases_at, end, trees: None })
+    }
+    pub(super) fn decode(tail: &[u8; FOOTER as usize]) -> io::Result<Self> {
+        let format = match &tail[..8] {
+            b"RANKDIR2" => Format::Offsets,
+            b"RANKDIR3" => Format::Grouped,
+            b"RANKDIR4" => Format::Tree,
+            _ => return Err(invalid()),
+        };
         let n = |p: usize| u64::from_le_bytes(tail[p..p + 8].try_into().unwrap());
         let count = |p| usize::try_from(n(p)).map_err(|_| invalid());
         Ok(Self {
-            tree: &tail[..8] == b"RANKDIR4",
-            grouped: &tail[..8] != b"RANKDIR2",
+            format,
             files: count(8)?,
             terms: count(16)?,
             offset: n(24),
@@ -43,53 +196,78 @@ struct Reader<'a> {
     bases: Option<Vec<usize>>,
     trees: Option<[Range<u64>; 2]>,
     nodes: directory::Cursor,
-    cached_rows: Option<Vec<Row>>,
+    cached_rows: Option<(u64, Vec<Row>)>,
 }
-impl Reader<'_> {
-    fn position(&mut self, base: u64, slot: usize) -> io::Result<u64> {
-        if self.dir.tree {
-            return Ok(self.range(base, slot, self.dir.offset)?.start);
+impl<'a> Reader<'a> {
+    fn open(length: u64, read: &'a mut ReadAt<'a>, file_count: usize) -> io::Result<Self> {
+        let mut magic = [0; 8];
+        read(0, &mut magic)?;
+        let format = Format::read(&magic)?;
+        if format == Format::Sequential {
+            return Err(invalid());
+        }
+        let mut tail = [0; FOOTER as usize];
+        let footer_pos = length.checked_sub(FOOTER).ok_or_else(invalid)?;
+        read(footer_pos, &mut tail)?;
+        let dir = Directory::decode(&tail)?;
+        let Layout {
+            terms_at,
+            bases_at,
+            end,
+            trees,
+        } = dir.layout(read)?;
+        if dir.format != format
+            || dir.files != file_count
+            || end != footer_pos
+            || dir.rows_end < 8
+            || dir.rows_end >= dir.offset
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            read,
+            dir,
+            terms_at,
+            bases_at,
+            bases: None,
+            trees,
+            nodes: Default::default(),
+            cached_rows: None,
+        })
+    }
+
+    fn offset_base(&self, table: RecordTable) -> u64 {
+        match table {
+            RecordTable::File => self.dir.offset,
+            RecordTable::Term => self.terms_at,
+        }
+    }
+
+    fn position(&mut self, table: RecordTable, slot: usize) -> io::Result<u64> {
+        if self.dir.format == Format::Tree {
+            return Ok(self.range(table, slot, self.dir.offset)?.start);
         }
         let mut b = [0; 8];
+        let base = self.offset_base(table);
         (self.read)(base + (slot as u64) * 8, &mut b)?;
         Ok(u64::from_le_bytes(b))
     }
-    fn range(&mut self, base: u64, slot: usize, limit: u64) -> io::Result<Range<u64>> {
+
+    fn range(&mut self, table: RecordTable, slot: usize, limit: u64) -> io::Result<Range<u64>> {
         if let Some(trees) = &self.trees {
-            let file = base == self.dir.offset;
-            let (root, first, count) = if file {
-                (
-                    &trees[0],
-                    8 + directory::var_len(self.dir.files),
-                    self.dir.files,
-                )
-            } else {
-                (
-                    &trees[1],
-                    self.dir
-                        .rows_end
-                        .checked_add(directory::var_len(self.dir.terms))
-                        .ok_or_else(invalid)?,
-                    self.dir.terms,
-                )
-            };
-            let range = self
-                .nodes
-                .range(self.read, root.clone(), slot, count, first)?;
-            if range.end > limit {
-                return Err(invalid());
-            }
-            return Ok(range);
+            let subtree = self.dir.subtree(trees, table)?;
+            let range = self.nodes.range(self.read, subtree, slot)?;
+            return (range.end <= limit).then_some(range).ok_or_else(invalid);
         }
         let mut b = [0; 16];
+        let base = self.offset_base(table);
         (self.read)(base + (slot as u64) * 8, &mut b)?;
         let lo = u64::from_le_bytes(b[..8].try_into().unwrap());
         let hi = u64::from_le_bytes(b[8..].try_into().unwrap());
-        if lo < 8 || lo > hi || hi > limit {
-            return Err(invalid());
-        }
-        Ok(lo..hi)
+        let valid = (8..=hi).contains(&lo) && hi <= limit;
+        valid.then_some(lo..hi).ok_or_else(invalid)
     }
+
     fn fetch(&mut self, r: Range<u64>) -> io::Result<Vec<u8>> {
         let n = r.end.checked_sub(r.start).ok_or_else(invalid)?;
         let n = usize::try_from(n).map_err(|_| invalid())?;
@@ -99,103 +277,102 @@ impl Reader<'_> {
         (self.read)(r.start, &mut buf)?;
         Ok(buf)
     }
+    fn file(&mut self, id: usize, rows_at: u64, expected: &str) -> io::Result<File> {
+        let range = self.range(RecordTable::File, id, rows_at)?;
+        let buf = self.fetch(range)?;
+        let mut data = &buf[..];
+        let file = storage::file(&mut data)?;
+        if file.path != expected || !data.is_empty() { return Err(invalid()); }
+        Ok(file)
+    }
+
     fn load_rows(&mut self) -> io::Result<()> {
         if self.cached_rows.is_some() {
             return Ok(());
         }
-        let rows_at = self.position(self.dir.offset, self.dir.files)?;
+        let rows_at = self.position(RecordTable::File, self.dir.files)?;
         let buf = self.fetch(rows_at..self.dir.rows_end)?;
-        let mut data = &buf[..];
-        if storage::get(&mut data)? != self.dir.rows || self.dir.rows > data.len() / 9 {
-            return Err(invalid());
-        }
+        let block = self.dir.row_block(&buf)?;
         let mut rows = Vec::with_capacity(self.dir.rows);
-        let mut bases = if self.dir.tree {
-            vec![0; self.dir.files.checked_add(1).ok_or_else(invalid)?]
-        } else {
-            vec![]
-        };
-        let mut tokens = 0;
-        for _ in 0..self.dir.rows {
-            let row = storage::row(&mut data, tokens, self.dir.files)?;
-            if rows.last().is_some_and(|p: &Row| row.file < p.file) {
+        let mut bases = (self.dir.format == Format::Tree)
+            .then(|| grouped::FileBases::new(self.dir.files))
+            .transpose()?;
+        block.visit(|_, start, row| {
+            if let Some(bases) = &mut bases {
+                bases.observe(row.file, start);
+            }
+            rows.push(row);
+        })?;
+        if let Some(bases) = bases {
+            self.bases = Some(bases.finish(self.dir.tokens));
+        }
+        self.cached_rows = Some((rows_at, rows));
+        Ok(())
+    }
+    fn load_bases(&mut self) -> io::Result<()> {
+        if self.dir.format == Format::Tree {
+            self.load_rows()?;
+        }
+        if self.bases.is_none() {
+            let bases =
+                self.fetch(self.bases_at..self.bases_at + 8 * (self.dir.files as u64 + 1))?;
+            let bases = bases
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| usize::try_from(u64::from_le_bytes(*b)).map_err(|_| invalid()))
+                .collect::<io::Result<Vec<_>>>()?;
+            if bases.first() != Some(&0)
+                || bases.last() != Some(&self.dir.tokens)
+                || !bases.is_sorted()
+            {
                 return Err(invalid());
-            }
-            tokens = row.end;
-            if self.dir.tree {
-                bases[row.file + 1] = tokens
-            }
-            rows.push(row)
-        }
-        if tokens != self.dir.tokens || !data.is_empty() {
-            return Err(invalid());
-        }
-        if self.dir.tree {
-            for i in 1..bases.len() {
-                bases[i] = bases[i].max(bases[i - 1])
             }
             self.bases = Some(bases);
         }
-        self.cached_rows = Some(rows);
         Ok(())
     }
+    fn decode_term(&mut self, mut data: &[u8]) -> io::Result<Term> {
+        if self.dir.format.grouped() {
+            self.load_bases()?;
+        }
+        let term = storage::term_record(
+            &mut data,
+            self.dir.format,
+            storage::TermBounds {
+                rows: self.dir.rows,
+                tokens: self.dir.tokens,
+                bases: self.bases.as_deref().unwrap_or_default(),
+            },
+        )?;
+        if !data.is_empty() {
+            return Err(invalid());
+        }
+        Ok(term)
+    }
+
+    fn probe<'p>(&mut self, slot: usize, bytes: &'p mut [u8; term_key::PROBE]) -> io::Result<term_key::Key<'p>> {
+        let range = self.range(RecordTable::Term, slot, self.dir.offset)?;
+        if range.start <= self.dir.rows_end {
+            return Err(invalid());
+        }
+        let size = (range.end - range.start).min(bytes.len() as u64) as usize;
+        (self.read)(range.start, &mut bytes[..size])?;
+        term_key::Key::parse(range, &bytes[..size])
+    }
+
     fn lookup(&mut self, key: &[u8]) -> io::Result<Option<Term>> {
         let (mut lo, mut hi) = (0, self.dir.terms);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let range = self.range(self.terms_at, mid, self.dir.offset)?;
-            if range.start <= self.dir.rows_end {
-                return Err(invalid());
-            }
-            let size = range.end - range.start;
-            let mut prefix = [0; 10];
-            let n = size.min(10) as usize;
-            (self.read)(range.start, &mut prefix[..n])?;
-            let mut header = &prefix[..n];
-            let key_len = storage::get(&mut header)?;
-            let start = range.start + (n - header.len()) as u64;
-            if key_len == 0 || key_len > 32768 || key_len as u64 > range.end - start {
-                return Err(invalid());
-            }
-            let end = start + key_len as u64;
-            let found = self.fetch(start..end)?;
-            match found.as_slice().cmp(key) {
+            let mut bytes = [0; term_key::PROBE];
+            let probe = self.probe(mid, &mut bytes)?;
+            match probe.compare(key, |r| self.fetch(r))? {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
-                    let buf = self.fetch(end..range.end)?;
-                    let mut data = &buf[..];
-                    let term = if self.dir.grouped {
-                        if self.dir.tree {
-                            self.load_rows()?;
-                        }
-                        if self.bases.is_none() {
-                            let bases = self.fetch(
-                                self.bases_at..self.bases_at + 8 * (self.dir.files as u64 + 1),
-                            )?;
-                            let bases = bases
-                                .as_chunks::<8>()
-                                .0
-                                .iter()
-                                .map(|b| {
-                                    usize::try_from(u64::from_le_bytes(*b)).map_err(|_| invalid())
-                                })
-                                .collect::<io::Result<Vec<_>>>()?;
-                            if bases.first() != Some(&0)
-                                || bases.last() != Some(&self.dir.tokens)
-                                || !bases.is_sorted()
-                            {
-                                return Err(invalid());
-                            }
-                            self.bases = Some(bases);
-                        }
-                        grouped::read_term(&mut data, self.dir.rows, self.bases.as_ref().unwrap())?
-                    } else {
-                        storage::term(&mut data, self.dir.rows, self.dir.tokens)?
-                    };
-                    if !data.is_empty() {
-                        return Err(invalid());
-                    }
+                    let bytes = probe.postings(&mut self.read)?;
+                    let term = self.decode_term(&bytes)?;
                     return Ok(Some(term));
                 }
             }
@@ -204,124 +381,87 @@ impl Reader<'_> {
     }
 }
 impl RankedIndex {
-    pub fn search_extent<'a>(
-        length: u64,
-        mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
-        file_count: usize,
+    /// Search a serialized ranked index using the files from its original catalog.
+    pub fn search_extent<'a, Path, Source>(
+        extent: impl crate::domain::content_lookup::ExtentRead,
+        catalog: super::ExtentCatalog<Path, Source>,
+        query: &str,
+    ) -> io::Result<(Vec<RankedHit>, bool)>
+    where
+        Path: Fn(usize) -> &'a str,
+        Source: FnMut(usize, Range<u64>) -> io::Result<String>,
+    {
+        Self::project_extent(extent, catalog, query, |hit| hit.full_hit())
+    }
+
+    pub(crate) fn project_extent<'a, T, Path, Source>(
+        mut extent: impl crate::domain::content_lookup::ExtentRead,
+        catalog: super::ExtentCatalog<Path, Source>,
+        query: &str,
+        project: impl Fn(MatchedChunk<'_>) -> T,
+    ) -> io::Result<(Vec<T>, bool)>
+    where
+        Path: Fn(usize) -> &'a str,
+        Source: FnMut(usize, Range<u64>) -> io::Result<String>,
+    {
+        Reader::open(
+            extent.length(),
+            &mut |at, bytes| extent.read(at, bytes),
+            catalog.count,
+        )?
+        .project(catalog.path, catalog.source, query, project)
+    }
+}
+
+impl Reader<'_> {
+    fn project<'a, T>(
+        mut self,
         path: impl Fn(usize) -> &'a str,
         mut source: impl FnMut(usize, Range<u64>) -> io::Result<String>,
         query: &str,
-    ) -> io::Result<(Vec<RankedHit>, bool)> {
-        let mut magic = [0; 8];
-        read(0, &mut magic)?;
-        if &magic != b"CIRANK02" && &magic != b"CIRANK03" && &magic != b"CIRANK04" {
-            return Err(invalid());
-        }
-        let mut tail = [0; FOOTER as usize];
-        let footer_pos = length.checked_sub(FOOTER).ok_or_else(invalid)?;
-        read(footer_pos, &mut tail)?;
-        let dir = Directory::decode(&tail)?;
-        let next = |start: u64, n: usize| {
-            (n as u64)
-                .checked_add(1)
-                .and_then(|v| v.checked_mul(8))
-                .and_then(|v| v.checked_add(start))
-                .ok_or_else(invalid)
-        };
-        let (terms_at, bases_at, directory_end, trees) = if dir.tree {
-            let mut h = [0; 16];
-            read(dir.offset, &mut h)?;
-            let number = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
-            let first = dir.offset.checked_add(16).ok_or_else(invalid)?;
-            let middle = first.checked_add(number(&h[..8])).ok_or_else(invalid)?;
-            let end = middle.checked_add(number(&h[8..])).ok_or_else(invalid)?;
-            (middle, 0, end, Some([first..middle, middle..end]))
-        } else {
-            let terms_at = next(dir.offset, dir.files)?;
-            let bases_at = next(terms_at, dir.terms)?;
-            (
-                terms_at,
-                bases_at,
-                if dir.grouped {
-                    next(bases_at, dir.files)?
-                } else {
-                    bases_at
-                },
-                None,
-            )
-        };
-        if dir.tree != (&magic == b"CIRANK04")
-            || dir.grouped != (&magic != b"CIRANK02")
-            || dir.files != file_count
-            || directory_end != footer_pos
-            || dir.rows_end < 8
-            || dir.rows_end >= dir.offset
-        {
-            return Err(invalid());
-        }
-        let mut cursor = Reader {
-            read: &mut read,
-            dir,
-            terms_at,
-            bases_at,
-            bases: None,
-            trees,
-            nodes: Default::default(),
-            cached_rows: None,
-        };
+        project: impl Fn(MatchedChunk<'_>) -> T,
+    ) -> io::Result<(Vec<T>, bool)> {
         let mut index = RankedIndex::default();
-        let mut misses = HashSet::new();
-        let plan = Query::parse(query, |k| {
-            if let Some(&id) = index.dictionary.get(k) {
-                return Ok(Some(id));
+        // Query parsing can request the same folded key multiple times. Cache
+        // both present and absent keys in one table for this extent.
+        let mut resolved = HashMap::new();
+        let plan = Query::parse(query, |key| {
+            if let Some(&known) = resolved.get(key) {
+                return Ok(known);
             }
-            if misses.contains(k) {
-                return Ok(None);
-            }
-            if let Some(term) = cursor.lookup(k)? {
+            let id = self.lookup(key)?.map(|term| {
                 let id = index.terms.len();
                 index.terms.push(term);
-                index.dictionary.insert(k.to_owned(), id);
-                Ok(Some(id))
-            } else {
-                misses.insert(k.to_owned());
-                Ok(None)
-            }
+                id
+            });
+            resolved.insert(key.to_vec(), id);
+            Ok(id)
         })?;
         if plan.phrases.is_empty() {
             return Ok((vec![], false));
         }
-        let rows_at = cursor.position(cursor.dir.offset, file_count)?;
-        cursor.load_rows()?;
-        index.tokens = cursor.dir.tokens;
-        index.rows = cursor.cached_rows.take().unwrap();
+        self.load_rows()?;
+        let (rows_at, rows) = self.cached_rows.take().unwrap();
+        index.tokens = self.dir.tokens;
+        index.rows = rows;
         let mut kept = None;
         index
             .evaluate(
                 &plan,
                 |a, b| path(a).cmp(path(b)),
-                |row, hits, count| {
+                |row, score, hits| {
                     if kept.as_ref().is_none_or(|(id, _)| *id != row.file) {
-                        let file = (|| -> io::Result<File> {
-                            let r = cursor.range(cursor.dir.offset, row.file, rows_at)?;
-                            let buf = cursor.fetch(r)?;
-                            let mut data = &buf[..];
-                            let f = storage::file(&mut data)?;
-                            if f.path != path(row.file) || !data.is_empty() {
-                                return Err(invalid());
-                            }
-                            Ok(f)
-                        })()
-                        .map_err(|e| e.to_string())?;
+                        let file = self
+                            .file(row.file, rows_at, path(row.file))
+                            .map_err(|e| e.to_string())?;
                         kept = Some((row.file, file));
                     }
-                    let stop = row.span_start + (row.parts_start - row.body_start);
                     let spans = kept
                         .as_ref()
                         .unwrap()
                         .1
                         .spans
-                        .get(row.span_start..stop)
+                        .get(row.span_range())
                         .ok_or_else(|| invalid().to_string())?;
                     let bytes = &row.chunk.bytes;
                     let text = source(row.file, bytes.start as u64..bytes.end as u64)
@@ -329,7 +469,13 @@ impl RankedIndex {
                     if text.len() != bytes.len() {
                         return Err(invalid().to_string());
                     }
-                    render(row, spans, &text, bytes.start, hits, count)
+                    MatchedChunk::new(
+                        row,
+                        score,
+                        result::ChunkText { text: &text, base: bytes.start },
+                        result::ChunkEvidence { spans, hits },
+                    )
+                        .map(&project)
                 },
             )
             .map_err(io::Error::other)

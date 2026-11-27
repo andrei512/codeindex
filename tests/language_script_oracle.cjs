@@ -48,20 +48,114 @@ function checkout(project, fixture) {
   git(["checkout", "-q", "--detach", "FETCH_HEAD"], repo);
   return { repo, commit: spec.commit };
 }
-function location(node, file, repo) {
+function location(node, file, name) {
   const pos = file.getLineAndCharacterOfPosition(node.getStart(file));
-  return path.relative(repo, file.fileName) + ":" + (pos.line + 1) + ":" + (pos.character + 1);
+  return name + ":" + (pos.line + 1) + ":" + (pos.character + 1);
 }
 function classify(decl) {
   if (ts.isFunctionDeclaration(decl)) return "function";
   if (ts.isMethodDeclaration(decl)) return "method";
-  if (ts.isVariableDeclaration(decl) && decl.parent.flags & ts.NodeFlags.Const &&
-      decl.initializer && (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer))) {
-    return "const-function";
-  }
+  if (!ts.isVariableDeclaration(decl) || !(decl.parent.flags & ts.NodeFlags.Const)) return null;
+  const initializer = decl.initializer;
+  if (!initializer) return null;
+  return ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer) ? "const-function" : null;
+}
+function localDeclaration(id, checker, file) {
+  if (!id || !ts.isIdentifier(id)) return null;
+  const declarations = checker.getSymbolAtLocation(id)?.declarations;
+  if (declarations?.length !== 1) return null;
+  const decl = declarations[0];
+  return decl.name && ts.isIdentifier(decl.name) && decl.name.text === id.text &&
+    decl.getSourceFile() === file ? decl : null;
+}
+function lexicalRead(node) {
+  const parent = node.parent;
+  return ts.isReturnStatement(parent) && parent.expression === node ||
+    ts.isCallExpression(parent) && parent.arguments.includes(node) ||
+    ts.isBinaryExpression(parent) && parent.operatorToken.kind < ts.SyntaxKind.FirstAssignment &&
+    (parent.left === node || parent.right === node);
+}
+function methodReceiver(expr, decl) {
+  if (!ts.isPropertyAccessExpression(expr) || !ts.isClassDeclaration(decl.parent)) return false;
+  const receiver = expr.expression;
+  return receiver.kind === ts.SyntaxKind.ThisKeyword ||
+    ts.isIdentifier(receiver) && decl.parent.name?.text === receiver.text;
+}
+function callSite(expr, checker, file, site) {
+  const member = ts.isPropertyAccessExpression(expr);
+  const id = member ? expr.name : expr;
+  const decl = localDeclaration(id, checker, file);
+  const kind = decl && classify(decl);
+  if (!kind) return null;
+  if (kind === "method" ? !methodReceiver(expr, decl) : member) return null;
+  return site(id, decl, kind);
+}
+function lexicalKind(decl) {
+  if (!decl) return null;
+  if (ts.isParameter(decl)) return "parameter";
+  if (ts.isBindingElement(decl)) return "binding-element";
   return null;
 }
-function collect(repo) {
+function lexicalSite(node, checker, file, site) {
+  const decl = localDeclaration(node, checker, file);
+  const kind = lexicalKind(decl);
+  if (!kind) return null;
+  return site(node, decl, kind, {
+    ownerKind: ts.SyntaxKind[decl.parent.kind],
+    anonymousFunction: ts.isFunctionExpression(decl.parent) && !decl.parent.name,
+  });
+}
+
+// Compute each stable sample rank once before sorting.
+function rankByHash(items, key) {
+  return items.map(item => [hash(key(item)), item])
+    .sort(([a], [b]) => a.localeCompare(b)).map(([, item]) => item);
+}
+
+function* firstUsePerTarget(items) {
+  const seen = new Set();
+  for (const item of items) {
+    if (seen.has(item.target)) continue;
+    seen.add(item.target);
+    yield item;
+  }
+}
+
+function distinctTargets(items) {
+  const selected = [];
+  for (const item of firstUsePerTarget(rankByHash(items, item => item.use))) {
+    selected.push(item);
+    if (selected.length === 3) break;
+  }
+  return selected;
+}
+
+function sourceCandidates(checker, file, name) {
+  const candidates = { calls: [], lexical: [] };
+  const targets = new Map();
+  function bindingSite(id, decl, kind, owner) {
+    if (!targets.has(decl)) targets.set(decl, location(decl.name, file, name));
+    return { file: name, kind, ...owner, name: id.text, use: location(id, file, name), target: targets.get(decl) };
+  }
+  function admit(node) {
+    if (ts.isCallExpression(node)) {
+      return ["calls", callSite(node.expression, checker, file, bindingSite)];
+    }
+    if (ts.isIdentifier(node) && lexicalRead(node)) {
+      return ["lexical", lexicalSite(node, checker, file, bindingSite)];
+    }
+    return [null, null];
+  }
+  function visit(node) {
+    const [family, site] = admit(node);
+    if (site) candidates[family].push(site);
+    ts.forEachChild(node, visit);
+  }
+  visit(file);
+  return candidates;
+}
+
+function collect(repo, witnesses) {
   const names = git(["ls-files", "-z"], repo).split("\0").filter(name =>
     /\.[cm]?[jt]sx?$/.test(name) && !/\.d\.[cm]?ts$|\.min\.|(?:^|\/)(?:vendor|node_modules|dist|build|generated)\//.test(name) &&
     fs.statSync(path.join(repo, name)).size <= 150000);
@@ -73,122 +167,68 @@ function collect(repo) {
   });
   const checker = program.getTypeChecker();
   const files = { calls: [], lexical: [] };
-  for (const name of names.sort((a, b) => hash(a).localeCompare(hash(b)))) {
+  for (const name of rankByHash(names, name => name)) {
     const file = program.getSourceFile(path.join(repo, name));
     if (!file || program.getSyntacticDiagnostics(file).length) continue;
-    const candidates = { calls: [], lexical: [] };
-    function visit(node) {
-      if (ts.isCallExpression(node)) {
-        const expr = node.expression;
-        const id = ts.isIdentifier(expr) ? expr : ts.isPropertyAccessExpression(expr) ? expr.name : null;
-        const symbol = id && checker.getSymbolAtLocation(id);
-        const decl = symbol?.declarations?.length === 1 && symbol.declarations[0];
-        const kind = decl && classify(decl);
-        if (kind && ts.isIdentifier(decl.name) && decl.getSourceFile() === file &&
-            ts.isIdentifier(id) && id.text === decl.name.text) {
-          // An explicit class receiver or this is readily reviewable for a
-          // declared method. Exclude inferred receivers and object-literal
-          // methods, which introduce dynamic dispatch ambiguity.
-          const classMethod = kind === "method" && ts.isClassDeclaration(decl.parent) &&
-              ts.isPropertyAccessExpression(expr) &&
-              (expr.expression.kind === ts.SyntaxKind.ThisKeyword ||
-               (ts.isIdentifier(expr.expression) && decl.parent.name?.text === expr.expression.text));
-          if (classMethod || (kind !== "method" && ts.isIdentifier(expr))) {
-            candidates.calls.push({ file: name, kind, name: id.text, use: location(id, file, repo),
-              target: location(decl.name, file, repo) });
-          }
-        }
-      }
-      // Plain argument, operand and return-value reads. These denote a lexical
-      // value even when its runtime value or containing object is unknown.
-      if (ts.isIdentifier(node)) {
-        const parent = node.parent;
-        const read = ts.isReturnStatement(parent) && parent.expression === node ||
-          ts.isCallExpression(parent) && parent.arguments.includes(node) ||
-          ts.isBinaryExpression(parent) && parent.operatorToken.kind < ts.SyntaxKind.FirstAssignment &&
-          (parent.left === node || parent.right === node);
-        if (read) {
-          const symbol = checker.getSymbolAtLocation(node);
-          const decl = symbol?.declarations?.length === 1 && symbol.declarations[0];
-          if (decl && (ts.isParameter(decl) || ts.isBindingElement(decl)) &&
-              ts.isIdentifier(decl.name) && node.text === decl.name.text && decl.getSourceFile() === file) {
-            candidates.lexical.push({ file: name, kind: ts.isParameter(decl) ? "parameter" : "binding-element",
-              ownerKind: ts.SyntaxKind[decl.parent.kind],
-              anonymousFunction: ts.isFunctionExpression(decl.parent) && !decl.parent.name,
-              name: node.text, use: location(node, file, repo), target: location(decl.name, file, repo) });
-          }
-        }
-      }
-      ts.forEachChild(node, visit);
-    }
-    visit(file);
-    for (const [family, items] of Object.entries(candidates)) {
-      if (!items.length) continue;
-      // Select distinct targets, deterministic by source position hash. A single
-      // frequently called helper cannot fill an entire file's quota.
-      items.sort((a, b) => hash(a.use).localeCompare(hash(b.use)));
-      const selected = [];
-      const seen = new Set();
-      for (const item of items) {
-        if (seen.has(item.target)) continue;
-        selected.push(item);
-        seen.add(item.target);
-        if (selected.length === 3) break;
-      }
-      files[family].push(selected);
-    }
+    recordCandidates(sourceCandidates(checker, file, name), witnesses, files);
   }
   return { scannedFiles: names.length, files };
 }
-function query(repo, home, op, anchor) {
-  const match = /^(.*):(\d+):(\d+)$/.exec(anchor);
-  const args = ["--cx", op, match[1], match[2], match[3]];
-  const res = command(binary, args, repo, {
-    ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "./.missing-config",
-  });
-  if (res.status !== 0) throw new Error(res.stderr);
-  const answer = JSON.parse(res.stdout);
-  const sites = answer.result.map(r => r.path + ":" + r.line + ":" + r.col);
-  return { status: answer.operation_status, sites, truncated: answer.truncated };
+function recordCandidates(candidates, witnesses, files) {
+  for (const [family, items] of Object.entries(candidates)) {
+    if (!items.length) continue;
+    recordWitnesses(items, witnesses);
+    files[family].push(distinctTargets(items));
+  }
 }
 
-try {
+function recordWitnesses(items, witnesses) {
+  // Preserve every independently known site before applying each file's quota.
+  for (const row of items) {
+    const prior = witnesses.get(row.use);
+    witnesses.set(row.use, prior === undefined || prior === row.target ? row.target : null);
+  }
+}
+
+function schedule(batches, files, project) {
+  for (const [family, groups] of Object.entries(files)) {
+    for (const [i, samples] of groups.entries()) {
+      const batch = Math.floor(i / 4);
+      (batches[family][batch] ||= []).push(...samples.map(row => ({ ...row, family, project })));
+    }
+  }
+}
+
+function makePlan() {
   const home = path.join(temp, "home");
   fs.mkdirSync(home);
-  const inventory = {}, bases = {}, batches = {calls: [], lexical: []};
+  const inventory = {}, bases = {}, witnesses = {}, batches = {calls: [], lexical: []};
   for (const [project, fixture] of Object.entries(projects)) {
     const { repo, commit } = checkout(project, fixture);
     bases[project] = repo;
-    const { scannedFiles, files } = collect(repo);
+    const known = new Map();
+    const { scannedFiles, files } = collect(repo, known);
+    witnesses[project] = Object.fromEntries(known);
     inventory[project] = { commit, scannedFiles, eligibleFiles: Object.fromEntries(Object.entries(files).map(([k, v]) => [k, v.length])) };
     // Select the complete schedule before sending any queries to cx.
-    for (const [family, groups] of Object.entries(files)) {
-      for (const [i, samples] of groups.entries()) {
-        const batch = Math.floor(i / 4);
-        (batches[family][batch] ||= []).push(...samples.map(row => ({ ...row, family, project })));
-      }
-    }
+    schedule(batches, files, project);
   }
   const waves = [...batches.calls, ...batches.lexical];
-  for (const [i, wave] of waves.entries()) {
-    let bad = 0, incomplete = 0;
-    for (const row of wave) {
-      const repo = bases[row.project];
-      const forward = query(repo, home, "definition", row.use);
-      const reverse = query(repo, home, "references", row.target);
-      row.definition = forward;
-      row.referencePresent = reverse.sites.includes(row.use);
-      row.referenceTruncated = reverse.truncated;
-      row.forwardMismatch = forward.status !== "resolved" || forward.sites.length !== 1 || forward.sites[0] !== row.target;
-      row.reverseMismatch = !row.referencePresent && !reverse.truncated;
-      if (row.forwardMismatch || row.reverseMismatch) bad++;
-      if (!row.referencePresent && reverse.truncated) incomplete++;
-    }
-    console.log(wave[0].family, "wave", i + 1, "samples", wave.length, "mismatched", bad, "uncertain reverse", incomplete);
-    fs.mkdirSync(path.dirname(report), { recursive: true });
-    fs.writeFileSync(report, JSON.stringify({ typescript: ts.version, inventory, completed: i + 1, waves }, null, 2) + "\n");
+  // The pinned compiler, projects and sampling rule define these exact nine waves.
+  const sites = waves.map(wave => wave.map(row => [row.project, row.family, row.use, row.target]));
+  if (hash(JSON.stringify(sites)) !== "13469080af2664430514264231d4b9da1bf0d1daca0906cfd1374a9c5b4b2e2c") {
+    throw new Error("TypeScript oracle sample differs from the pinned schedule");
   }
-  process.exitCode = Number(waves.some(w => w.some(r => r.forwardMismatch || r.reverseMismatch)));
+  return {typescript: ts.version, inventory, bases, home, waves, witnesses};
+}
+
+try {
+  const plan = makePlan();
+  const runner = spawnSync("python3", [path.join(__dirname, "language_script_oracle.py"), binary, report], {
+    input: JSON.stringify(plan), stdio: ["pipe", "inherit", "inherit"],
+  });
+  if (runner.error) throw runner.error;
+  process.exitCode = runner.status ?? 1;
 } finally {
   fs.rmSync(temp, { recursive: true, force: true });
 }

@@ -23,14 +23,7 @@ pub(super) fn write(
     for (id, label) in labels {
         let split = label.rfind(' ').map_or(0, |i| i + 1);
         let (prefix, suffix) = label.split_at(split);
-        let prefix_offset = match prefixes.entry(prefix) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let offset = w.offset() - start;
-                string(w, prefix)?;
-                *e.insert(offset)
-            }
-        };
+        let prefix_offset = write_prefix(w, start, prefix, prefixes.entry(prefix))?;
         let suffix_offset = w.offset() - start;
         string(w, suffix)?;
         rows.push([id as u64, prefix_offset, suffix_offset]);
@@ -73,4 +66,20 @@ pub(super) fn lookup(
         }
     }
     Ok(None)
+}
+
+fn write_prefix<'a>(
+    w: &mut impl ExtentSink,
+    start: u64,
+    prefix: &'a str,
+    entry: std::collections::hash_map::Entry<'a, &str, u64>,
+) -> io::Result<u64> {
+    match entry {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let offset = w.offset() - start;
+            string(w, prefix)?;
+            Ok(*entry.insert(offset))
+        }
+    }
 }

@@ -1,13 +1,24 @@
 //! Written declarations and conservative navigation for direct, named calls.
 //! This lexical profile has partial coverage. Matching names in unrelated files
 //! are never added to the target set of a call.
+mod analyzer;
+pub use analyzer::Language;
+mod edit_proof;
+mod project_resolver;
+pub(crate) use project_resolver::{retained_files,ProjectView};
+pub(crate) use edit_proof::GraphComparison;
+pub(crate) use analyzer::{Document, LexedAnalyzer, Measured, ProjectInputs};
+pub(crate) use lexer::ScanState;
 mod cache;
 mod cfamily;
-pub(crate) use cfamily::{project::CProject, sdk::Receipt as CReceipt};
+mod comment_evidence;
+pub(crate) use cfamily::{project::{CProject, compilation_database}, sdk::Receipt as CReceipt};
 mod direct;
 mod extended;
 mod lexer;
+mod make_reference;
 mod markup;
+pub(crate) mod navigation;
 mod rust;
 pub(crate) mod score;
 pub(crate) mod roles;
@@ -15,102 +26,45 @@ mod script;
 use lexer::{Kind, Token};
 use std::{collections::HashMap, ops::Range, path::Path};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Language {
-    Rust,
-    Js,
-    Python,
-    Starlark,
-    Shell,
-    Powershell,
-    Csharp,
-    Swift,
-    C,
-    Cpp,
-    Proto,
-    Css,
-    Html,
-    Sql,
-    Go,
-    Java,
-    Kotlin,
-    ObjectiveC,
-    Dart,
-    Php,
-    Hack,
-    Dockerfile,
-    Makefile,
-    Batchfile,
-    CMake,
-    Procfile,
-    Hcl,
-    Nix,
-    Ruby,
-    Lua,
-    Perl,
-    Assembly,
-    Mako,
-    PlPgSql,
-}
 
 impl Language {
     pub fn for_path(path: &str) -> Option<Self> {
         let p = Path::new(path);
         let name = p.file_name()?.to_str()?;
-        match name.split('.').next()? {
-            "Dockerfile" | "Containerfile" => return Some(Self::Dockerfile),
-            "Makefile" | "makefile" | "GNUmakefile" => return Some(Self::Makefile),
-            "Procfile" => return Some(Self::Procfile),
-            _ => {}
+        const MANIFESTS: &[(&str, Language)] = &[
+            ("Dockerfile", Language::Dockerfile),
+            ("Containerfile", Language::Dockerfile),
+            ("Makefile", Language::Makefile),
+            ("makefile", Language::Makefile),
+            ("GNUmakefile", Language::Makefile),
+            ("Procfile", Language::Procfile),
+        ];
+        let stem = name.split('.').next()?;
+        if let Some((_, language)) = MANIFESTS.iter().find(|(written, _)| *written == stem) {
+            return Some(*language);
         }
-        if name == "CMakeLists.txt" { return Some(Self::CMake); }
-        Some(match p.extension().or_else(|| p.file_name())?.to_str()? {
-            "rs" => Self::Rust,
-            "ts" | "tsx" | "cts" | "mts" | "js" | "jsx" | "mjs" | "cjs" => Self::Js,
-            "py" | "pyi" => Self::Python,
-            "bzl" | "bazel" | "BUILD" | "WORKSPACE" => Self::Starlark,
-            "sh" | "bash" => Self::Shell,
-            "ps1" | "psm1" => Self::Powershell,
-            "cs" => Self::Csharp,
-            "swift" => Self::Swift,
-            "c" | "h" => Self::C,
-            "cc" | "cpp" | "hpp" | "cxx" => Self::Cpp,
-            "proto" => Self::Proto,
-            "css" => Self::Css,
-            "html" | "htm" => Self::Html,
-            "sql" => Self::Sql,
-            "java" => Self::Java,
-            "kt" | "kts" => Self::Kotlin,
-            "go" => Self::Go,
-            "dart" => Self::Dart,
-            "m" => Self::ObjectiveC,
-            "php" | "phtml" => Self::Php,
-            "hack" | "hhi" => Self::Hack,
-            "rb" | "rake" | "gemspec" | "Gemfile" | "Rakefile" => Self::Ruby,
-            "lua" => Self::Lua,
-            "pl" | "pm" => Self::Perl,
-            "asm" | "s" | "S" => Self::Assembly,
-            "mako" | "mao" => Self::Mako,
-            "plpgsql" | "pgsql" => Self::PlPgSql,
-            "mk" | "mak" => Self::Makefile,
-            "dockerfile" => Self::Dockerfile,
-            "cmd" | "bat" => Self::Batchfile,
-            "cmake" => Self::CMake,
-            "hcl" | "tf" | "tfvars" => Self::Hcl,
-            "nix" => Self::Nix,
-
-            _ => return None,
-        })
+        if name == "CMakeLists.txt" {
+            return Some(Self::CMake);
+        }
+        // Resolve the last component once. A leading dot belongs to the
+        // basename; extensionless build manifests use their whole name.
+        let suffix = match name.rsplit_once('.') {
+            Some((stem, suffix)) if !stem.is_empty() => suffix,
+            _ => name,
+        };
+        Self::for_suffix(suffix)
     }
-    fn line_comment(self, t: &str) -> bool {
+    fn comment_style(self) -> lexer::LineComments {
+        use lexer::LineComments::*;
         match self {
-            Self::Python | Self::Starlark | Self::Shell | Self::Powershell | Self::Ruby | Self::Perl | Self::Nix | Self::Dockerfile | Self::Makefile | Self::CMake => t.starts_with('#'),
-            Self::Sql | Self::PlPgSql | Self::Lua => t.starts_with("--"),
-            Self::Php | Self::Hack | Self::Hcl => t.starts_with("//") || t.starts_with('#'),
-            Self::Css | Self::Html => false,
-            _ => t.starts_with("//"),
+            Self::Python | Self::Starlark | Self::Shell | Self::Powershell | Self::Ruby | Self::Perl | Self::Nix | Self::Dockerfile | Self::Makefile | Self::CMake => Hash,
+            Self::Sql | Self::PlPgSql | Self::Lua => Dash,
+            Self::Php | Self::Hack | Self::Hcl => SlashOrHash,
+            Self::Css | Self::Html => None,
+            _ => Slash,
         }
     }
+    fn line_comment(self, text: &str) -> bool { self.comment_style().starts(text) }
     fn block_comments(self) -> bool {
         matches!(
             self,
@@ -127,42 +81,7 @@ impl Language {
         )
     }
 
-    fn decl(self, kw: &str) -> Option<&'static str> {
-        Some(match (self, kw) {
-            (Self::Rust, "fn") => "function_item",
-            (Self::Rust, "struct") => "struct_item",
-            (Self::Rust, "enum") => "enum_item",
-            (Self::Rust, "trait") => "trait_item",
-            (Self::Rust, "mod") => "mod_item",
-            (Self::Rust, "const") => "const_item",
-            (Self::Rust, "type") => "type_item",
-            (Self::Rust, "static") => "static_item",
-            (Self::Js, "function") => "function_declaration",
-            (Self::Js, "class") => "class_declaration",
-            (Self::Js, "const" | "let" | "var") => "variable_declarator",
-            (Self::Js, "interface") => "interface_declaration",
-            (Self::Js, "type") => "type_alias_declaration",
-            (Self::Js, "enum") => "enum_declaration",
-            (Self::Python | Self::Starlark, "def") => "function_definition",
-            (Self::Python, "class") => "class_definition",
-            (Self::Swift, "func") => "function_declaration",
-            (Self::Swift, "class" | "struct" | "enum") => "class_declaration",
-            (Self::Csharp, "class") => "class_declaration",
-            (Self::Csharp, "interface") => "interface_declaration",
-            (Self::Csharp, "struct") => "struct_declaration",
-            (Self::Csharp, "enum") => "enum_declaration",
-            (Self::Cpp, "class") => "class_specifier",
-            (Self::C | Self::Cpp, "struct") => "struct_specifier",
-            (Self::C | Self::Cpp, "enum") => "enum_specifier",
-            (Self::Proto, "message") => "message_name",
-            (Self::Proto, "service") => "service_name",
-            (Self::Proto, "rpc") => "rpc_name",
-            (Self::Proto, "enum") => "enum_name",
-            (Self::Powershell, "function") => "function_name",
-            (Self::Shell, "function") => "function_definition",
-            _ => return None,
-        })
-    }
+
 }
 
 #[derive(Debug)]
@@ -180,10 +99,10 @@ pub struct Call {
 pub struct Analysis {
     direct: Vec<(usize, Vec<usize>)>,
     direct_evidence: Option<Box<direct::Evidence>>,
-    rust: Option<rust::Evidence>,
+    rust: Option<Box<rust::Evidence>>,
     pub declarations: Vec<Declaration>,
     pub calls: Vec<Call>,
-    script: Option<script::Evidence>,
+    script: Option<Box<script::Evidence>>,
 }
 
 fn indentation(text: &str, start: usize) -> usize {
@@ -194,192 +113,12 @@ fn indentation(text: &str, start: usize) -> usize {
         .count()
 }
 
-pub(crate) fn scored(
-    lang: Language,
-    text: &str,
-    path: &str,
-    project: Option<&CProject>,
-) -> (Analysis, score::Saved) {
-    let (facts, base, _) = score_file(lang, text, path, project, false);
-    (facts, base)
-}
+mod scoring;
+mod source_lines;
+pub(crate) use scoring::{scored, score_file};
 
-pub(crate) fn score_file(lang: Language, text: &str, path: &str, project: Option<&CProject>, test_rules: bool)
-    -> (Analysis, score::Saved, score::Saved) {
-    let finish = |facts: Analysis, base: score::Saved, syntax: Option<(&[Token], &[usize])>| {
-        let adjusted = if test_rules {
-            score::for_tests(path, text, base.as_deref(), &facts, project.is_some(), syntax)
-        } else { None };
-        (facts, base, adjusted)
-    };
-    if let Some((facts, base)) = extended::scored(lang, text) {
-        return finish(facts, base, None);
-    }
-    let tokens = lexer::tokens(text, lang);
-    if matches!(lang, Language::Rust | Language::Python | Language::Js) {
-        let pairs = if lang == Language::Rust {
-            rust::matches(&tokens)
-        } else {
-            script::paired_for_score(&tokens)
-        };
-        let facts = if lang == Language::Rust {
-            rust::analyze_paired(&tokens, text.len(), &pairs)
-        } else {
-            script::analyze_paired(lang, text, &tokens, &pairs)
-        };
-        let score = score::with_pairs(lang, text, &tokens, &pairs, &facts);
-        return finish(facts, score, (lang != Language::Rust).then_some((&tokens, &pairs)));
-    }
-    let facts = match project {
-        Some(p) if matches!(lang, Language::C | Language::Cpp) => p.analyze(lang, path, text),
-        _ if lang.extended_name().is_some() || matches!(lang, Language::Html | Language::Shell) => {
-            analyze(lang, text)
-        }
-        _ => analyze_tokens(lang, text, &tokens),
-    };
-    if matches!(lang, Language::Sql | Language::PlPgSql) {
-        let base = score::with_tokens(lang, text, &tokens, &facts);
-        finish(facts, base, None)
-    } else {
-        let pairs = script::paired_for_score(&tokens);
-        let base = score::with_pairs(lang, text, &tokens, &pairs, &facts);
-        finish(facts, base, Some((&tokens, &pairs)))
-    }
-}
 pub fn analyze(lang: Language, text: &str) -> Analysis {
-    if let Some(facts) = extended::analyze(lang, text) { return facts; }
-    if lang == Language::Html {
-        return markup::html(text);
-    }
-    if lang == Language::Shell {
-        return direct::analyze_shell(text);
-    }
-    analyze_tokens(lang, text, &lexer::tokens(text, lang))
-}
-fn analyze_tokens(lang:Language,text:&str,t:&[Token])->Analysis {
-    if lang == Language::Powershell { return direct::powershell::analyze(text, &t); }
-    if lang == Language::Proto {
-        return direct::analyze_proto(&t);
-    }
-    if matches!(
-        lang,
-        Language::C | Language::Cpp | Language::Csharp | Language::Swift
-    ) {
-        return cfamily::analyze(lang, &t);
-    }
-    if lang == Language::Css {
-        return markup::css(&t);
-    }
-    if lang == Language::Sql {
-        let mut facts = markup::sql(&t);
-        if t.windows(2).any(|pair| pair[0].text.eq_ignore_ascii_case("language")
-            && pair[1].text.trim_matches(['\'', '"']).eq_ignore_ascii_case("plpgsql"))
-        {
-            extended::sql_routines(text, &mut facts);
-        }
-        return facts;
-    }
-    if lang == Language::Rust {
-        return rust::analyze(&t, text.len());
-    }
-    if matches!(lang, Language::Python | Language::Js) {
-        return script::analyze(lang, text, &t);
-    }
-    let mut a = Analysis::default();
-    let mut brace_depth = 0usize;
-    let mut pending = None;
-    let mut scopes: Vec<(usize, usize)> = Vec::new();
-    let mut py_scopes: Vec<(usize, usize)> = Vec::new();
-    let offside = matches!(lang, Language::Python | Language::Starlark);
-    for (i, tok) in t.iter().enumerate() {
-        let prev = i.checked_sub(1).map_or("", |j| t[j].text);
-        let next = t.get(i + 1).map_or("", |x| x.text);
-        if offside && (i == 0 || t[i - 1].line != tok.line) {
-            let indent = indentation(text, tok.span.start);
-            while py_scopes.last().is_some_and(|&(v, _)| v >= indent) {
-                py_scopes.pop();
-            }
-        }
-        if tok.text == "{" {
-            brace_depth += 1;
-            if let Some(id) = pending.take() {
-                scopes.push((brace_depth, id));
-            }
-        }
-        if tok.text == "}" {
-            if scopes.last().is_some_and(|s| s.0 == brace_depth) {
-                scopes.pop();
-            }
-            brace_depth = brace_depth.saturating_sub(1);
-            pending = None;
-        }
-        if tok.text == ";" {
-            pending = None;
-        }
-        let span = tok.span.clone();
-        let kind = if tok.kind == Kind::Word {
-            lang.decl(prev).or_else(|| match lang {
-                Language::Shell
-                    if next == "("
-                        && t.get(i + 2).is_some_and(|x| x.text == ")")
-                        && t.get(i + 3).is_some_and(|x| x.text == "{") =>
-                {
-                    Some("function_definition")
-                }
-                Language::C | Language::Cpp
-                    if next == "("
-                        && matches!(
-                            prev,
-                            "int" | "long" | "float" | "double" | "char" | "void" | "bool"
-                        ) =>
-                {
-                    Some("function_definition")
-                }
-                _ => None,
-            })
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            let id = a.declarations.len();
-            a.declarations.push(Declaration { span, kind });
-            if kind.starts_with("function") {
-                if offside {
-                    py_scopes.push((indentation(text, tok.span.start), id));
-                } else {
-                    pending = Some(id);
-                }
-            }
-        } else if tok.kind == Kind::Word
-            && next == "("
-            && !matches!(prev, "." | ":" | "#")
-            && !matches!(
-                tok.text,
-                "if" | "for"
-                    | "while"
-                    | "match"
-                    | "switch"
-                    | "catch"
-                    | "return"
-                    | "sizeof"
-                    | "function"
-                    | "fn"
-            )
-        {
-            let owner = if offside {
-                py_scopes.last().map(|s| s.1)
-            } else {
-                scopes.last().map(|s| s.1)
-            };
-            a.calls.push(Call {
-                span,
-                owner,
-                is_call: true,
-            });
-        }
-    }
-
-    a
+    lang.analyzer().analyze(&Document { path: "", text })
 }
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -403,8 +142,13 @@ pub struct Names {
     pub targets: HashMap<Site, Vec<Site>>,
 }
 
+pub(crate) use cfamily::projection::Projection;
+
 #[derive(Default)]
 pub(crate) struct ForwardNames {
+    pub(crate) context_keys: Vec<String>,
+    pub(crate) translation_uses: HashMap<Site, (usize, Option<Site>)>,
+    pub(crate) translation_definitions: HashMap<Site, Vec<usize>>,
     pub(crate) public_labels: HashMap<Site, String>,
     pub(crate) by_name: HashMap<String, Vec<Site>>,
     targets: HashMap<Site, Vec<Site>>,
@@ -416,6 +160,50 @@ pub struct Unit<'a> {
     pub text: &'a str,
     pub analysis: &'a Analysis,
 }
+/// Cache lexical project ownership for this snapshot. A lookup at a shared
+/// ancestor settles each previously unvisited directory on the route.
+fn nearest_owner<'a, T: Copy>(
+    cache: &mut HashMap<&'a Path, Option<T>>,
+    directory: &'a Path,
+    mut local: impl FnMut(&Path) -> Option<T>,
+) -> Option<T> {
+    let mut visited = 0;
+    let owner = directory.ancestors().find_map(|ancestor| {
+        cache.get(ancestor).copied().or_else(|| {
+            visited += 1;
+            local(ancestor).map(Some)
+        })
+    }).flatten();
+    for ancestor in directory.ancestors().take(visited) {
+        cache.insert(ancestor, owner);
+    }
+    owner
+}
+
+/// Resolve a captured relative spelling without accessing the filesystem.
+fn relative_path(dir: &Path, spelling: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut path = dir.to_owned();
+    for part in Path::new(spelling).components() {
+        match part {
+            Component::Normal(name) => path.push(name),
+            Component::CurDir => {}
+            Component::ParentDir if path.pop() => {}
+            _ => return None,
+        }
+    }
+    Some(path)
+}
+
+/// A second declaration of a spelling blocks resolution, including fallback
+/// to an outer scope. Keep the occupied key after it becomes ambiguous.
+fn record_unique<K: Eq + std::hash::Hash, V>(names: &mut HashMap<K, Option<V>>, key: K, value: V) {
+    names
+        .entry(key)
+        .and_modify(|existing| *existing = None)
+        .or_insert(Some(value));
+}
+
 impl Declaration {
     pub fn searchable(&self) -> bool {
         !matches!(
@@ -437,18 +225,34 @@ impl Declaration {
     }
 }
 
+impl Analysis {
+    pub(super) fn declare_at(&mut self, span: std::ops::Range<usize>, kind: &'static str) -> usize {
+        let id = self.declarations.len();
+        self.declarations.push(Declaration { span, kind });
+        id
+    }
+
+    pub(super) fn direct_edge(
+        &mut self,
+        target: usize,
+        span: std::ops::Range<usize>,
+        owner: Option<usize>,
+        is_call: bool,
+    ) {
+        self.direct.push((self.calls.len(), vec![target]));
+        self.calls.push(Call {
+            span,
+            owner,
+            is_call,
+        });
+    }
+}
+
 impl Names {
     /// With identical path membership, these are the units whose bytes can
     /// affect binding or exported labels. All other units contribute only paths.
     pub(crate) fn consumes_text(path: &str) -> bool {
-        let p = Path::new(path);
-        Language::for_path(path).is_some() || path.ends_with(".csproj") || path == "pyproject.toml" ||
-            match p.file_name().and_then(|name| name.to_str()) {
-                Some("compile_commands.json" | "Cargo.toml" | "package.json" | "tsconfig.json" | "Directory.Build.props" | "Directory.Build.targets") => true,
-                Some("config" | "config.toml") => p.parent().and_then(Path::file_name)
-                    .is_some_and(|name| name == ".cargo"),
-                _ => false,
-            }
+        Language::for_path(path).is_some() || compilation_database(path) || project_resolver::consumes_support_text(path)
     }
 }
 
@@ -474,15 +278,20 @@ impl ForwardNames {
         })
     }
 
-    fn bind_one(&mut self, source: Site, target: Site) {
-        if let Some(file) = self.rows.get_mut(source.file) {
-            let slot = &mut file[source.local];
-            if *slot == Self::EMPTY || *slot == target {
-                *slot = target;
-                return;
-            }
+    pub(crate) fn bind_one(&mut self, source: Site, target: Site) {
+        if let Some(slot) = self.rows.get_mut(source.file).map(|file| &mut file[source.local])
+            && (*slot == Self::EMPTY || *slot == target)
+        {
+            *slot = target;
+            return;
         }
-        self.bind(source, vec![target]);
+        let Some(row) = self.targets.get_mut(&source) else {
+            self.bind(source, vec![target]);
+            return;
+        };
+        if let Err(at) = row.binary_search(&target) {
+            row.insert(at, target);
+        }
     }
 
     fn bind(&mut self, site: Site, mut targets: Vec<Site>) {
@@ -491,43 +300,44 @@ impl ForwardNames {
         }
         if !self.rows.is_empty() {
             let slot = &mut self.rows[site.file][site.local];
-            if *slot == Self::EMPTY && targets.len() == 1 {
-                *slot = targets[0];
-                return;
-            }
             if *slot != Self::MANY {
                 if *slot != Self::EMPTY {
                     targets.push(*slot);
                 }
                 targets.sort_unstable();
                 targets.dedup();
-                if targets.len() == 1 {
-                    *slot = targets[0];
-                    return;
+                if let [target] = targets.as_slice() {
+                    *slot = *target;
+                } else {
+                    *slot = Self::MANY;
+                    self.targets.insert(site, targets);
                 }
-                *slot = Self::MANY;
-                self.targets.insert(site, targets);
                 return;
             }
         }
-        targets.sort_unstable();
-        targets.dedup();
-        match self.targets.entry(site) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(targets);
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                let previous = e.get_mut();
-                previous.extend(targets);
-                previous.sort_unstable();
-                previous.dedup();
-            }
+        let stored = self.targets.entry(site).or_default();
+        if stored.is_empty() {
+            *stored = targets;
+        } else {
+            stored.extend(targets);
         }
+        stored.sort_unstable();
+        stored.dedup();
     }
 
     pub(crate) fn forward(units: &[Unit<'_>]) -> Self {
+        Self::bind_project(&ProjectView::new(units))
+    }
+
+    pub(crate) fn bind_project(project:&ProjectView) -> Self {
+        let mut names=Self::with_rows(project.units);
+        names.complete_partitions(project,&[]);
+        names
+    }
+
+    pub(crate) fn with_rows(units: &[Unit<'_>]) -> Self {
         let rows = units.iter().map(|u| vec![Self::EMPTY; u.analysis.calls.len()]).collect();
-        Self::resolve(units, Self { rows, ..Self::default() })
+        Self { rows, ..Self::default() }
     }
 
     pub(crate) fn declarations(units: &[Unit<'_>]) -> Self {
@@ -553,61 +363,13 @@ impl ForwardNames {
         }
     }
 
+    pub(crate) fn complete_partitions(&mut self, project:&ProjectView, retained: &[bool]) {
+        self.collect_declarations(project.units);
+        project_resolver::resolve(project, self, retained);
+    }
+
     fn resolve(units: &[Unit<'_>], mut names: Self) -> Self {
-        let paths: HashMap<_, _> = units.iter().enumerate().map(|(i, u)| (u.path, i)).collect();
-        names.collect_declarations(units);
-        direct::resolve(units, &paths, &mut names);
-        cfamily::csharp::resolve(units, &paths, &mut names);
-        rust::resolve(units, &paths, &mut names);
-        script::resolve(units, &paths, &mut names);
-        script::public_labels(units, &mut names.public_labels);
-        for (file, u) in units.iter().enumerate() {
-            let Some(lang) = Language::for_path(u.path) else {
-                continue;
-            };
-            for (local, targets) in &u.analysis.direct {
-                names.bind(
-                    Site {
-                        file,
-                        local: *local,
-                    },
-                    targets.iter().map(|&local| Site { file, local }).collect(),
-                );
-            }
-            if lang == Language::Powershell {
-                direct::powershell::resolve(file, units, &paths, &mut names);
-                continue;
-            }
-            if lang == Language::Sql || lang.extended_name().is_some() || matches!(
-                lang,
-                Language::Rust
-                    | Language::Python
-                    | Language::Js
-                    | Language::Css
-                    | Language::Html
-                    | Language::Shell
-                    | Language::Proto
-                    | Language::C
-                    | Language::Cpp
-                    | Language::Csharp
-                    | Language::Swift
-            ) {
-                continue;
-            }
-            for (local, c) in u.analysis.calls.iter().enumerate() {
-                let call = Site { file, local };
-                let key = &u.text[c.span.clone()];
-                let targets: Vec<_> = names
-                    .by_name
-                    .get(key)
-                    .into_iter()
-                    .flatten()
-                    .filter(|s| s.file == file)
-                    .copied()
-                    .collect();
-                names.bind(call, targets);
-            }
-        }
+        names.complete_partitions(&ProjectView::new(units), &[]);
         names
     }
 }
@@ -625,15 +387,16 @@ impl Names {
         };
         // Derive the reverse directory from the complete forward relation.
         // Site order is canonical across worker orders and randomized hash seeds.
-        for (file, u) in units.iter().enumerate() {
-            for local in 0..u.analysis.calls.len() {
-                let site = Site { file, local };
-                if let Some(targets) = names.targets.get(&site) {
-                    for &target in targets {
-                        names.incoming.entry(target).or_default().push(site);
-                    }
-                }
+        let valid_source = |site: &Site| {
+            units.get(site.file).is_some_and(|unit| site.local < unit.analysis.calls.len())
+        };
+        for (&source, targets) in names.targets.iter().filter(|(site, _)| valid_source(site)) {
+            for &target in targets {
+                names.incoming.entry(target).or_default().push(source);
             }
+        }
+        for sources in names.incoming.values_mut() {
+            sources.sort_unstable();
         }
         names
     }
@@ -646,10 +409,6 @@ crate::domain::code::cache::record!(Call { is_call, span, owner });
 crate::domain::code::cache::record!(Declaration { span, kind });
 
 impl Analysis{
-    pub(crate) fn same_binding_text(&self, lang: Language, old: &str, new: &str) -> bool {
-        matches!(lang, Language::Python | Language::Js) && script::same_binding_text(self, lang, old, new)
-    }
-
 pub(crate) fn encode(&self,w:&mut Vec<u8>){ use cache::Wire;self.save(w); }
 pub(crate) fn encode_bounded(&self, w: &mut cache::BoundedOutput) {
     use cache::Wire;
@@ -675,5 +434,29 @@ mod public_bindings_tests {
         let filtered = build(&analysis);
         assert_eq!(filtered.targets, original.targets);
         assert!(filtered.incoming.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod directory_owners {
+    use super::*;
+
+    #[test]
+    fn caches_shared_ancestors_and_missing_projects() {
+        let mut cache = HashMap::new();
+        let mut probes = 0;
+        let mut resolve = |dir| {
+            nearest_owner(&mut cache, Path::new(dir), |candidate| {
+                probes += 1;
+                (candidate == Path::new("app")).then_some(1)
+            })
+        };
+        for dir in ["app/a/b/c", "app/a/b/d", "app/a/b/d"] {
+            assert_eq!(resolve(dir), Some(1));
+        }
+        for dir in ["other/a/b", "other/a/c", "other/a/c"] {
+            assert_eq!(resolve(dir), None);
+        }
+        assert_eq!(probes, 10);
     }
 }

@@ -1,6 +1,8 @@
 //! A refresh captures eligible inputs and publishes all six query products together.
 pub(crate) mod binary;
 pub(crate) mod build;
+mod catalog;
+pub(crate) use catalog::{files, scope_range};
 pub(crate) mod graph;
 pub mod layout;
 pub(crate) mod markdown_lookup;
@@ -10,7 +12,7 @@ pub(crate) mod relationship_lookup;
 pub(crate) mod symbol_lookup;
 
 use crate::domain::ObservedPath;
-use binary::{Decoder, bad, put, string};
+use binary::{bad, put, string};
 use std::{
     io::{self, Write},
     ops::Range,
@@ -27,8 +29,22 @@ pub(crate) fn same_observation(a: &[ObservedPath], b: &[ObservedPath]) -> bool {
             .zip(b)
             .all(|(a, b)| a.path == b.path && a.stamp == b.stamp)
 }
-pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE5";
+/// Both catalogs are path-sorted. Inserts and deletions shift ordinals, so a
+/// full pass can match rows with a forward cursor instead of a lookup per file.
+pub(crate) fn prior_rows<'a>(old: &'a [Entry], current: &'a [ObservedPath]) -> impl Iterator<Item = Option<usize>> + 'a {
+    let mut prior = old.iter().enumerate().peekable();
+    current.iter().map(move |row| loop {
+        let &(id, entry) = prior.peek()?;
+        match entry.path().cmp(&row.path) {
+            std::cmp::Ordering::Less => { prior.next(); }
+            std::cmp::Ordering::Equal => { prior.next(); return Some(id); }
+            std::cmp::Ordering::Greater => return None,
+        }
+    })
+}
+pub(super) const CATALOG_MAGIC: &[u8; 8] = b"CIXFILE6";
 pub struct Entry {
+    pub(crate) score_marker: bool,
     pub(crate) test_score: crate::domain::code::score::Saved,
     pub(crate) score: crate::domain::code::score::Saved,
     pub(crate) blob: Option<crate::domain::BlobId>,
@@ -56,6 +72,14 @@ impl Entry {
     pub(crate) fn stamp(&self) -> [u64; 7] {
         self.observation.stamp
     }
+    pub(crate) fn matches_observation(&self, observed: &ObservedPath) -> bool {
+        self.path() == observed.path && self.stamp() == observed.stamp
+    }
+
+    pub(crate) fn has_markdown(&self) -> bool {
+        self.bytes.is_some() && crate::domain::markdown::is_markdown(self.path())
+    }
+
     pub fn path(&self) -> &str {
         &self.observation.path
     }
@@ -77,10 +101,8 @@ impl Entry {
     }
     fn write_with_lines(&self, w: &mut impl Write, ends: &[usize]) -> io::Result<()> {
         string(w, self.path())?;
-        for s in self.observation.stamp {
-            w.write_all(&s.to_le_bytes())?;
-        }
-        w.write_all(&[u8::from(self.bytes.is_some())])?;
+        offsets::write_words(w, &self.observation.stamp)?;
+        w.write_all(&[u8::from(self.bytes.is_some()) | (u8::from(self.score_marker) << 1)])?;
         if let Some(b) = &self.bytes {
             w.write_all(&(b.end - b.start).to_le_bytes())?;
             let blob = self
@@ -92,9 +114,7 @@ impl Entry {
             w.write_all(blob.as_bytes())?;
         }
         put(w, ends.len())?;
-        for &end in ends {
-            put(w, end)?;
-        }
+        offsets::write_positions(w, ends)?;
         Self::write_score(w, &self.score)?;
         Self::write_score(w, &self.test_score)?;
         Ok(())
@@ -116,140 +136,4 @@ impl Entry {
         }
         Ok(())
     }
-}
-fn read_score(d: &mut Decoder) -> io::Result<crate::domain::code::score::Saved> {
-    Ok(match d.take(1)? {
-        [0] => None,
-        [1] => {
-            use crate::domain::code::score::{Finding, Rule, Score};
-            let lines = d.num()?;
-            let count = d.num()?;
-            let mut findings = Vec::new();
-            for _ in 0..count {
-                let rule = *Rule::ALL.get(d.take(1)?[0] as usize).ok_or_else(bad)?;
-                let line = d.num()?;
-                let value = d.num()?;
-                let unit = d.string()?.to_owned();
-                findings.push(Finding {
-                    rule,
-                    line,
-                    value,
-                    unit,
-                });
-            }
-            Some(std::sync::Arc::new(Score { lines, findings }))
-        }
-        _ => return Err(bad()),
-    })
-}
-pub(crate) fn files(bytes: &[u8], source_len: u64) -> io::Result<Vec<Entry>> {
-    let mut d = Decoder(bytes);
-    let catalog_size = bytes.len();
-    let test_scores = bytes.starts_with(CATALOG_MAGIC);
-    let scores = test_scores || bytes.starts_with(b"CIXFILE4");
-    let hashes = scores || bytes.starts_with(b"CIXFILE3");
-    let packed = hashes || bytes.starts_with(b"CIXFILE2");
-    if packed {
-        d.take(8)?;
-    }
-    let mut source_end = 0u64;
-    let count = d.num()?;
-    let mut files = Vec::new();
-    for _ in 0..count {
-        let row_start = (bytes.len() - d.0.len()) as u64;
-        let path = d.string()?.to_owned();
-        let mut stamp = [0; 7];
-        for s in &mut stamp {
-            *s = u64::from_le_bytes(d.take(8)?.try_into().unwrap());
-        }
-        let bytes = match d.take(1)? {
-            [0] => None,
-            [1] => {
-                let start = if packed { source_end } else { d.num()? as u64 };
-                let n = d.num()? as u64;
-                let end = if packed {
-                    start.checked_add(n).ok_or_else(bad)?
-                } else {
-                    n
-                };
-                source_end = end;
-                if start > end || end > source_len {
-                    return Err(bad());
-                }
-                Some(start..end)
-            }
-            _ => return Err(bad()),
-        };
-        let blob = if hashes && bytes.is_some() {
-            let len = d.take(1)?[0];
-            if !matches!(len, 20 | 32) {
-                return Err(bad());
-            }
-            let mut data = [0u8; 32];
-            data[..len as usize].copy_from_slice(d.take(len as usize)?);
-            Some(crate::domain::BlobId { bytes: data, len })
-        } else {
-            None
-        };
-        let count = d.num()?;
-        let mut line_ends = Vec::new();
-        let mut previous = 0;
-        for _ in 0..count {
-            let end = d.num()?;
-            if end <= previous || bytes.as_ref().is_none_or(|b| end as u64 > b.end - b.start) {
-                return Err(bad());
-            }
-            line_ends.push(end);
-            previous = end;
-        }
-        if files
-            .last()
-            .is_some_and(|f: &Entry| f.path() >= path.as_str())
-        {
-            return Err(bad());
-        }
-        let score = if scores { read_score(&mut d)? } else { None };
-        let test_score = if test_scores {
-            read_score(&mut d)?
-        } else {
-            None
-        };
-        files.push(Entry {
-            test_score,
-            score,
-            blob,
-            catalog_row: if test_scores {
-                row_start..(catalog_size - d.0.len()) as u64
-            } else {
-                0..0
-            },
-            original_stamp: None,
-            observation: Observation { path, stamp },
-            bytes,
-            line_ends,
-            evidence: 0..0,
-        });
-    }
-    // Older generations have no evidence directory and are rebuilt on rules mismatch.
-    if packed && source_end != source_len {
-        return Err(bad());
-    }
-    if packed || !d.0.is_empty() {
-        let mut from = d.num()? as u64;
-        for f in &mut files {
-            let word = d.num()? as u64;
-            let end = if packed {
-                from.checked_add(word).ok_or_else(bad)?
-            } else {
-                word
-            };
-            if end < from {
-                return Err(bad());
-            }
-            f.evidence = from..end;
-            from = end;
-        }
-    }
-    d.end()?;
-    Ok(files)
 }

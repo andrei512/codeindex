@@ -9,29 +9,33 @@ fn absorb(state: &mut u64, bytes: impl IntoIterator<Item = u8>) {
 }
 fn hash_path(path: &Path, state: &mut u64) {
     if path.is_dir() {
-        let mut entries: Vec<_> = fs::read_dir(path)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        entries.sort();
-        for entry in entries {
-            hash_path(&entry, state);
-        }
-    } else {
-        if path.file_name().is_some_and(|name| name == "tests.rs") {
-            return;
-        }
-        let bytes = fs::read(path).unwrap();
-        absorb(
-            state,
-            path.as_os_str()
-                .as_encoded_bytes()
-                .iter()
-                .copied()
-                .chain([0])
-                .chain((bytes.len() as u64).to_le_bytes())
-                .chain(bytes),
-        );
+        hash_directory(path, state);
+        return;
+    }
+    if path.file_name().is_some_and(|name| name == "tests.rs") {
+        return;
+    }
+    let bytes = fs::read(path).unwrap();
+    absorb(
+        state,
+        path.as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .copied()
+            .chain([0])
+            .chain((bytes.len() as u64).to_le_bytes())
+            .chain(bytes),
+    );
+}
+
+fn hash_directory(path: &Path, state: &mut u64) {
+    let mut entries: Vec<_> = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        hash_path(&entry, state);
     }
 }
 fn main() {

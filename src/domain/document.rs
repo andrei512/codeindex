@@ -42,6 +42,15 @@ pub struct BlobId {
 }
 
 impl BlobId {
+    pub(crate) fn from_raw(raw: &[u8]) -> Self {
+        let mut bytes = [0; 32];
+        bytes[..raw.len()].copy_from_slice(raw);
+        Self {
+            bytes,
+            len: raw.len() as u8,
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }

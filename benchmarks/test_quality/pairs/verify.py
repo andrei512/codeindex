@@ -21,6 +21,68 @@ def observed(proc):
     return sorted(int(n) for n in re.findall(r"CASE=(-?\d+)\b", proc.stdout))
 
 
+def container_prefix(language, work, cache):
+    image = {"go": "golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59",
+             "java": "eclipse-temurin@sha256:7a0b2bc7e1372bb05ee361fb79e8a9e822df47343b8716253b3bbaa75060653e"}[language]
+    return ["docker", "run", "--rm", "--network=none", "-v", f"{work}:/case",
+              "-v", f"{cache}:/buildcache", "-w", "/case", "-e", "CX_PAIR_MUTANT",
+              "-e", "GO111MODULE=off", "-e", "GOCACHE=/buildcache", image]
+
+
+def prepare_java(source, work, junit_dir, prefix):
+    for jar, digest in JARS.items():
+        path = junit_dir / jar
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError(f"JUnit dependency differs: {jar}")
+        shutil.copy(path, work)
+    cp = os.pathsep.join([".", *JARS])
+    subprocess.run(prefix + ["javac", "-cp", cp, source.name, "Subject.java"], cwd=work, check=True)
+    return ["java", "-cp", cp, "org.junit.runner.JUnitCore", "TransformTest"]
+
+
+class Runner:
+    def __init__(self, language, work, options, cache):
+        self.language = language
+        self.work = work
+        self.env = dict(os.environ)
+        self.env.pop("CX_PAIR_MUTANT", None)
+        self.prefix = container_prefix(language, work, cache) if language in options.docker else []
+        self.junit_dir = options.junit_dir
+
+    def prepare(self, source):
+        if self.language == "python":
+            return ["python3", "-m", "unittest", source.name]
+        if self.language in ("js", "ts"):
+            return ["node", "--test", source.name]
+        if self.language == "rust":
+            subprocess.run(["rustc", "--edition=2021", "--test", source.name, "-o", "suite"], cwd=self.work, check=True)
+            return ["./suite", "--nocapture", "--test-threads=1"]
+        if self.language == "go":
+            self.env["GO111MODULE"] = "off"
+            subprocess.run(self.prefix + ["go", "test", "-c", "-o", "suite"], cwd=self.work, env=self.env, check=True)
+            return ["./suite", "-test.v"]
+        if self.language == "java":
+            return prepare_java(source, self.work, self.junit_dir, self.prefix)
+        raise ValueError(self.language)
+
+    def verify(self, command, mutation, label):
+        env = self.env if mutation is None else {**self.env, "CX_PAIR_MUTANT": str(mutation)}
+        proc = subprocess.run(self.prefix + command, cwd=self.work, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=60)
+        calls = observed(proc)
+        if not expected_run(self.language, mutation, proc.returncode, calls):
+            raise RuntimeError(f"{label} mutant={mutation}, exit={proc.returncode}, inputs={calls}\n{proc.stdout}")
+
+
+def expected_run(language, mutation, exit_code, calls):
+    if mutation is None:
+        return exit_code == 0 and calls == INPUTS
+    # A failed assertion can stop the suite early, but cannot introduce new
+    # input values or repeat an invocation absent from the baseline.
+    return (exit_code == (101 if language == "rust" else 1)
+            and mutation in calls and calls == sorted(set(calls) & set(INPUTS)))
+
+
 def run_pair(pair, options, cache):
     if pair["kind"] == "fixture_layout":
         left = (ROOT / pair["left"]).read_text().split()
@@ -28,56 +90,20 @@ def run_pair(pair, options, cache):
         if left != right:
             raise ValueError(f"fixture layout changed more than whitespace: {pair['id']}")
     for side in ("left", "right"):
-        source = ROOT / pair[side]
-        with tempfile.TemporaryDirectory(prefix="cx-test-quality-") as tmp:
-            work = Path(tmp)
-            shutil.copy(source, work)
-            shutil.copy(ROOT / pair["subject"], work)
-            env = dict(os.environ)
-            env.pop("CX_PAIR_MUTANT", None)
-            language = pair["language"]
-            container = language in options.docker
-            prefix = []
-            if container:
-                image = {"go": "golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59",
-                         "java": "eclipse-temurin@sha256:7a0b2bc7e1372bb05ee361fb79e8a9e822df47343b8716253b3bbaa75060653e"}[language]
-                prefix = ["docker", "run", "--rm", "--network=none", "-v", f"{work}:/case",
-                          "-v", f"{cache}:/buildcache", "-w", "/case", "-e", "CX_PAIR_MUTANT",
-                          "-e", "GO111MODULE=off", "-e", "GOCACHE=/buildcache", image]
-            if language == "python":
-                cmd = ["python3", "-m", "unittest", source.name]
-            elif language in ("js", "ts"):
-                cmd = ["node", "--test", source.name]
-            elif language == "rust":
-                subprocess.run(["rustc", "--edition=2021", "--test", source.name, "-o", "suite"], cwd=work, check=True)
-                cmd = ["./suite", "--nocapture", "--test-threads=1"]
-            elif language == "go":
-                env.update(GO111MODULE="off")
-                subprocess.run(prefix + ["go", "test", "-c", "-o", "suite"], cwd=work, env=env, check=True)
-                cmd = ["./suite", "-test.v"]
-            elif language == "java":
-                for jar, digest in JARS.items():
-                    path = options.junit_dir / jar
-                    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-                        raise ValueError(f"JUnit dependency differs: {jar}")
-                    shutil.copy(path, work)
-                cp = os.pathsep.join([".", *JARS])
-                subprocess.run(prefix + ["javac", "-cp", cp, source.name, "Subject.java"], cwd=work, check=True)
-                cmd = ["java", "-cp", cp, "org.junit.runner.JUnitCore", "TransformTest"]
-            else:
-                raise ValueError(language)
-            for mutation in (None, *pair["representative_mutants"]):
-                if mutation is not None:
-                    env["CX_PAIR_MUTANT"] = str(mutation)
-                proc = subprocess.run(prefix + cmd, cwd=work, env=env, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, text=True, timeout=60)
-                calls = observed(proc)
-                ok = (proc.returncode == 0 and calls == INPUTS) if mutation is None else (
-                    proc.returncode == (101 if language == "rust" else 1) and mutation in calls)
-                if not ok:
-                    raise RuntimeError(f"{pair['id']} {side} mutant={mutation}, exit={proc.returncode}, "
-                                       f"inputs={calls}\n{proc.stdout}")
+        verify_side(pair, side, options, cache)
     print(pair["id"], "PASS", flush=True)
+
+
+def verify_side(pair, side, options, cache):
+    source = ROOT / pair[side]
+    with tempfile.TemporaryDirectory(prefix="cx-test-quality-") as tmp:
+        work = Path(tmp)
+        shutil.copy(source, work)
+        shutil.copy(ROOT / pair["subject"], work)
+        runner = Runner(pair["language"], work, options, cache)
+        command = runner.prepare(source)
+        for mutation in (None, *pair["representative_mutants"]):
+            runner.verify(command, mutation, f"{pair['id']} {side}")
 
 
 def main():

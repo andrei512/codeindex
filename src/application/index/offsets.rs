@@ -1,9 +1,11 @@
 //! Footer tables index variable-length records in a sealed product extent.
+pub(super) mod adjacent;
 use super::{
     binary::{bad, put},
     layout::ExtentSink,
 };
 use crate::domain::content_lookup::ExtentRead;
+pub(super) use crate::domain::lower_bound;
 use std::{io, ops::Range};
 pub(super) fn write_words(w: &mut impl io::Write, values: &[u64]) -> io::Result<()> {
     #[cfg(target_endian = "little")]
@@ -22,8 +24,30 @@ pub(super) fn write_words(w: &mut impl io::Write, values: &[u64]) -> io::Result<
         Ok(())
     }
 }
-pub(super) fn finish(w: &mut impl ExtentSink, start: u64, tables: [Vec<u64>; 2]) -> io::Result<()> {
-    let directory = w.offset() - start;
+/// Catalog positions use 64-bit words on disk, including on 32-bit hosts.
+pub(super) fn write_positions(w: &mut impl io::Write, positions: &[usize]) -> io::Result<()> {
+    #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+    {
+        // usize has no padding, and its native width and byte order match the catalog.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(positions.as_ptr().cast::<u8>(), std::mem::size_of_val(positions))
+        };
+        w.write_all(bytes)
+    }
+    #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
+    {
+        for &position in positions { put(w, position)?; }
+        Ok(())
+    }
+}
+pub(super) fn finish<const N:usize>(w: &mut impl ExtentSink, start: u64, tables: [Vec<u64>; N]) -> io::Result<()> {
+    write_tables(w, w.offset() - start, tables)
+}
+pub(super) fn write_tables<const N: usize>(
+    w: &mut impl io::Write,
+    directory: u64,
+    tables: [Vec<u64>; N],
+) -> io::Result<()> {
     for offsets in tables {
         put(w, offsets.len())?;
         write_words(w, &offsets)?;
@@ -48,6 +72,8 @@ pub(super) fn table(r: &mut impl ExtentRead, pos: &mut u64) -> io::Result<Range<
     }
     Ok(start..*pos)
 }
+/// Search one sorted directory by ordinal. The predicate decodes only the
+/// fields needed to decide whether a row precedes the desired boundary.
 pub(super) fn row(
     r: &mut impl ExtentRead,
     table: &Range<u64>,
@@ -58,8 +84,11 @@ pub(super) fn row(
         return Err(bad());
     }
     let at = table.start + 8 * id;
-    let from = word(r, at)?;
-    let to = word(r, at + 8)?;
+    let mut pair = [0; 16];
+    r.read(at, &mut pair)?;
+    let (from, to) = pair.split_at(8);
+    let from = u64::from_le_bytes(from.try_into().unwrap());
+    let to = u64::from_le_bytes(to.try_into().unwrap());
     if from > to || to > row_end {
         return Err(bad());
     }

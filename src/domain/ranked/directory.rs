@@ -3,7 +3,9 @@
 //! in unrelated leaves. Each node owns its small header; child subtrees
 //! can be borrowed intact from a predecessor.
 use super::{patch::Patch, storage::invalid};
-use std::{collections::HashMap, io, ops::Range};
+mod lookup;
+pub(super) use lookup::{Cursor, Subtree};
+use std::{io, ops::Range};
 
 const LEAF: usize = 64;
 const BRANCH: usize = 16;
@@ -12,9 +14,7 @@ pub(super) const HEADER: usize = 16;
 #[derive(Default)]
 pub(super) struct Node {
     children: Children,
-    count: usize,
-    sum: u64,
-    size: usize,
+    metadata: Metadata,
     old: Option<Range<u64>>,
 }
 enum Children {
@@ -26,22 +26,82 @@ impl Default for Children {
         Self::Leaf(Vec::new())
     }
 }
+#[derive(Clone, Copy)]
 pub(super) enum Edit {
     Set(u64),
     Insert(u64),
     Remove,
 }
+impl Edit {
+    fn apply_leaf(self, v: &mut Vec<u64>, index: usize) -> io::Result<bool> {
+        if let Edit::Set(value) = self {
+            let slot = v.get_mut(index).ok_or_else(invalid)?;
+            return Ok(std::mem::replace(slot, value) != value);
+        }
+        match self {
+            Edit::Insert(value) if index <= v.len() => v.insert(index, value),
+            Edit::Remove if index < v.len() => { v.remove(index); }
+            _ => return Err(invalid()),
+        }
+        Ok(true)
+    }
+}
 fn word(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
 }
-fn usize_at(bytes: &[u8]) -> io::Result<usize> {
-    usize::try_from(word(bytes)).map_err(|_| invalid())
+enum Shape {
+    Leaf(usize),
+    Branch(usize),
 }
-fn header(bytes: &[u8]) -> io::Result<(u8, usize)> {
-    match *bytes {
-        [0, n] if usize::from(n) <= LEAF => Ok((0, usize::from(n))),
-        [1, n] if n > 0 && usize::from(n) <= BRANCH => Ok((1, usize::from(n))),
-        _ => Err(invalid()),
+
+impl Shape {
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        match *bytes {
+            [0, n] if usize::from(n) <= LEAF => Ok(Self::Leaf(usize::from(n))),
+            [1, n] if n > 0 && usize::from(n) <= BRANCH => Ok(Self::Branch(usize::from(n))),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Metadata {
+    slots: usize,
+    sum: u64,
+    bytes: u64,
+}
+
+impl Metadata {
+    const SIZE: usize = 24;
+
+    fn advance(self, child: Self) -> io::Result<Self> {
+        Ok(Self {
+            slots: self.slots.checked_add(child.slots).ok_or_else(invalid)?,
+            sum: self.sum.checked_add(child.sum).ok_or_else(invalid)?,
+            bytes: self.bytes.checked_add(child.bytes).ok_or_else(invalid)?,
+        })
+    }
+
+    fn branch_header(width: usize) -> Self {
+        Self { bytes: 2 + (Self::SIZE * width) as u64, ..Self::default() }
+    }
+
+    fn encode(self, bytes: &mut Vec<u8>) {
+        for word in [self.slots as u64, self.sum, self.bytes] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    fn decode(row: &[u8]) -> io::Result<Self> {
+        let bytes = usize::try_from(word(&row[16..])).map_err(|_| invalid())?;
+        if bytes < 2 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            slots: usize::try_from(word(&row[..8])).map_err(|_| invalid())?,
+            sum: word(&row[8..16]),
+            bytes: bytes as u64,
+        })
     }
 }
 
@@ -56,13 +116,17 @@ impl Node {
     }
     fn refresh(&mut self) {
         self.old = None;
-        (self.count, self.sum, self.size) = match &self.children {
-            Children::Leaf(values) => (values.len(), values.iter().sum(), 2 + 8 * values.len()),
-            Children::Branch(nodes) => (
-                nodes.iter().map(|n| n.count).sum(),
-                nodes.iter().map(|n| n.sum).sum(),
-                2 + 24 * nodes.len() + nodes.iter().map(|n| n.size).sum::<usize>(),
-            ),
+        self.metadata = match &self.children {
+            Children::Leaf(values) => Metadata {
+                slots: values.len(),
+                sum: values.iter().sum(),
+                bytes: 2 + 8 * values.len() as u64,
+            },
+            Children::Branch(nodes) => nodes.iter()
+                .try_fold(Metadata::branch_header(nodes.len()), |total, child| {
+                    total.advance(child.metadata)
+                })
+                .expect("directory already fits in memory and indexes representable record offsets"),
         };
     }
     fn width(&self) -> usize {
@@ -113,70 +177,61 @@ impl Node {
         self.refresh();
         Some(Self::from(right))
     }
-    fn touch(&mut self, mut index: usize, edit: Edit) -> io::Result<bool> {
-        match &mut self.children {
-            Children::Leaf(v) => match edit {
-                Edit::Set(x) => {
-                    let prev = v.get_mut(index).ok_or_else(invalid)?;
-                    if *prev == x {
-                        return Ok(false);
-                    }
-                    *prev = x;
-                }
-                Edit::Insert(x) => {
-                    if index > v.len() {
-                        return Err(invalid());
-                    }
-                    v.insert(index, x);
-                }
-                Edit::Remove => {
-                    if index >= v.len() {
-                        return Err(invalid());
-                    }
-                    v.remove(index);
-                }
-            },
-            Children::Branch(v) => {
-                let at = v.iter().position(|n| {
-                    if index < n.count {
-                        true
-                    } else {
-                        index -= n.count;
-                        false
-                    }
-                });
-                let at = match at {
-                    Some(i) => i,
-                    None if matches!(edit, Edit::Insert(_)) && index == 0 => {
-                        let last = v.len() - 1;
-                        index = v[last].count;
-                        last
-                    }
-                    None => return Err(invalid()),
-                };
-                let deleting = matches!(edit, Edit::Remove);
-                if !v[at].touch(index, edit)? {
-                    return Ok(false);
-                }
-                if let Some(right) = v[at].split() {
-                    v.insert(at + 1, right);
-                } else if deleting && v.len() > 1 && v[at].width() < v[at].capacity() / 4 {
-                    let first = at.min(v.len() - 2);
-                    let right = v.remove(first + 1);
-                    match (&mut v[first].children, right.children) {
-                        (Children::Leaf(a), Children::Leaf(b)) => a.extend(b),
-                        (Children::Branch(a), Children::Branch(b)) => a.extend(b),
-                        _ => return Err(invalid()),
-                    }
-                    v[first].refresh();
-                    if let Some(right) = v[first].split() {
-                        v.insert(first + 1, right);
-                    }
-                }
-            }
+    fn touch(&mut self, index: usize, edit: Edit) -> io::Result<bool> {
+        let changed = match &mut self.children {
+            Children::Leaf(v) => edit.apply_leaf(v, index)?,
+            Children::Branch(v) => Self::edit_child(v, index, edit)?,
+        };
+        if changed {
+            self.refresh();
         }
-        self.refresh();
+        Ok(changed)
+    }
+
+    fn edit_child(nodes: &mut Vec<Node>, mut index: usize, edit: Edit) -> io::Result<bool> {
+        // The last child owns the end insertion point. Its leaf validates
+        // out-of-range edits before mutating anything.
+        let last = nodes.len() - 1;
+        let mut at = 0;
+        while at < last && index >= nodes[at].metadata.slots {
+            index -= nodes[at].metadata.slots;
+            at += 1;
+        }
+        if !nodes[at].touch(index, edit)? {
+            return Ok(false);
+        }
+        if matches!(edit, Edit::Insert(_)) {
+            Self::split_child(nodes, at);
+        }
+        if matches!(edit, Edit::Remove) && last > 0 && nodes[at].underfull() {
+            Self::rebalance_pair(nodes, at.min(last - 1))?;
+        }
         Ok(true)
+    }
+    fn underfull(&self) -> bool {
+        self.width() < self.capacity() / 4
+    }
+
+    fn split_child(nodes: &mut Vec<Node>, at: usize) -> bool {
+        let Some(right) = nodes[at].split() else {
+            return false;
+        };
+        nodes.insert(at + 1, right);
+        true
+    }
+
+    fn rebalance_pair(nodes: &mut Vec<Node>, first: usize) -> io::Result<()> {
+        let right = nodes.remove(first + 1);
+        let left = &mut nodes[first];
+        match (&mut left.children, right.children) {
+            (Children::Leaf(a), Children::Leaf(b)) => a.extend(b),
+            (Children::Branch(a), Children::Branch(b)) => a.extend(b),
+            _ => return Err(invalid()),
+        }
+        if !Self::split_child(nodes, first) {
+            nodes[first].refresh();
+        }
+        Ok(())
     }
     pub(super) fn edit(&mut self, index: usize, edit: Edit) -> io::Result<()> {
         self.touch(index, edit)?;
@@ -192,293 +247,253 @@ impl Node {
         }
         Ok(())
     }
-    fn encode_header(&self) -> Vec<u8> {
-        let mut out = vec![
-            if matches!(self.children, Children::Leaf(_)) {
-                0
-            } else {
-                1
-            },
-            self.width() as u8,
-        ];
+    fn encode_header<'b>(&self, buffer: &'b mut Vec<u8>) -> &'b [u8] {
+        buffer.clear();
+        buffer.push(u8::from(matches!(self.children, Children::Branch(_))));
+        buffer.push(self.width() as u8);
         match &self.children {
-            Children::Leaf(v) => {
-                let mut sum = 0u64;
-                for n in v {
-                    sum += *n;
-                    out.extend_from_slice(&sum.to_le_bytes());
-                }
-            }
-            Children::Branch(v) => {
-                for n in v {
-                    for x in [n.count as u64, n.sum, n.size as u64] {
-                        out.extend_from_slice(&x.to_le_bytes())
-                    }
-                }
-            }
+            Children::Leaf(weights) => encode_endpoints(weights, buffer),
+            Children::Branch(nodes) => nodes.iter().for_each(|node| node.metadata.encode(buffer)),
         }
-        out
+        buffer
     }
-    fn append(&self, out: &mut Patch) {
-        if let Some(r) = self.old.clone() {
-            out.borrow(r);
-            return;
-        }
-        out.write(&self.encode_header());
-        if let Children::Branch(nodes) = &self.children {
+    /// A retained subtree already includes its children in their serialized order.
+    fn visit<E>(&self, emit: &mut impl FnMut(&Node) -> Result<bool, E>) -> Result<(), E> {
+        if emit(self)?
+            && let Children::Branch(nodes) = &self.children
+        {
             for child in nodes {
-                child.append(out)
-            }
-        }
-    }
-    fn write(&self, out: &mut impl io::Write) -> io::Result<()> {
-        out.write_all(&self.encode_header())?;
-        if let Children::Branch(nodes) = &self.children {
-            for child in nodes {
-                child.write(out)?
+                child.visit(emit)?;
             }
         }
         Ok(())
     }
-    fn load(bytes: &[u8], offset: u64, depth: usize) -> io::Result<Self> {
+    fn write(&self, out: &mut impl io::Write, buffer: &mut Vec<u8>) -> io::Result<()> {
+        self.visit(&mut |node| {
+            out.write_all(node.encode_header(buffer))?;
+            Ok::<_, io::Error>(true)
+        })
+    }
+    fn append(&self, patch: &mut Patch, buffer: &mut Vec<u8>) {
+        let Ok(()) = self.visit(&mut |node| {
+            if let Some(range) = &node.old {
+                patch.borrow(range.clone());
+                return Ok(false);
+            }
+            patch.write(node.encode_header(buffer));
+            Ok::<_, std::convert::Infallible>(true)
+        });
+    }
+}
+
+fn encode_endpoints(weights: &[u64], output: &mut Vec<u8>) {
+    let mut end = 0u64;
+    for weight in weights {
+        end += weight;
+        output.extend_from_slice(&end.to_le_bytes());
+    }
+}
+
+/// The same decoder can validate a tree or retain its nodes and record offsets
+/// for an incremental edit. Validation only needs the running count and address.
+struct Decoder {
+    end: u64,
+    count: usize,
+    offsets: Option<Vec<u64>>,
+    leaf_depth: Option<usize>,
+}
+
+impl Decoder {
+    fn new(first: u64, entries: Option<usize>) -> Self {
+        let offsets = entries.map(|count| {
+            let mut v = Vec::with_capacity(count + 1);
+            v.push(first);
+            v
+        });
+        Self {
+            end: first,
+            count: 0,
+            offsets,
+            leaf_depth: None,
+        }
+    }
+
+    fn node(
+        &mut self,
+        bytes: &[u8],
+        offset: u64,
+        depth: usize,
+        parent: Option<Metadata>,
+    ) -> io::Result<Option<Node>> {
         if depth > 32 {
             return Err(invalid());
         }
-        let (kind, n) = header(bytes.get(..2).ok_or_else(invalid)?)?;
-        let rest = &bytes[2..];
-        let children = if kind == 0 {
-            if rest.len() != n * 8 {
-                return Err(invalid());
-            }
-            let mut last = 0;
-            let mut v = Vec::with_capacity(n);
-            for b in rest.chunks_exact(8) {
-                let end = word(b);
-                v.push(end.checked_sub(last).ok_or_else(invalid)?);
-                last = end;
-            }
-            Children::Leaf(v)
-        } else {
-            let (head, mut data) = rest.split_at_checked(n * 24).ok_or_else(invalid)?;
-            let mut start = offset + 2 + n as u64 * 24;
-            let mut nodes = Vec::with_capacity(n);
-            for d in head.chunks_exact(24) {
-                let size = usize_at(&d[16..])?;
-                let (sub, tail) = data.split_at_checked(size).ok_or_else(invalid)?;
-                let child = Self::load(sub, start, depth + 1)?;
-                if child.count != usize_at(&d[..8])? || child.sum != word(&d[8..16]) {
-                    return Err(invalid());
-                }
-                nodes.push(child);
-                start += size as u64;
-                data = tail;
-            }
-            if !data.is_empty() {
-                return Err(invalid());
-            }
-            // Check sums before refresh aggregates them.
-            nodes
-                .iter()
-                .try_fold(0u64, |s, n| s.checked_add(n.sum).ok_or_else(invalid))?;
-            Children::Branch(nodes)
+        let shape = Shape::decode(bytes.get(..2).ok_or_else(invalid)?)?;
+        let start = self.end;
+        let count = self.count;
+        let children = match shape {
+            Shape::Leaf(width) => self.leaf(&bytes[2..], width, depth)?,
+            Shape::Branch(width) => self.branch(&bytes[2..], width, offset, depth)?,
         };
-        let mut node = Self::from(children);
-        node.old = Some(offset..offset + bytes.len() as u64);
-        Ok(node)
-    }
-    fn offsets(&self, start: u64) -> io::Result<Vec<u64>> {
-        fn visit(n: &Node, out: &mut Vec<u64>) -> io::Result<()> {
-            match &n.children {
-                Children::Leaf(v) => {
-                    for weight in v {
-                        out.push(
-                            out.last()
-                                .unwrap()
-                                .checked_add(*weight)
-                                .ok_or_else(invalid)?,
-                        );
-                    }
-                }
-                Children::Branch(v) => {
-                    for node in v {
-                        visit(node, out)?
-                    }
-                }
-            }
-            Ok(())
+        let metadata = Metadata {
+            slots: self.count - count,
+            sum: self.end - start,
+            bytes: bytes.len() as u64,
+        };
+        if parent.is_some_and(|expected| expected != metadata) {
+            return Err(invalid());
         }
-        let mut offsets = Vec::with_capacity(self.count + 1);
-        offsets.push(start);
-        visit(self, &mut offsets)?;
-        Ok(offsets)
+        Ok(children.map(|children| Node {
+            children,
+            metadata,
+            old: Some(offset..offset + metadata.bytes),
+        }))
+    }
+
+    fn leaf(&mut self, data: &[u8], n: usize, depth: usize) -> io::Result<Option<Children>> {
+        // Rebalancing can only merge nodes of the same height.
+        if data.len() != n * 8 || *self.leaf_depth.get_or_insert(depth) != depth {
+            return Err(invalid());
+        }
+        let first = self.end;
+        let mut weights = self.offsets.as_ref().map(|_| Vec::with_capacity(n));
+        for b in data.chunks_exact(8) {
+            let end = first.checked_add(word(b)).ok_or_else(invalid)?;
+            let weight = end.checked_sub(self.end).ok_or_else(invalid)?;
+            if let Some((weights, offsets)) = weights.as_mut().zip(self.offsets.as_mut()) {
+                weights.push(weight);
+                offsets.push(end);
+            }
+            self.end = end;
+        }
+        self.count += n;
+        Ok(weights.map(Children::Leaf))
+    }
+
+    fn branch(
+        &mut self,
+        bytes: &[u8],
+        n: usize,
+        offset: u64,
+        depth: usize,
+    ) -> io::Result<Option<Children>> {
+        let (headers, mut data) = bytes
+            .split_at_checked(n * Metadata::SIZE)
+            .ok_or_else(invalid)?;
+        let mut at = offset + 2 + headers.len() as u64;
+        let mut nodes = self.offsets.as_ref().map(|_| Vec::with_capacity(n));
+        for row in headers.chunks_exact(Metadata::SIZE) {
+            let header = Metadata::decode(row)?;
+            let (child, tail) = data.split_at_checked(header.bytes as usize).ok_or_else(invalid)?;
+            let node = self.node(child, at, depth + 1, Some(header))?;
+            if let Some(nodes) = &mut nodes {
+                nodes.push(node.unwrap());
+            }
+            at += header.bytes;
+            data = tail;
+        }
+        if !data.is_empty() {
+            return Err(invalid());
+        }
+        Ok(nodes.map(Children::Branch))
     }
 }
-pub(super) fn capacity_header<'a>(trees: impl Iterator<Item = &'a Node>) -> Vec<u8> {
-    let mut h = Vec::with_capacity(HEADER);
-    for t in trees {
-        h.extend_from_slice(&(t.size as u64).to_le_bytes())
+/// The file and term tree share one pair of byte-length fields on disk.
+pub(super) fn tree_ranges(header: &[u8; HEADER], at: u64) -> io::Result<[Range<u64>; 2]> {
+    let first = at.checked_add(HEADER as u64).ok_or_else(invalid)?;
+    let middle = first.checked_add(word(&header[..8])).ok_or_else(invalid)?;
+    let end = middle.checked_add(word(&header[8..])).ok_or_else(invalid)?;
+    Ok([first..middle, middle..end])
+}
+fn capacity_header(trees: &[Node; 2]) -> [u8; HEADER] {
+    let mut header = [0; HEADER];
+    for (bytes, tree) in header.chunks_exact_mut(8).zip(trees) {
+        bytes.copy_from_slice(&tree.metadata.bytes.to_le_bytes());
     }
-    h
+    header
 }
 pub(super) fn write(trees: &[Node; 2], out: &mut impl io::Write) -> io::Result<()> {
-    out.write_all(&capacity_header(trees.iter()))?;
-    for t in trees {
-        t.write(out)?
+    out.write_all(&capacity_header(trees))?;
+    let mut buffer = Vec::new();
+    for tree in trees {
+        tree.write(out, &mut buffer)?;
     }
     Ok(())
 }
 pub(super) fn append(trees: &[Node; 2], patch: &mut Patch) {
-    patch.write(&capacity_header(trees.iter()));
-    for t in trees {
-        t.append(patch)
+    patch.write(&capacity_header(trees));
+    let mut buffer = Vec::new();
+    for tree in trees {
+        tree.append(patch, &mut buffer);
     }
 }
+pub(super) type Expanded = ([Node; 2], [Vec<u64>; 2]);
 pub(super) fn load(
     bytes: &[u8],
     start: u64,
     firsts: [u64; 2],
     counts: [usize; 2],
-) -> io::Result<([Node; 2], [Vec<u64>; 2])> {
-    let (h, mut data) = bytes.split_at_checked(HEADER).ok_or_else(invalid)?;
-    start.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
-    let mut offset = start + HEADER as u64;
-    let mut trees = [Node::default(), Node::default()];
-    let mut values = [Vec::new(), Vec::new()];
-    for (i, d) in h.chunks_exact(8).enumerate() {
-        let len = usize_at(d)?;
-        let (sub, tail) = data.split_at_checked(len).ok_or_else(invalid)?;
-        let tree = Node::load(sub, offset, 0)?;
-        if tree.count != counts[i] {
+) -> io::Result<Expanded> {
+    let [files, terms] = DirectoryInput::new(bytes, start, firsts, counts)?.trees;
+    let (files, file_offsets) = files.expand()?;
+    let (terms, term_offsets) = terms.expand()?;
+    Ok(([files, terms], [file_offsets, term_offsets]))
+}
+
+pub(super) fn validate(bytes: &[u8], firsts: [u64; 2], counts: [usize; 2]) -> io::Result<[u64; 2]> {
+    let [files, terms] = DirectoryInput::new(bytes, 0, firsts, counts)?.trees;
+    Ok([files.decode(None)?.0.end, terms.decode(None)?.0.end])
+}
+
+struct TreeInput<'a> {
+    bytes: &'a [u8],
+    offset: u64,
+    first: u64,
+    count: usize,
+}
+
+impl TreeInput<'_> {
+    fn decode(self, entries: Option<usize>) -> io::Result<(Decoder, Option<Node>)> {
+        if self.count > self.bytes.len() / 8 {
             return Err(invalid());
         }
-        values[i] = tree.offsets(firsts[i])?;
-        trees[i] = tree;
-        offset += len as u64;
-        data = tail;
-    }
-    if !data.is_empty() {
-        return Err(invalid());
-    }
-    Ok((trees, values))
-}
-type Reader<'a> = dyn FnMut(u64, &mut [u8]) -> io::Result<()> + 'a;
-struct Branch {
-    entries: Vec<[u64; 3]>,
-}
-#[derive(Default)]
-pub(super) struct Cursor {
-    branches: HashMap<u64, Branch>,
-}
-impl Cursor {
-    /// Return a record's start and end, with a zero-length sentinel at count.
-    pub(super) fn range(
-        &mut self,
-        read: &mut Reader<'_>,
-        mut tree: Range<u64>,
-        mut slot: usize,
-        mut count: usize,
-        mut start: u64,
-    ) -> io::Result<Range<u64>> {
-        if slot > count {
+        let mut decoder = Decoder::new(self.first, entries);
+        let root = decoder.node(self.bytes, self.offset, 0, None)?;
+        if decoder.count != self.count {
             return Err(invalid());
         }
-        for _ in 0..32 {
-            if tree.len_checked()? < 2 {
-                return Err(invalid());
-            }
-            if !self.branches.contains_key(&tree.start) {
-                let mut h = [0; 2];
-                read(tree.start, &mut h)?;
-                let (kind, n) = header(&h)?;
-                if kind == 0 {
-                    if n != count || tree.len_checked()? != 2 + 8 * n as u64 {
-                        return Err(invalid());
-                    }
-                    if n == 0 {
-                        return Ok(start..start);
-                    }
-                    let mut pair = [0; 16];
-                    let (a, b) = if slot == 0 {
-                        read(tree.start + 2, &mut pair[..8])?;
-                        (0, word(&pair[..8]))
-                    } else if slot == count {
-                        read(tree.start + 2 + 8 * (slot - 1) as u64, &mut pair[..8])?;
-                        let pos = word(&pair[..8]);
-                        (pos, pos)
-                    } else {
-                        read(tree.start + 2 + 8 * (slot - 1) as u64, &mut pair)?;
-                        (word(&pair[..8]), word(&pair[8..]))
-                    };
-                    if a > b {
-                        return Err(invalid());
-                    }
-                    return Ok(start.checked_add(a).ok_or_else(invalid)?
-                        ..start.checked_add(b).ok_or_else(invalid)?);
-                }
-                if 2 + 24 * n as u64 > tree.len_checked()? {
-                    return Err(invalid());
-                }
-                let mut data = vec![0; 24 * n];
-                read(tree.start + 2, &mut data)?;
-                let entries = data
-                    .chunks_exact(24)
-                    .map(|b| [word(&b[..8]), word(&b[8..16]), word(&b[16..])])
-                    .collect::<Vec<_>>();
-                let mut slots = 0u64;
-                let mut bytes = 2 + 24 * n as u64;
-                let mut total = 0u64;
-                for &[child_slots, child_total, child_bytes] in &entries {
-                    if child_bytes < 2 {
-                        return Err(invalid());
-                    }
-                    slots = slots.checked_add(child_slots).ok_or_else(invalid)?;
-                    bytes = bytes.checked_add(child_bytes).ok_or_else(invalid)?;
-                    total = total.checked_add(child_total).ok_or_else(invalid)?;
-                }
-                if slots != count as u64
-                    || bytes != tree.len_checked()?
-                    || start.checked_add(total).is_none()
-                {
-                    return Err(invalid());
-                }
-                self.branches.insert(tree.start, Branch { entries });
-            }
-            let old = tree.clone();
-            let entries = &self.branches[&old.start].entries;
-            let mut child_at = old.start + 2 + 24 * entries.len() as u64;
-            let mut found = false;
-            for (i, &[slots, sum, bytes]) in entries.iter().enumerate() {
-                let stop = child_at
-                    .checked_add(bytes)
-                    .filter(|&v| v <= old.end)
-                    .ok_or_else(invalid)?;
-                let slots = usize::try_from(slots).map_err(|_| invalid())?;
-                if slot < slots || i + 1 == entries.len() && slot == slots {
-                    tree = child_at..stop;
-                    count = slots;
-                    found = true;
-                    break;
-                }
-                slot = slot.checked_sub(slots).ok_or_else(invalid)?;
-                start = start.checked_add(sum).ok_or_else(invalid)?;
-                child_at = stop;
-            }
-            if !found {
-                return Err(invalid());
-            }
-        }
-        Err(invalid())
+        Ok((decoder, root))
     }
-}
-trait RangeLen {
-    fn len_checked(&self) -> io::Result<u64>;
-}
-impl RangeLen for Range<u64> {
-    fn len_checked(&self) -> io::Result<u64> {
-        self.end.checked_sub(self.start).ok_or_else(invalid)
+
+    fn expand(self) -> io::Result<(Node, Vec<u64>)> {
+        let count = self.count;
+        let (decoder, root) = self.decode(Some(count))?;
+        Ok((root.unwrap(), decoder.offsets.unwrap()))
     }
 }
 
+struct DirectoryInput<'a> {
+    trees: [TreeInput<'a>; 2],
+}
+
+impl<'a> DirectoryInput<'a> {
+    fn new(bytes: &'a [u8], start: u64, firsts: [u64; 2], counts: [usize; 2]) -> io::Result<Self> {
+        let (header, data) = bytes.split_at_checked(HEADER).ok_or_else(invalid)?;
+        let end = start.checked_add(bytes.len() as u64).ok_or_else(invalid)?;
+        let [files, terms] = tree_ranges(header.try_into().unwrap(), start)?;
+        if terms.end != end {
+            return Err(invalid());
+        }
+        let (file_bytes, term_bytes) = data.split_at((files.end - files.start) as usize);
+        let trees = std::array::from_fn(|i| TreeInput {
+            bytes: [file_bytes, term_bytes][i],
+            offset: [files.start, terms.start][i],
+            first: firsts[i],
+            count: counts[i],
+        });
+        Ok(Self { trees })
+    }
+}
 pub(super) fn var_len(n: usize) -> u64 {
     ((usize::BITS - n.leading_zeros()).max(1) as u64).div_ceil(7)
 }
@@ -488,12 +503,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_expands_directory_offsets_from_each_first_record_address() {
+        let mut offsets = vec![19];
+        for i in 0..LEAF * BRANCH + 7 {
+            offsets.push(offsets.last().unwrap() + (i % 5) as u64);
+        }
+        let trees = [Node::from_offsets(&offsets), Node::from_offsets(&[])];
+        let mut bytes = Vec::new();
+        write(&trees, &mut bytes).unwrap();
+        let counts = [offsets.len() - 1, 0];
+        let (_, actual) = load(&bytes, 103, [19, 79], counts).unwrap();
+        assert_eq!(actual, [offsets, vec![79]]);
+        assert!(load(&bytes, 103, [u64::MAX - 1, 79], counts).is_err());
+        assert!(load(&bytes, 103, [19, 79], [usize::MAX, 0]).is_err());
+    }
+
+    #[test]
+    fn validation_and_expanded_edits_agree_on_corrupt_directories() {
+        let offsets: Vec<_> = (0..=LEAF * BRANCH + 17).map(|i| 3 * i as u64).collect();
+        let trees = [Node::from_offsets(&offsets), Node::from_offsets(&[0, 3, 6])];
+        let counts = [offsets.len() - 1, 2];
+        let starts = [16, 10000];
+        let mut bytes = Vec::new();
+        write(&trees, &mut bytes).unwrap();
+        let expected = validate(&bytes, starts, counts).unwrap();
+        assert_eq!(expected, [16 + 3 * counts[0] as u64, 10006]);
+        // Include capacity headers, branch headers, leaf weights and tail lengths.
+        for at in (0..bytes.len()).step_by(7) {
+            bytes[at] ^= 0x80;
+            let checked = validate(&bytes, starts, counts);
+            let expanded = load(&bytes, 0, starts, counts)
+                .map(|(_, offsets)| offsets.map(|v| *v.last().unwrap()));
+            assert_eq!(checked.ok(), expanded.ok(), "byte {at}");
+            bytes[at] ^= 0x80;
+        }
+    }
+    #[test]
+    fn mixed_leaf_depth_is_rejected_before_an_edit_can_rebalance_incompatible_siblings() {
+        let tree = Node::from(Children::Branch(vec![
+            Node::from(Children::Leaf(vec![2; 8])),
+            Node::from(Children::Branch(vec![Node::from(Children::Leaf(vec![
+                1;
+                5
+            ]))])),
+        ]));
+        let mut bytes = Vec::new();
+        write(&[tree, Node::from_offsets(&[])], &mut bytes).unwrap();
+        assert!(validate(&bytes, [0, 0], [13, 0]).is_err());
+        assert!(load(&bytes, 0, [0, 0], [13, 0]).is_err());
+    }
+
+    #[test]
     fn persistent_tree_limits_changed_bytes_and_finds_all_records_after_splits_and_merges() {
         let mut values = vec![4u64; 4_097];
         let offsets: Vec<_> = (0..=values.len()).map(|i| 4 * i as u64).collect();
         let mut original = Vec::new();
-        Node::from_offsets(&offsets).write(&mut original).unwrap();
-        let mut tree = Node::load(&original, 0, 0).unwrap();
+        Node::from_offsets(&offsets)
+            .write(&mut original, &mut Vec::new())
+            .unwrap();
+        let mut tree = Decoder::new(0, Some(0))
+            .node(&original, 0, 0, None)
+            .unwrap()
+            .unwrap();
         for i in 0..96 {
             tree.edit(100, Edit::Insert(i)).unwrap();
             values.insert(100, i);
@@ -505,7 +576,49 @@ mod tests {
         tree.edit(11, Edit::Set(17)).unwrap();
         values[11] = 17;
         let mut plan = Patch::default();
-        tree.append(&mut plan);
+        tree.append(&mut plan, &mut Vec::new());
+        let (mut bytes, written) = materialize_patch(plan, &original);
+        assert!(written < original.len() / 5);
+        let mut cursor = Cursor::default();
+        let mut last = 0;
+        for (i, &weight) in values.iter().chain(std::iter::once(&0)).enumerate() {
+            let r = cursor
+                .range(
+                    &mut |off, dst| {
+                        dst.copy_from_slice(&bytes[off as usize..off as usize + dst.len()]);
+                        Ok(())
+                    },
+                    Subtree {
+                        bytes: 0..bytes.len() as u64,
+                        count: values.len(),
+                        start: 0,
+                    },
+                    i,
+                )
+                .unwrap();
+            assert_eq!(r, last..last + weight);
+            last += weight;
+        }
+        bytes[2..10].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!((Decoder::new(0, None)).node(&bytes, 0, 0, None).is_err());
+        assert!(
+            Cursor::default()
+                .range(
+                    &mut |off, dst| {
+                        dst.copy_from_slice(&bytes[off as usize..off as usize + dst.len()]);
+                        Ok(())
+                    },
+                    Subtree {
+                        bytes: 0..bytes.len() as u64,
+                        count: values.len(),
+                        start: 0
+                    },
+                    0
+                )
+                .is_err()
+        );
+    }
+    fn materialize_patch(plan: Patch, original: &[u8]) -> (Vec<u8>, usize) {
         let mut bytes = Vec::new();
         let mut written = 0;
         for p in plan.pieces {
@@ -519,40 +632,7 @@ mod tests {
                 }
             }
         }
-        assert!(written < original.len() / 5);
-        let mut cursor = Cursor::default();
-        let mut last = 0;
-        for (i, &weight) in values.iter().chain(std::iter::once(&0)).enumerate() {
-            let r = cursor
-                .range(
-                    &mut |off, dst| {
-                        dst.copy_from_slice(&bytes[off as usize..off as usize + dst.len()]);
-                        Ok(())
-                    },
-                    0..bytes.len() as u64,
-                    i,
-                    values.len(),
-                    0,
-                )
-                .unwrap();
-            assert_eq!(r, last..last + weight);
-            last += weight;
-        }
-        bytes[2..10].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(Node::load(&bytes, 0, 0).is_err());
-        assert!(
-            Cursor::default()
-                .range(
-                    &mut |off, dst| {
-                        dst.copy_from_slice(&bytes[off as usize..off as usize + dst.len()]);
-                        Ok(())
-                    },
-                    0..bytes.len() as u64,
-                    0,
-                    values.len(),
-                    0
-                )
-                .is_err()
-        );
+        (bytes, written)
     }
+
 }

@@ -36,19 +36,22 @@ pub(super) fn digest(header: &[u8], data: &[u8], sha256: bool) -> BlobId {
             0x5be0cd19,
         ];
         blocks(header, data, |block| sha256_block(&mut state, block));
-        for (word, out) in state.iter().zip(bytes.chunks_exact_mut(4)) {
-            out.copy_from_slice(&word.to_be_bytes());
-        }
+        write_words(&state, &mut bytes);
     } else {
         let mut state = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
         sha1_blocks(&mut state, header, data);
-        for (word, out) in state.iter().zip(bytes.chunks_exact_mut(4)) {
-            out.copy_from_slice(&word.to_be_bytes());
-        }
+        write_words(&state, &mut bytes);
     }
     BlobId {
         bytes,
         len: if sha256 { 32 } else { 20 },
+    }
+}
+
+#[inline]
+fn write_words(words: &[u32], bytes: &mut [u8; 32]) {
+    for (word, out) in words.iter().zip(bytes.as_chunks_mut::<4>().0) {
+        *out = word.to_be_bytes();
     }
 }
 
@@ -75,22 +78,7 @@ unsafe fn arm_sha1_blocks(state: &mut [u32; 5], header: &[u8], data: &[u8]) {
             let raw = unsafe { vld1q_u8(block.as_ptr().add(i * 16)) };
             vreinterpretq_u32_u8(vrev32q_u8(raw))
         });
-        for group in 0..20 {
-            let lane = group % 4;
-            let wk = vaddq_u32(words[lane], k[group / 5]);
-            if group < 16 {
-                let start =
-                    vsha1su0q_u32(words[lane], words[(lane + 1) % 4], words[(lane + 2) % 4]);
-                words[lane] = vsha1su1q_u32(start, words[(lane + 3) % 4]);
-            }
-            let next_e = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
-            abcd = match group / 5 {
-                0 => vsha1cq_u32(abcd, e, wk),
-                2 => vsha1mq_u32(abcd, e, wk),
-                _ => vsha1pq_u32(abcd, e, wk),
-            };
-            e = next_e;
-        }
+        (abcd, e) = unsafe { arm_sha1_rounds((abcd, e), &mut words, k) };
         abcd = vaddq_u32(abcd, initial_abcd);
         e = e.wrapping_add(initial_e);
     });
@@ -98,7 +86,43 @@ unsafe fn arm_sha1_blocks(state: &mut [u32; 5], header: &[u8], data: &[u8]) {
     state[4] = e;
 }
 
-fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2")]
+#[inline]
+unsafe fn arm_sha1_schedule_next(words: &mut [std::arch::aarch64::uint32x4_t; 4], group: usize) {
+    use std::arch::aarch64::*;
+    if group < 16 {
+        let lane = group % 4;
+        let start = vsha1su0q_u32(words[lane], words[(lane + 1) % 4], words[(lane + 2) % 4]);
+        words[lane] = vsha1su1q_u32(start, words[(lane + 3) % 4]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2")]
+#[inline]
+unsafe fn arm_sha1_rounds(
+    (mut abcd, mut e): (std::arch::aarch64::uint32x4_t, u32),
+    words: &mut [std::arch::aarch64::uint32x4_t; 4],
+    k: [std::arch::aarch64::uint32x4_t; 4],
+) -> (std::arch::aarch64::uint32x4_t, u32) {
+    use std::arch::aarch64::*;
+    for group in 0..20 {
+        let lane = group % 4;
+        let wk = vaddq_u32(words[lane], k[group / 5]);
+        unsafe { arm_sha1_schedule_next(words, group) };
+        let next_e = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+        abcd = match group / 5 {
+            0 => vsha1cq_u32(abcd, e, wk),
+            2 => vsha1mq_u32(abcd, e, wk),
+            _ => vsha1pq_u32(abcd, e, wk),
+        };
+        e = next_e;
+    }
+    (abcd, e)
+}
+
+fn sha1_schedule(block: &[u8]) -> [u32; 80] {
     let mut w = [0u32; 80];
     for (word, raw) in w.iter_mut().zip(block.chunks_exact(4)) {
         *word = u32::from_be_bytes(raw.try_into().unwrap());
@@ -106,8 +130,12 @@ fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
     for i in 16..80 {
         w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
     }
+    w
+}
+
+fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
     let [mut a, mut b, mut c, mut d, mut e] = *state;
-    for (i, word) in w.into_iter().enumerate() {
+    for (i, word) in sha1_schedule(block).into_iter().enumerate() {
         let (f, k) = match i {
             0..20 => ((b & c) | (!b & d), 0x5a827999),
             20..40 => (b ^ c ^ d, 0x6ed9eba1),

@@ -7,19 +7,19 @@ mod index;
 mod inflate;
 mod key;
 mod provenance;
-mod sparse;
 pub(crate) mod search_paths;
+mod sparse;
 mod walk_pool;
-pub use capture::{capture, capture_observed};
 pub(crate) use capture::CaptureRoot;
+pub use capture::{capture, capture_observed};
 pub use key::cache_key;
 pub use provenance::{BlobId, CommitTree, raw_blob_id, uses_sha256};
 use std::{
     env,
     ffi::CString,
     fs, io,
-    sync::Arc,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -46,15 +46,21 @@ pub fn locate(cwd: &Path) -> io::Result<PathBuf> {
 pub(crate) fn find_worktree(cwd: &Path) -> io::Result<Option<PathBuf>> {
     let path = cwd.canonicalize()?;
     for root in path.ancestors() {
-        match fs::symlink_metadata(root.join(".git")) {
-            Ok(m) if m.is_dir() || m.is_file() => return Ok(Some(root.to_owned())),
-            Ok(_) => return Err(invalid("invalid .git marker")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        if has_marker(root)? {
+            return Ok(Some(root.to_owned()));
         }
     }
     Ok(None)
 }
+fn has_marker(root: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(root.join(".git")) {
+        Ok(meta) if meta.is_dir() || meta.is_file() => Ok(true),
+        Ok(_) => Err(invalid("invalid .git marker")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn add_rules(bytes: &[u8], base: usize, fold: bool, rules: &mut Vec<ignore::Rule>) {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     rules.extend(
@@ -78,6 +84,12 @@ struct Rules {
 }
 
 impl Rules {
+    fn nested(self: &Arc<Self>, bytes: &[u8], base: usize, fold: bool) -> Option<Arc<Self>> {
+        let mut local = Vec::new();
+        add_rules(bytes, base, fold, &mut local);
+        (!local.is_empty()).then(|| Arc::new(Self { parent: Some(Arc::clone(self)), local }))
+    }
+
     fn excludes(&self, names: &[CString], is_directory: bool) -> bool {
         let mut frame = Some(self);
         while let Some(rules) = frame {
@@ -104,117 +116,258 @@ struct Walk<'a> {
     names: Vec<CString>,
     found: Vec<ObservedPath>,
 }
+struct ReadControl {
+    stamp: [u64; 7],
+    bytes: Vec<u8>,
+}
+
+impl ReadControl {
+    fn captured(self, stamp: [u64; 7]) -> io::Result<Option<String>> {
+        if stamp != self.stamp {
+            return Err(io::Error::other("ignore file changed during discovery"));
+        }
+        Ok(if self.bytes.contains(&0) { None } else { String::from_utf8(self.bytes).ok() })
+    }
+}
+
+struct Child {
+    name: String,
+    path: String,
+    ty: fs::FileType,
+    tracked: bool,
+}
+
+/// The directory's ignore file is both a rule source and, when selected, an
+/// indexed file. Transfer its existing capture to the matching directory entry.
+struct IgnoreFile {
+    name: &'static str,
+    file: Option<ReadControl>,
+}
+
+impl Tree<'_> {
+    fn ignore_file(&self, rel: &str, ignored: bool) -> io::Result<IgnoreFile> {
+        let name = if self.plain_hidden.is_some() {
+            ".ignore"
+        } else {
+            ".gitignore"
+        };
+        let file = if ignored {
+            None
+        } else {
+            read_control(self.root, &Path::new(rel).join(name))?
+        };
+        Ok(IgnoreFile { name, file })
+    }
+
+    fn child(&self, entry: &fs::DirEntry, rel: &str) -> io::Result<Option<Child>> {
+        let Ok(name) = entry.file_name().into_string() else {
+            return Ok(None);
+        };
+        if self.skip_name(&name) {
+            return Ok(None);
+        }
+        let path = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        if self.tracked.gitlinks.contains(&path) {
+            return Ok(None);
+        }
+        let ty = entry.file_type()?;
+        let tracked = self.tracked.paths.contains(&path);
+        if self.is_cache(&path, tracked)? {
+            return Ok(None);
+        }
+        Ok(Some(Child {
+            name,
+            path,
+            ty,
+            tracked,
+        }))
+    }
+    fn skip_name(&self, name: &str) -> bool {
+        if self.plain_hidden == Some(false) && name.starts_with('.') { return true; }
+        if self.fold { name.eq_ignore_ascii_case(".git") } else { name == ".git" }
+    }
+
+    fn is_cache(&self, path: &str, tracked: bool) -> io::Result<bool> {
+        if self.cache.as_deref() != Some(Path::new(path)) {
+            return Ok(false);
+        }
+        if tracked || self.tracked.has_descendant(path) {
+            return Err(invalid("tracked file collides with Codeindex cache"));
+        }
+        Ok(true)
+    }
+
+    fn enter_directory(&self, entry: &fs::DirEntry, path: &str, excluded: bool) -> io::Result<bool> {
+        let descendants = std::cell::OnceCell::new();
+        let tracked_child = || *descendants.get_or_init(|| self.tracked.has_descendant(path));
+        Ok((!excluded || tracked_child())
+            && (self.plain_hidden.is_some() || !entry.path().join(".git").try_exists()? || tracked_child()))
+    }
+}
+
+fn read_control(root: &Path, path: &Path) -> io::Result<Option<ReadControl>> {
+    let metadata = match fs::symlink_metadata(root.join(path)) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let bytes = capture::read_control(root, path, &metadata)?;
+    Ok(Some(ReadControl {
+        stamp: capture::stamp(&metadata),
+        bytes,
+    }))
+}
+
 impl Walk<'_> {
-    fn visit(&mut self, rel: &str, ignored: bool, mut ready: Option<&mut Vec<Directory>>) -> io::Result<()> {
-        let dir = self.tree.root.join(rel);
-        let mut old_rules = None;
-        let mut control = None;
-        let control_name = if self.tree.plain_hidden.is_some() { ".ignore" } else { ".gitignore" };
-        if !ignored {
-            let ignore = dir.join(control_name);
-            match fs::symlink_metadata(&ignore) {
-                Ok(m) if m.is_file() => {
-                    let bytes =
-                        capture::read_control(self.tree.root, &Path::new(rel).join(control_name), &m)?;
-                    let mut nested = Vec::new();
-                    add_rules(&bytes, self.names.len(), self.tree.fold, &mut nested);
-                    if !nested.is_empty() {
-                        old_rules = Some(self.rules.clone());
-                        self.rules = Arc::new(Rules { parent: old_rules.clone(), local: nested });
-                    }
-                    let text = if bytes.contains(&0) {
-                        None
-                    } else {
-                        String::from_utf8(bytes).ok()
-                    };
-                    control = Some((capture::stamp(&m), text));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if self.tree.plain_hidden == Some(false) && name.starts_with('.') || name == ".git" || self.tree.fold && name.eq_ignore_ascii_case(".git") {
-                continue;
-            }
-            let path = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
-            if self.tree.tracked.gitlinks.contains(&path) {
-                continue;
-            }
-            let ty = entry.file_type()?;
-            let tracked = self.tree.tracked.paths.contains(&path);
-            if self.tree.cache.as_deref() == Some(Path::new(&path)) {
-                let prefix = format!("{path}/");
-                if tracked
-                    || self.tree
-                        .tracked
-                        .paths
-                        .range(prefix.clone()..)
-                        .next()
-                        .is_some_and(|p| p.starts_with(&prefix))
-                {
-                    return Err(invalid("tracked file collides with Codeindex cache"));
-                }
-                continue;
-            }
-            let is_control = name == control_name;
-            // Tracked leaves remain eligible under every ignore rule. Only directories
-            // need a component on the stack while visiting their children.
-            let match_rules = ty.is_dir() || !tracked;
-            let excluded = if match_rules {
-                self.names.push(CString::new(if self.tree.fold { name.to_ascii_lowercase() } else { name }).map_err(invalid)?);
-                ignored || self.rules.excludes(&self.names, ty.is_dir())
-            } else {
-                false
-            };
-            if ty.is_dir() {
-                let prefix = format!("{path}/");
-                let tracked_child = || {
-                    self.tree.tracked
-                        .paths
-                        .range(prefix.clone()..)
-                        .next()
-                        .is_some_and(|p| p.starts_with(&prefix))
-                };
-                if (!excluded || tracked_child())
-                    && (self.tree.plain_hidden.is_some() || !entry.path().join(".git").try_exists()? || tracked_child())
-                {
-                    if let Some(jobs) = ready.as_deref_mut() {
-                        jobs.push(Directory { rel: path, ignored: excluded, rules: self.rules.clone(), names: self.names.clone() });
-                    } else {
-                        self.visit(&path, excluded, None)?;
-                    }
-                }
-            } else if (tracked || !excluded) && (ty.is_file() || self.tree.plain_hidden.is_none() && ty.is_symlink()) {
-                let metadata = entry.metadata()?;
-                let stamp = capture::stamp(&metadata);
-                let captured = if is_control && let Some((read_stamp, text)) = control.take() {
-                    if stamp != read_stamp {
-                        return Err(io::Error::other("ignore file changed during discovery"));
-                    }
-                    Some(text)
-                } else {
-                    None
-                };
-                self.found.push(ObservedPath {
-                    path,
-                    stamp,
-                    captured,
-                });
-            }
-            if match_rules { self.names.pop(); }
-        }
-        if let Some(saved) = old_rules { self.rules = saved; }
+    fn record_file(
+        &mut self,
+        entry: &fs::DirEntry,
+        path: String,
+        control: Option<ReadControl>,
+    ) -> io::Result<()> {
+        let metadata = entry.metadata()?;
+        let stamp = capture::stamp(&metadata);
+        let captured = control.map(|file| file.captured(stamp)).transpose()?;
+        self.found.push(ObservedPath {
+            path,
+            stamp,
+            captured,
+        });
         Ok(())
+    }
+    fn descend(
+        &mut self,
+        path: String,
+        excluded: bool,
+        ready: Option<&mut Vec<Directory>>,
+    ) -> io::Result<()> {
+        if let Some(jobs) = ready {
+            jobs.push(Directory {
+                rel: path,
+                ignored: excluded,
+                rules: self.rules.clone(),
+                names: self.names.clone(),
+            });
+            Ok(())
+        } else {
+            self.visit(&path, excluded, None)
+        }
+    }
+
+    fn visit(
+        &mut self,
+        rel: &str,
+        ignored: bool,
+        ready: Option<&mut Vec<Directory>>,
+    ) -> io::Result<()> {
+        let control = self.tree.ignore_file(rel, ignored)?;
+        let inherited = control
+            .file
+            .as_ref()
+            .and_then(|file| {
+                self.rules
+                    .nested(&file.bytes, self.names.len(), self.tree.fold)
+            })
+            .map(|nested| std::mem::replace(&mut self.rules, nested));
+        let result = self.visit_entries(rel, ignored, control, ready);
+        if let Some(inherited) = inherited {
+            self.rules = inherited;
+        }
+        result
+    }
+    fn push_name(&mut self, name: String) -> io::Result<()> {
+        let name = if self.tree.fold {
+            name.to_ascii_lowercase()
+        } else {
+            name
+        };
+        self.names.push(CString::new(name).map_err(invalid)?);
+        Ok(())
+    }
+
+    fn visit_directory(
+        &mut self,
+        entry: &fs::DirEntry,
+        child: Child,
+        ignored: bool,
+        ready: Option<&mut Vec<Directory>>,
+    ) -> io::Result<()> {
+        self.push_name(child.name)?;
+        let excluded = ignored || self.rules.excludes(&self.names, true);
+        let result = match self.tree.enter_directory(entry, &child.path, excluded) {
+            Ok(true) => self.descend(child.path, excluded, ready),
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
+        self.names.pop();
+        result
+    }
+
+    fn include_leaf(&mut self, name: String, tracked: bool, ignored: bool) -> io::Result<bool> {
+        // Tracked leaves override inherited and local exclusions. An ignored
+        // directory cannot unignore one of its untracked descendants.
+        if tracked || ignored {
+            return Ok(tracked);
+        }
+        if self.rules.local.is_empty() && self.rules.parent.is_none() {
+            return Ok(true);
+        }
+        self.push_name(name)?;
+        let included = !self.rules.excludes(&self.names, false);
+        self.names.pop();
+        Ok(included)
+    }
+
+    fn visit_entries(
+        &mut self,
+        rel: &str,
+        ignored: bool,
+        mut control: IgnoreFile,
+        mut ready: Option<&mut Vec<Directory>>,
+    ) -> io::Result<()> {
+        for entry in fs::read_dir(self.tree.root.join(rel))? {
+            let entry = entry?;
+            let Some(child) = self.tree.child(&entry, rel)? else {
+                continue;
+            };
+            self.visit_child(&entry, child, ignored, (&mut control, ready.as_deref_mut()))?;
+        }
+        Ok(())
+    }
+    fn visit_child(
+        &mut self,
+        entry: &fs::DirEntry,
+        child: Child,
+        ignored: bool,
+        (control, ready): (&mut IgnoreFile, Option<&mut Vec<Directory>>),
+    ) -> io::Result<()> {
+        if child.ty.is_dir() {
+            self.visit_directory(entry, child, ignored, ready)
+        } else {
+            self.visit_leaf(entry, child, ignored, control)
+        }
+    }
+
+    fn visit_leaf(
+        &mut self,
+        entry: &fs::DirEntry,
+        child: Child,
+        ignored: bool,
+        control: &mut IgnoreFile,
+    ) -> io::Result<()> {
+        let is_control = child.name == control.name;
+        let link_admitted = self.tree.plain_hidden.is_none() && child.ty.is_symlink();
+        let file = child.ty.is_file() || link_admitted;
+        if !file || !self.include_leaf(child.name, child.tracked, ignored)? {
+            return Ok(());
+        }
+        let captured = is_control.then(|| control.file.take()).flatten();
+        self.record_file(entry, child.path, captured)
     }
 }
 pub(crate) fn usable_marker(root:&Path)->bool {
@@ -276,23 +429,31 @@ pub(crate) fn plain_paths(root: &Path, hidden: bool) -> io::Result<Vec<ObservedP
     let mut rules = Vec::new();
     let ancestors: Vec<_> = root.ancestors().collect();
     for &dir in ancestors.iter().rev() {
-        if let Some(name) = dir.file_name() {
-            names.push(CString::new(name.as_encoded_bytes()).map_err(invalid)?);
+        names.extend(encoded_basename(dir)?);
+        if dir == root {
+            break;
         }
-        if dir == root { break; }
-        let ignore = dir.join(".ignore");
-        match fs::symlink_metadata(&ignore) {
-            Ok(m) if m.is_file() => {
-                let bytes = capture::read_control(dir, Path::new(".ignore"), &m)?;
-                add_rules(&bytes, names.len(), false, &mut rules);
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        add_parent_ignore(dir, names.len(), &mut rules)?;
     }
-    let tree = Tree { root, cache: None, tracked: Default::default(), fold: false, plain_hidden: Some(hidden) };
+    let tree = Tree {
+        root,
+        cache: None,
+        tracked: Default::default(),
+        fold: false,
+        plain_hidden: Some(hidden),
+    };
     walk(tree, rules, names)
+}
+
+fn encoded_basename(dir: &Path) -> io::Result<Option<CString>> {
+    dir.file_name().map(|name| CString::new(name.as_encoded_bytes()).map_err(invalid)).transpose()
+}
+
+fn add_parent_ignore(dir: &Path, depth: usize, rules: &mut Vec<ignore::Rule>) -> io::Result<()> {
+    if let Some(control) = read_control(dir, Path::new(".ignore"))? {
+        add_rules(&control.bytes, depth, false, rules);
+    }
+    Ok(())
 }
 
 fn walk(tree: Tree<'_>, rules: Vec<ignore::Rule>, names: Vec<CString>) -> io::Result<Vec<ObservedPath>> {

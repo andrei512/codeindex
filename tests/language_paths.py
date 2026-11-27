@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[1]
+from language_conformance import ROOT, registry_profiles
 
 # The filenames and source examples form the test contract. Do not generate them
 # from Language::for_path: a removed branch would remove its own test.
@@ -101,20 +101,22 @@ def check(binary, profile, name, template):
                     parsed_files=parsed, exit_code=proc.returncode)
 
 
+def path_cases():
+    cases = [(profile, name, source) for profile, group in CASES.items()
+             for names, source in group for name in names.split()]
+    cases.extend(("negative", name, "fn cxprobe() {}") for name in NEGATIVES)
+    return cases
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/cx")
     parser.add_argument("--report", type=Path, default=ROOT / "target/language-paths.json")
     args = parser.parse_args()
-    src = (ROOT / "src/domain/code/mod.rs").read_text()
-    enum = src.split("pub enum Language {", 1)[1].split("}", 1)[0]
-    live = {v.strip().rstrip(",").lower() for v in enum.splitlines() if v.strip()}
+    live = registry_profiles()
     gaps = sorted(live.symmetric_difference(CASES))
-    cases = [(profile, name, source) for profile, group in CASES.items()
-             for names, source in group for name in names.split()]
-    cases.extend(("negative", name, "fn cxprobe() {}") for name in NEGATIVES)
     results = []
-    for profile, name, source in cases:
+    for profile, name, source in path_cases():
         try:
             row = check(args.binary.resolve(), profile, name, source)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:

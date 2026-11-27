@@ -1,21 +1,56 @@
 //! Lexical let/lambda scopes and statically selected literal attribute sets.
 use super::{
-    Facts, Span,
+    Span,
     config::{self, Kind, Token},
     span,
 };
 use crate::domain::code::Analysis;
+use crate::domain::code::record_unique;
 use std::collections::HashMap;
 
 struct Scope<'a> {
     parent: Option<usize>,
     names: HashMap<&'a str, Option<usize>>,
 }
+/// Bindings are recorded in the set's own scope. Their values can see those
+/// bindings only in a recursive set or a let expression.
+#[derive(Clone, Copy)]
+struct BindingScopes {
+    table: usize,
+    lexical: usize,
+}
+#[derive(Clone, Copy)]
+struct ExpressionScope {
+    lexical: usize,
+    owner: Option<usize>,
+    depth: usize,
+}
+impl ExpressionScope {
+    fn nested(self, lexical: usize) -> Self {
+        Self {
+            lexical,
+            depth: self.depth + 1,
+            ..self
+        }
+    }
+}
 struct Use {
     scope: usize,
     owner: Option<usize>,
-    parts: Vec<usize>,
+    parts: std::ops::RangeInclusive<usize>,
     application: bool,
+}
+enum Value {
+    Other,
+    Lambda,
+    Set(usize),
+}
+
+struct Lambda {
+    colon: usize,
+    prefix: Option<usize>,
+    formals: Option<std::ops::Range<usize>>,
+    suffix: Option<usize>,
 }
 struct Parser<'a> {
     source: &'a str,
@@ -24,29 +59,47 @@ struct Parser<'a> {
     scopes: Vec<Scope<'a>>,
     sets: HashMap<usize, usize>,
     uses: Vec<Use>,
-    facts: Facts,
+    facts: Analysis,
 }
 
-pub(super) fn analyze(source: &str) -> Analysis {
-    let t = config::tokens(source, true);
+fn delimiter_pairs(t: &[Token]) -> Vec<usize> {
     let mut mates = vec![usize::MAX; t.len()];
     let mut stack = Vec::new();
-    for (i, tok) in t.iter().enumerate() {
-        if !matches!(tok.kind, Kind::Punct | Kind::Name) {
-            continue;
-        }
-        match tok.text {
-            "(" => stack.push((i, ")")),
-            "[" => stack.push((i, "]")),
-            "{" | "${" => stack.push((i, "}")),
-            "let" => stack.push((i, "in")),
-            ")" | "]" | "}" | "in" if stack.last().is_some_and(|(_, s)| *s == tok.text) => {
-                let (open, _) = stack.pop().unwrap();
-                mates[open] = i;
-            }
-            _ => (),
+    let tokens = t
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| matches!(token.kind, Kind::Punct | Kind::Name));
+    for (i, token) in tokens {
+        match group_close(token.text) {
+            Some(close) => stack.push((i, close)),
+            None => pair_closing(&mut stack, &mut mates, i, token.text),
         }
     }
+    mates
+}
+
+fn pair_closing(stack: &mut Vec<(usize, &str)>, mates: &mut [usize], at: usize, word: &str) {
+    if let Some((open, _)) = stack.pop_if(|(_, expected)| word == *expected) {
+        mates[open] = at;
+    }
+}
+
+fn group_close(word: &str) -> Option<&'static str> {
+    const GROUPS: &[(&str, &str)] = &[
+        ("(", ")"),
+        ("[", "]"),
+        ("{", "}"),
+        ("${", "}"),
+        ("let", "in"),
+    ];
+    GROUPS
+        .iter()
+        .find_map(|(open, close)| (*open == word).then_some(*close))
+}
+
+pub(in crate::domain::code) fn analyze(source: &str) -> Analysis {
+    let t = config::tokens(source, true);
+    let mates = delimiter_pairs(&t);
     let end = t.len();
     let mut p = Parser {
         source,
@@ -55,37 +108,54 @@ pub(super) fn analyze(source: &str) -> Analysis {
         scopes: vec![],
         sets: HashMap::new(),
         uses: vec![],
-        facts: Facts::default(),
+        facts: Analysis::default(),
     };
     let root = p.scope(None);
-    p.expr(0, end, root, None, false, 0);
+    p.expr(
+        0..end,
+        ExpressionScope {
+            lexical: root,
+            owner: None,
+            depth: 0,
+        },
+        false,
+    );
     for u in std::mem::take(&mut p.uses) {
-        let mut scope = Some(u.scope);
-        let name = p.t[u.parts[0]].text;
-        let mut id = None;
-        while let Some(s) = scope {
-            if let Some(binding) = p.scopes[s].names.get(name) {
-                id = *binding;
-                break;
-            }
-            scope = p.scopes[s].parent;
-        }
-        for (at, &token) in u.parts.iter().enumerate() {
-            let Some(decl) = id else { break };
-            let call = at + 1 == u.parts.len()
-                && u.application
-                && p.facts.analysis.declarations[decl].kind == "function_definition";
-            p.facts.edge(decl, p.location(token), u.owner, call);
-            id = u.parts.get(at + 1).and_then(|&next| {
-                let s = *p.sets.get(&decl)?;
-                *p.scopes[s].names.get(p.t[next].text)?
-            });
-        }
+        p.resolve_path(u);
     }
-    p.facts.finish()
+    p.facts
 }
 
 impl<'a> Parser<'a> {
+    fn resolve_path(&mut self, u: Use) {
+        let mut id = std::iter::successors(Some(u.scope), |&s| self.scopes[s].parent)
+            .find_map(|s| self.scopes[s].names.get(self.t[*u.parts.start()].text))
+            .copied()
+            .flatten();
+        let last = *u.parts.end();
+        for token in u.parts.step_by(2) {
+            let Some(decl) = id else { break };
+            let call = token == last
+                && u.application
+                && self.facts.declarations[decl].kind == "function_definition";
+            self.facts
+                .direct_edge(decl, self.location(token), u.owner, call);
+            id = self.next_path_target(decl, token, last);
+        }
+    }
+
+    fn next_path_target(&self, declaration: usize, token: usize, last: usize) -> Option<usize> {
+        if token == last {
+            return None;
+        }
+        self.attribute_of(declaration, self.t[token + 2].text)
+    }
+
+    fn attribute_of(&self, declaration: usize, name: &str) -> Option<usize> {
+        let scope = *self.sets.get(&declaration)?;
+        self.scopes[scope].names.get(name).copied().flatten()
+    }
+
     fn scope(&mut self, parent: Option<usize>) -> usize {
         let id = self.scopes.len();
         self.scopes.push(Scope {
@@ -111,12 +181,11 @@ impl<'a> Parser<'a> {
             .get(i)
             .is_some_and(|t| matches!(t.kind, Kind::Name | Kind::Punct) && t.text == s)
     }
+    fn close_before(&self, i: usize, end: usize) -> Option<usize> {
+        self.mates.get(i).copied().filter(|&close| close < end)
+    }
     fn next(&self, i: usize, end: usize) -> usize {
-        if self.mates[i] < end {
-            self.mates[i] + 1
-        } else {
-            i + 1
-        }
+        self.close_before(i, end).unwrap_or(i) + 1
     }
     fn stop(&self, mut i: usize, end: usize, words: &[&str]) -> usize {
         while i < end && !words.iter().any(|w| self.is(i, w)) {
@@ -125,250 +194,351 @@ impl<'a> Parser<'a> {
         i
     }
     fn decl(&mut self, scope: usize, i: usize, kind: &'static str) -> usize {
-        let id = self.facts.analysis.declarations.len();
-        self.facts
-            .analysis
-            .declarations
-            .push(crate::domain::code::Declaration {
-                span: self.location(i),
-                kind,
-            });
-        self.scopes[scope]
-            .names
-            .entry(self.t[i].text)
-            .and_modify(|v| *v = None)
-            .or_insert(Some(id));
+        let id = self.facts.declare_at(self.location(i), kind);
+        record_unique(&mut self.scopes[scope].names, self.t[i].text, id);
         id
     }
-    fn lambda_colon(&self, i: usize, end: usize) -> Option<usize> {
-        if self.name(i) && i + 1 < end && self.is(i + 1, ":") {
-            Some(i + 1)
-        } else {
-            let start = if self.name(i) && self.is(i + 1, "@") {
-                i + 2
-            } else {
-                i
-            };
-            if !self.is(start, "{") || self.mates[start] >= end {
-                return None;
+    fn lambda(&self, start: usize, end: usize) -> Option<Lambda> {
+        let following = self.name(start).then(|| self.t.get(start + 1)).flatten();
+        let prefix = match following.map(|token| token.text) {
+            Some(":") if start + 1 < end => {
+                return Some(Lambda {
+                    colon: start + 1,
+                    prefix: Some(start),
+                    formals: None,
+                    suffix: None,
+                });
             }
-            let mut j = self.mates[start] + 1;
-            if self.is(j, "@") && self.name(j + 1) {
-                j += 2
-            }
-            (j < end && self.is(j, ":")).then_some(j)
-        }
-    }
-    fn params(&mut self, start: usize, colon: usize, scope: usize) {
-        if self.name(start) {
-            self.decl(scope, start, "parameter");
-        }
-        let brace = if self.is(start, "{") {
-            start
-        } else {
-            start + 2
+            Some("@") => Some(start),
+            _ => None,
         };
-        if brace >= colon || !self.is(brace, "{") {
-            return;
+        self.formal_lambda(start, end, prefix)
+    }
+
+    fn formal_lambda(&self, start: usize, end: usize, prefix: Option<usize>) -> Option<Lambda> {
+        let open = if prefix.is_some() { start + 2 } else { start };
+        if !self.is(open, "{") {
+            return None;
         }
-        let close = self.mates[brace];
-        let mut j = brace + 1;
-        while j < close {
-            if self.name(j) {
-                self.decl(scope, j, "parameter");
+        let close = self.close_before(open, end)?;
+        let suffix = (self.is(close + 1, "@") && self.name(close + 2)).then_some(close + 2);
+        let colon = suffix.map_or(close + 1, |i| i + 1);
+        (colon < end && self.is(colon, ":")).then_some(Lambda {
+            colon,
+            prefix,
+            formals: Some(open + 1..close),
+            suffix,
+        })
+    }
+    fn params(&mut self, lambda: &Lambda, scope: usize) {
+        if let Some(i) = lambda.prefix {
+            self.decl(scope, i, "parameter");
+        }
+        if let Some(formals) = &lambda.formals {
+            let mut i = formals.start;
+            while i < formals.end {
+                if self.name(i) {
+                    self.decl(scope, i, "parameter");
+                }
+                i = self.stop(i, formals.end, &[","]) + 1;
             }
-            j = self.stop(j, close, &[","]) + 1;
         }
-        if close + 2 < colon && self.is(close + 1, "@") && self.name(close + 2) {
-            self.decl(scope, close + 2, "parameter");
+        if let Some(i) = lambda.suffix {
+            self.decl(scope, i, "parameter");
         }
     }
-    fn bindings(&mut self, mut i: usize, end: usize, table: usize, lexical: usize, depth: usize) {
+    fn lambda_body(&mut self, lambda: Lambda, end: usize, scope: ExpressionScope) {
+        let child = self.scope(Some(scope.lexical));
+        self.params(&lambda, child);
+        self.expr(lambda.colon + 1..end, scope.nested(child), false);
+    }
+
+    fn lambda_value(
+        &mut self,
+        lambda: Lambda,
+        end: usize,
+        scope: ExpressionScope,
+        begins_expression: bool,
+    ) -> Value {
+        if scope.depth < 96 {
+            self.lambda_body(lambda, end, scope);
+        }
+        if begins_expression {
+            Value::Lambda
+        } else {
+            Value::Other
+        }
+    }
+
+    fn bindings(&mut self, mut i: usize, end: usize, scopes: BindingScopes, depth: usize) {
         if depth >= 96 {
             return;
         }
         while i < end {
             let semi = self.stop(i, end, &[";"]);
             if semi == end {
-                break;
+                return;
             }
-            let key = |t: Token| {
-                t.kind == Kind::Name
-                    || (t.kind == Kind::String
-                        && !t.text.is_empty()
-                        && !t.text.contains(['$', '\\']))
-            };
-            if self.is(i, "inherit") {
-                let mut name = i + 1;
-                if name < semi && self.is(name, "(") {
-                    name = self.next(name, semi);
-                }
-                for j in name..semi {
-                    if self.name(j) {
-                        self.scopes[table].names.insert(self.t[j].text, None);
-                    }
-                }
-            } else if key(self.t[i]) {
-                let mut last = i;
-                while last + 2 < semi && self.is(last + 1, ".") && key(self.t[last + 2]) {
-                    last += 2;
-                }
-                if last + 1 < semi && self.is(last + 1, "=") {
-                    let rhs = last + 2;
-                    let kind = if rhs < semi && self.lambda_colon(rhs, semi).is_some() {
-                        "function_definition"
-                    } else {
-                        "attribute"
-                    };
-                    let id = if i == last {
-                        self.decl(table, i, kind)
-                    } else {
-                        let id = self.facts.analysis.declarations.len();
-                        self.facts
-                            .analysis
-                            .declarations
-                            .push(crate::domain::code::Declaration {
-                                span: self.location(last),
-                                kind,
-                            });
-                        id
-                    };
-                    let recursive = self.is(rhs, "rec");
-                    let open = rhs + usize::from(recursive);
-                    if open < semi && self.is(open, "{") && self.mates[open] == semi - 1 {
-                        let nested = self.scope(Some(lexical));
-                        self.sets.insert(id, nested);
-                        self.bindings(
-                            open + 1,
-                            semi - 1,
-                            nested,
-                            if recursive { nested } else { lexical },
-                            depth + 1,
-                        );
-                    } else {
-                        self.expr(rhs, semi, lexical, Some(id), false, depth + 1);
-                    }
-                }
-            }
+            self.binding(i, semi, scopes, depth);
             i = semi + 1;
         }
     }
-    fn expr(
-        &mut self,
-        start: usize,
-        end: usize,
-        scope: usize,
-        owner: Option<usize>,
-        list: bool,
-        depth: usize,
-    ) {
-        if depth >= 96 {
-            return;
-        }
-        let mut i = start;
-        while i < end {
-            if let Some(colon) = self.lambda_colon(i, end) {
-                let nested = self.scope(Some(scope));
-                self.params(i, colon, nested);
-                self.expr(colon + 1, end, nested, owner, false, depth + 1);
-                break;
-            }
-            if self.is(i, "let") && self.mates[i] < end {
-                let close = self.mates[i];
-                let nested = self.scope(Some(scope));
-                self.bindings(i + 1, close, nested, nested, depth);
-                let stop = self.stop(close + 1, end, &["then", "else"]);
-                self.expr(close + 1, stop, nested, owner, false, depth + 1);
-                i = stop;
-                continue;
-            }
-            if self.is(i, "{") && self.mates[i] < end {
-                let table = self.scope(Some(scope));
-                let recursive = i > start && self.is(i - 1, "rec");
-                self.bindings(
-                    i + 1,
-                    self.mates[i],
-                    table,
-                    if recursive { table } else { scope },
-                    depth,
-                );
-                i = self.mates[i] + 1;
-                continue;
-            }
-            if (self.is(i, "(") || self.is(i, "[")) && self.mates[i] < end {
-                self.expr(
-                    i + 1,
-                    self.mates[i],
-                    scope,
-                    owner,
-                    self.is(i, "["),
-                    depth + 1,
-                );
-                i = self.mates[i] + 1;
-                continue;
-            }
-            if self.is(i, "${") && self.mates[i] < end {
-                i = self.mates[i] + 1;
-                continue;
-            }
-            if self.name(i)
-                && !matches!(
-                    self.t[i].text,
-                    "let"
-                        | "in"
-                        | "with"
-                        | "if"
-                        | "then"
-                        | "else"
-                        | "assert"
-                        | "rec"
-                        | "inherit"
-                        | "or"
-                        | "true"
-                        | "false"
-                        | "null"
-                )
-                && !(i > start && (self.is(i - 1, ".") || self.is(i - 1, "?")))
-            {
-                let first = i;
-                let mut parts = vec![i];
-                while i + 2 < end && self.is(i + 1, ".") && self.name(i + 2) {
-                    i += 2;
-                    parts.push(i);
-                }
-                let next = i + 1;
-                let head = first == start
-                    || matches!(
-                        self.t[first - 1].text,
-                        "then"
-                            | "else"
-                            | "in"
-                            | "="
-                            | "+"
-                            | "++"
-                            | "//"
-                            | "&&"
-                            | "||"
-                            | "=="
-                            | "!="
-                            | ";"
-                    );
-                let arg = next < end
-                    && (self.name(next)
-                        && !matches!(self.t[next].text, "then" | "else" | "in" | "or")
-                        || self.t[next].text.starts_with(|c: char| c.is_ascii_digit())
-                        || self.t[next].kind == Kind::String
-                        || self.is(next, "(")
-                        || self.is(next, "{")
-                        || self.is(next, "["));
-                self.uses.push(Use {
-                    scope,
-                    owner,
-                    parts,
-                    application: head && arg && !list,
-                });
-            }
-            i += 1;
+    fn binding(&mut self, start: usize, end: usize, scopes: BindingScopes, depth: usize) {
+        if self.is(start, "inherit") {
+            self.inherit(start + 1, end, scopes.table);
+        } else {
+            self.attribute(start, end, scopes, depth);
         }
     }
+
+    fn inherit(&mut self, mut name: usize, semi: usize, table: usize) {
+        if name < semi && self.is(name, "(") {
+            name = self.next(name, semi);
+        }
+        for j in name..semi {
+            if self.name(j) {
+                self.scopes[table].names.insert(self.t[j].text, None);
+            }
+        }
+    }
+    fn path_end(
+        &self,
+        mut last: usize,
+        end: usize,
+        component: impl Fn(&Self, usize) -> bool,
+    ) -> usize {
+        while self.path_dot(last + 1, end) && component(self, last + 2) {
+            last += 2;
+        }
+        last
+    }
+    fn path_dot(&self, at: usize, end: usize) -> bool {
+        at + 1 < end && self.is(at, ".")
+    }
+
+    fn attribute_name(&self, i: usize, semi: usize) -> Option<(usize, usize)> {
+        let key = |t: Token| {
+            t.kind == Kind::Name
+                || t.kind == Kind::String && !t.text.is_empty() && !t.text.contains(['$', '\\'])
+        };
+        if !key(self.t[i]) {
+            return None;
+        }
+        let last = self.path_end(i, semi, |parser, token| key(parser.t[token]));
+        if last + 1 >= semi || !self.is(last + 1, "=") {
+            return None;
+        }
+        Some((last, last + 2))
+    }
+
+    fn attribute(&mut self, i: usize, semi: usize, scopes: BindingScopes, depth: usize) {
+        let Some((last, rhs)) = self.attribute_name(i, semi) else {
+            return;
+        };
+        let id = if i == last {
+            self.decl(scopes.table, i, "attribute")
+        } else {
+            self.facts.declare_at(self.location(last), "attribute")
+        };
+        // The expression walker already recognizes functions and opens set scopes.
+        // Commit that result before resolving the accumulated uses.
+        let value_scope = ExpressionScope {
+            lexical: scopes.lexical,
+            owner: Some(id),
+            depth: depth + 1,
+        };
+        match self.expr(rhs..semi, value_scope, false) {
+            Value::Lambda => self.facts.declarations[id].kind = "function_definition",
+            Value::Set(scope) => {
+                self.sets.insert(id, scope);
+            }
+            Value::Other => {}
+        }
+    }
+    fn attribute_set(
+        &mut self,
+        pair: std::ops::Range<usize>,
+        parent: usize,
+        recursive: bool,
+        depth: usize,
+    ) -> usize {
+        let std::ops::Range {
+            start: open,
+            end: close,
+        } = pair;
+        let scope = self.scope(Some(parent));
+        let lexical = if recursive { scope } else { parent };
+        self.bindings(
+            open + 1,
+            close,
+            BindingScopes {
+                table: scope,
+                lexical,
+            },
+            depth,
+        );
+        scope
+    }
+
+    fn argument_start(&self, next: usize) -> bool {
+        let token = self.t[next];
+        token.text.starts_with(|c: char| c.is_ascii_digit())
+            || match token.kind {
+                Kind::Name => {
+                    self.name(next) && !matches!(token.text, "then" | "else" | "in" | "or")
+                }
+                Kind::String => true,
+                Kind::Punct => matches!(token.text, "(" | "{" | "["),
+                _ => false,
+            }
+    }
+
+    fn reference_head(&self, i: usize, start: usize) -> bool {
+        self.name(i)
+            && !matches!(
+                self.t[i].text,
+                "let"
+                    | "in"
+                    | "with"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "assert"
+                    | "rec"
+                    | "inherit"
+                    | "or"
+                    | "true"
+                    | "false"
+                    | "null"
+            )
+            && !(i > start && (self.is(i - 1, ".") || self.is(i - 1, "?")))
+    }
+
+    fn record_use(
+        &mut self,
+        i: usize,
+        bounds: std::ops::Range<usize>,
+        scope: ExpressionScope,
+        list: bool,
+    ) -> usize {
+        let first = i;
+        let std::ops::Range { start, end } = bounds;
+        let i = self.path_end(first, end, Self::name);
+        let next = i + 1;
+        let head = first == start
+            || matches!(
+                self.t[first - 1].text,
+                "then" | "else" | "in" | "=" | "+" | "++" | "//" | "&&" | "||" | "==" | "!=" | ";"
+            );
+        self.uses.push(Use {
+            scope: scope.lexical,
+            owner: scope.owner,
+            parts: first..=i,
+            application: !list && head && next < end && self.argument_start(next),
+        });
+        i
+    }
+    /// Consume one paired group; only a set spanning the whole value can be selected by its binding.
+    fn group(
+        &mut self,
+        pair: std::ops::Range<usize>,
+        outer: std::ops::Range<usize>,
+        scope: ExpressionScope,
+    ) -> (usize, Option<usize>) {
+        let std::ops::Range {
+            start: i,
+            end: close,
+        } = pair;
+        let std::ops::Range { start, end } = outer;
+        match self.t[i].text {
+            "let" => {
+                let nested = self.scope(Some(scope.lexical));
+                self.bindings(
+                    i + 1,
+                    close,
+                    BindingScopes {
+                        table: nested,
+                        lexical: nested,
+                    },
+                    scope.depth,
+                );
+                let stop = self.stop(close + 1, end, &["then", "else"]);
+                self.expr(close + 1..stop, scope.nested(nested), false);
+                return (stop, None);
+            }
+            "{" => {
+                let recursive = i > start && self.is(i - 1, "rec");
+                let nested = self.attribute_set(i..close, scope.lexical, recursive, scope.depth);
+                let complete = i == start + usize::from(recursive) && close + 1 == end;
+                return (close + 1, complete.then_some(nested));
+            }
+            "(" | "[" => {
+                self.expr(i + 1..close, scope.nested(scope.lexical), self.is(i, "["));
+            }
+            "${" => {}
+            _ => unreachable!("delimiter_pairs only records group openers"),
+        }
+        (close + 1, None)
+    }
+    fn expression_atom(
+        &mut self,
+        token: usize,
+        bounds: std::ops::Range<usize>,
+        scope: ExpressionScope,
+        list: bool,
+    ) -> usize {
+        if self.reference_head(token, bounds.start) {
+            self.record_use(token, bounds, scope, list)
+        } else {
+            token
+        }
+    }
+
+    fn expr(
+        &mut self,
+        bounds: std::ops::Range<usize>,
+        scope: ExpressionScope,
+        list: bool,
+    ) -> Value {
+        let mut i = bounds.start;
+        while i < bounds.end {
+            match self.expression_step(i, &bounds, scope, list) {
+                ExpressionStep::Next(at) => i = at,
+                ExpressionStep::Done(value) => return value,
+            }
+        }
+        Value::Other
+    }
+
+    fn expression_step(
+        &mut self,
+        i: usize,
+        bounds: &std::ops::Range<usize>,
+        scope: ExpressionScope,
+        list: bool,
+    ) -> ExpressionStep {
+        if let Some(lambda) = self.lambda(i, bounds.end) {
+            return ExpressionStep::Done(self.lambda_value(
+                lambda,
+                bounds.end,
+                scope,
+                i == bounds.start,
+            ));
+        }
+        if scope.depth >= 96 {
+            return ExpressionStep::Done(Value::Other);
+        }
+        if let Some(close) = self.close_before(i, bounds.end) {
+            let (next, set) = self.group(i..close, bounds.clone(), scope);
+            return set.map_or(ExpressionStep::Next(next), |set| {
+                ExpressionStep::Done(Value::Set(set))
+            });
+        }
+        ExpressionStep::Next(self.expression_atom(i, bounds.clone(), scope, list) + 1)
+    }
+}
+
+enum ExpressionStep {
+    Next(usize),
+    Done(Value),
 }

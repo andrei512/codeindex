@@ -1,30 +1,39 @@
 use super::*;
+fn exercise<R>(files: &[(&str, &str)], inspect: impl FnOnce(&[Unit], &Names) -> R) -> R {
+    let analyses: Vec<_> = files
+        .iter()
+        .map(|(path, s)| {
+            if path.ends_with(".rs") {
+                crate::domain::code::analyze(crate::domain::code::Language::Rust, s)
+            } else {
+                Analysis::default()
+            }
+        })
+        .collect();
+    let units: Vec<_> = files
+        .iter()
+        .zip(&analyses)
+        .map(|(&(path, text), analysis)| Unit {
+            path,
+            text,
+            analysis,
+        })
+        .collect();
+    let names = Names::build(&units);
+    inspect(&units, &names)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     const LIB: &str = "mod inner; use crate::inner::{work as renamed, Thing}; fn outer(x: Thing) { let before = renamed; renamed(); let x = x; { let x = x; let z = x; } let z = x; }";
     const INNER: &str = "pub struct Thing; pub fn work() {}";
-    fn fixture<R>(test: impl FnOnce(&[Unit], Names) -> R) -> R {
+    fn fixture<R>(test: impl FnOnce(&[Unit], &Names) -> R) -> R {
         let files = [
             ("src/lib.rs", LIB),
             ("src/inner.rs", INNER),
             ("other.rs", "pub fn work(){}"),
         ];
-        let analyses: Vec<_> = files
-            .iter()
-            .map(|(_, s)| crate::domain::code::analyze(crate::domain::code::Language::Rust, s))
-            .collect();
-        let units: Vec<_> = files
-            .iter()
-            .zip(&analyses)
-            .map(|(&(path, text), analysis)| Unit {
-                path,
-                text,
-                analysis,
-            })
-            .collect();
-        let names = Names::build(&units);
-        test(&units, names)
+        exercise(&files, test)
     }
     fn at(u: &Unit, text: &str, delta: usize) -> usize {
         let pos = u.text.find(text).unwrap() + delta;
@@ -126,37 +135,14 @@ fn pick(fallback: u8, arg: Option<u8>) -> u8 {
 }
 fn check() { let mut total = 0; for (a,b) in [(1,2)] {total += a+b;} }
 "#;
-    fn exercise(files: &[(&str, &str)], inspect: impl FnOnce(&[Unit], &Names)) {
-        let analyses: Vec<_> = files
-            .iter()
-            .map(|(path, s)| {
-                if path.ends_with(".rs") {
-                    crate::domain::code::analyze(crate::domain::code::Language::Rust, s)
-                } else {
-                    Analysis::default()
-                }
-            })
-            .collect();
-        let units: Vec<_> = files
-            .iter()
-            .zip(&analyses)
-            .map(|(&(path, text), analysis)| Unit {
-                path,
-                text,
-                analysis,
-            })
-            .collect();
-        let names = Names::build(&units);
-        inspect(&units, &names);
-    }
     fn targets(
         units: &[Unit],
         n: &Names,
         file: usize,
-        context: &str,
-        offset: usize,
+        location: (&str, usize),
     ) -> Vec<(usize, usize, &'static str)> {
         let u = &units[file];
+        let (context, offset) = location;
         let start = u.text.find(context).unwrap() + offset;
         let mut found = Vec::new();
         for (local, c) in u
@@ -182,15 +168,15 @@ fn check() { let mut total = 0; for (a,b) in [(1,2)] {total += a+b;} }
             let field_a = METHODS.find("score: u32").unwrap();
             let field_b = METHODS.find("score: u8").unwrap();
             assert_eq!(
-                targets(u, n, 0, "self.score", 5),
+                targets(u, n, 0, ("self.score", 5)),
                 [(0, field_a, "field_declaration")]
             );
             assert_eq!(
-                targets(u, n, 0, "two.score", 4),
+                targets(u, n, 0, ("two.score", 4)),
                 [(0, field_b, "field_declaration")]
             );
             assert_eq!(
-                targets(u, n, 0, "one.score", 4),
+                targets(u, n, 0, ("one.score", 4)),
                 [(0, METHODS.find("fn score").unwrap() + 3, "function_item")]
             );
         });
@@ -202,16 +188,16 @@ fn check() { let mut total = 0; for (a,b) in [(1,2)] {total += a+b;} }
             let signature = source.find("fn run").unwrap() + 3;
             let implementation = source.rfind("fn run").unwrap() + 3;
             assert_eq!(
-                targets(u, n, 0, "x.run", 2),
+                targets(u, n, 0, ("x.run", 2)),
                 [(0, implementation, "function_item")]
             );
             for site in ["g.run", "d.run"] {
                 assert_eq!(
-                    targets(u, n, 0, site, 2),
+                    targets(u, n, 0, (site, 2)),
                     [(0, signature, "function_signature_item")]
                 );
             }
-            assert!(targets(u, n, 0, "j.run", 2).is_empty());
+            assert!(targets(u, n, 0, ("j.run", 2)).is_empty());
         });
     }
     #[test]
@@ -219,10 +205,10 @@ fn check() { let mut total = 0; for (a,b) in [(1,2)] {total += a+b;} }
         let source = "struct Entry { value: u32 } fn f(rows: &[Entry], amount: u32) { rows.iter().map(|row| row.value); let e = Entry { value: amount }; let _ = 0..e.value; }";
         exercise(&[("src/lib.rs", source)], |u, n| {
             let field = (0, source.find("value:").unwrap(), "field_declaration");
-            assert_eq!(targets(u, n, 0, "row.value", 4), [field]);
-            assert_eq!(targets(u, n, 0, "..e.value", 4), [field]);
+            assert_eq!(targets(u, n, 0, ("row.value", 4)), [field]);
+            assert_eq!(targets(u, n, 0, ("..e.value", 4)), [field]);
             assert_eq!(
-                targets(u, n, 0, "value: amount", 7),
+                targets(u, n, 0, ("value: amount", 7)),
                 [(0, source.find("amount:").unwrap(), "parameter")]
             );
         });
@@ -231,51 +217,57 @@ fn check() { let mut total = 0; for (a,b) in [(1,2)] {total += a+b;} }
     fn generics_match_guards_and_for_patterns() {
         exercise(&[("src/lib.rs", SCOPES)], |u, n| {
             assert_eq!(
-                targets(u, n, 0, "&'a T", 1),
+                targets(u, n, 0, ("&'a T", 1)),
                 [(0, SCOPES.find("'a").unwrap(), "lifetime_parameter")]
             );
             assert_eq!(
-                targets(u, n, 0, "&'a T", 4),
+                targets(u, n, 0, ("&'a T", 4)),
                 [(0, SCOPES.find("T>").unwrap(), "generic_parameter")]
             );
             let arm = SCOPES.find("Some(fallback)").unwrap() + 5;
             assert_eq!(
-                targets(u, n, 0, "if fallback", 3),
+                targets(u, n, 0, ("if fallback", 3)),
                 [(0, arm, "local_binding")]
             );
             assert_eq!(
-                targets(u, n, 0, "0 => fallback", 5),
+                targets(u, n, 0, ("0 => fallback", 5)),
                 [(0, arm, "local_binding")]
             );
             assert_eq!(
-                targets(u, n, 0, "_ => fallback", 5),
+                targets(u, n, 0, ("_ => fallback", 5)),
                 [(0, SCOPES.find("fallback:").unwrap(), "parameter")]
             );
             assert_eq!(
-                targets(u, n, 0, "+= a+b", 3),
+                targets(u, n, 0, ("+= a+b", 3)),
                 [(0, SCOPES.find("(a,b)").unwrap() + 1, "local_binding")]
             );
         });
     }
     #[test]
     fn cargo_path_alias_picks_its_declared_dependency() {
-        let files = [
-            (
-                "consumer/Cargo.toml",
-                "[package]\nname = \"consumer\"\n[dependencies]\nwire = { package = \"target-package\", path = \"../one\" }\n",
-            ),
-            ("one/Cargo.toml", "[package]\nname=\"target-package\"\n"),
-            (
-                "consumer/src/lib.rs",
-                "use wire::Widget; fn test(_: Widget) {}",
-            ),
-            ("one/src/lib.rs", "pub struct Widget;"),
-            ("unrelated/src/lib.rs", "pub struct Widget;"),
-        ];
-        exercise(&files, |u, n| {
-            assert_eq!(targets(u, n, 2, "_: Widget", 3), [(3, 11, "struct_item")]);
-            assert_eq!(targets(u, n, 2, "use wire", 4), [(3, 0, "source_file")]);
-        });
+        for (alias, field) in [
+            ("wire", "path"),
+            ("'wire'", "\"path\""),
+            ("\"wire\"", "'path'"),
+        ] {
+            let manifest = format!(
+                "[package]\nname = \"consumer\"\n[dependencies]\n{alias} = {{ package = \"target-package\", {field} = \"../one\" }}\n"
+            );
+            let files = [
+                ("consumer/Cargo.toml", manifest.as_str()),
+                ("one/Cargo.toml", "[package]\nname=\"target-package\"\n"),
+                (
+                    "consumer/src/lib.rs",
+                    "use wire::Widget; fn test(_: Widget) {}",
+                ),
+                ("one/src/lib.rs", "pub struct Widget;"),
+                ("unrelated/src/lib.rs", "pub struct Widget;"),
+            ];
+            exercise(&files, |u, n| {
+                assert_eq!(targets(u, n, 2, ("_: Widget", 3)), [(3, 11, "struct_item")]);
+                assert_eq!(targets(u, n, 2, ("use wire", 4)), [(3, 0, "source_file")]);
+            });
+        }
     }
 }
 
@@ -331,7 +323,7 @@ fn pointer_slice_tuple_and_unwrap_track_declared_payloads() {
 #[test]
 fn explicit_module_path_wins_and_return_impl_trait_keeps_parameters() {
     use crate::domain::code::{Language, analyze};
-    let src = r#"#[path="chosen.rs"] mod target; fn wrap(x: u8) -> impl Copy { x } fn call(){target::work();}"#;
+    let src = r#"#[path="chosen.rs"] mod target; fn wrap<'a>(x: &'a u8) -> impl Copy + use<'a> { x } fn call(){target::work();}"#;
     let texts = [src, "pub fn work() {}", "pub fn work() {}"];
     let aa: Vec<_> = texts.iter().map(|s| analyze(Language::Rust, s)).collect();
     let paths = ["src/lib.rs", "src/chosen.rs", "src/target.rs"];
@@ -367,9 +359,11 @@ mod other { pub fn run() {} }
 fn use_it(){selected();machine::run();}
 "#;
     let ext = "pub fn helper(){} pub fn run(){helper();}";
-    for (triple, linux) in [
-        ("aarch64-apple-darwin", false),
-        ("aarch64-unknown-linux-gnu", true),
+    let other_run = src.find("mod other { pub fn run").unwrap() + "mod other { pub fn ".len();
+    let file_run = ext.find("run").unwrap();
+    for (triple, calls_expected, selected_target) in [
+        ("aarch64-apple-darwin", 0, (0, other_run)),
+        ("aarch64-unknown-linux-gnu", 1, (1, file_run)),
     ] {
         let a = analyze(Language::Rust, src);
         let b = analyze(Language::Rust, ext);
@@ -400,7 +394,7 @@ fn use_it(){selected();machine::run();}
             .enumerate()
             .filter(|(i, _)| n.targets.contains_key(&Site { file: 1, local: *i }))
             .count();
-        assert_eq!(calls, usize::from(linux));
+        assert_eq!(calls, calls_expected);
         let index = a
             .calls
             .iter()
@@ -410,20 +404,15 @@ fn use_it(){selected();machine::run();}
             file: 0,
             local: index,
         }][0];
-        if linux {
-            assert_eq!(target.file, 1);
-        } else {
-            assert_eq!(
-                a.declarations[target.local].span.start,
-                src.find("mod other { pub fn run").unwrap() + "mod other { pub fn ".len()
-            );
-        }
+        let start = units[target.file].analysis.declarations[target.local]
+            .span
+            .start;
+        assert_eq!((target.file, start), selected_target);
     }
 }
 
 #[test]
 fn public_labels_require_a_cargo_target_and_canonical_written_descriptors() {
-    use crate::domain::code::{Language, analyze};
     let root = r#"[workspace]
 members = ["apps/*"]
 [workspace.package]
@@ -439,63 +428,169 @@ version = "1.4.2"
         ("sub/apps/core/src/model.rs", model),
         ("sub/apps/core/scratch.rs", "fn unknown(){}"),
     ];
-    let a: Vec<_> = files
-        .iter()
-        .map(|(p, s)| {
-            if p.ends_with(".rs") {
-                analyze(Language::Rust, s)
-            } else {
-                Analysis::default()
-            }
-        })
-        .collect();
-    let units: Vec<_> = files
-        .iter()
-        .zip(&a)
-        .map(|(&(path, text), analysis)| Unit {
-            path,
-            text,
-            analysis,
-        })
-        .collect();
-    let n = Names::build(&units);
-    let labels = &n.public_labels;
-    let label = |file: usize, start: usize, kind: &str| -> Option<&str> {
-        let local = a[file]
-            .declarations
-            .iter()
-            .position(|d| d.span.start == start && d.kind == kind)?;
-        labels.get(&Site { file, local }).map(String::as_str)
-    };
-    let prefix = "rust-analyzer sub rust-analyzer cargo my-core 1.4.2 ";
-    assert_eq!(
-        label(2, lib.find("run(").unwrap(), "function_item").unwrap(),
-        format!("{prefix}run().")
-    );
-    assert_eq!(
-        label(2, 0, "source_file").unwrap(),
-        format!("{prefix}crate/")
-    );
-    assert_eq!(
-        label(3, 0, "source_file").unwrap(),
-        format!("{prefix}model/")
-    );
-    for (part, kind, expected) in [
-        ("Work {", "trait_item", "Work#"),
-        ("Item {", "struct_item", "Item#"),
-        ("value:u32", "field_declaration", "Item#value."),
-        ("new()", "function_item", "impl#[Item]new()."),
-        ("answer:u8", "field_declaration", "Choice#One#answer."),
-    ] {
+    exercise(&files, |units, n| {
+        let labels = &n.public_labels;
+        let label = |file: usize, start: usize, kind: &str| -> Option<&str> {
+            let local = units[file]
+                .analysis
+                .declarations
+                .iter()
+                .position(|d| d.span.start == start && d.kind == kind)?;
+            labels.get(&Site { file, local }).map(String::as_str)
+        };
+        let prefix = "rust-analyzer sub rust-analyzer cargo my-core 1.4.2 ";
         assert_eq!(
-            label(3, model.find(part).unwrap(), kind).unwrap(),
-            format!("{prefix}model/{expected}")
+            label(2, lib.find("run(").unwrap(), "function_item").unwrap(),
+            format!("{prefix}run().")
         );
+        assert_eq!(
+            label(2, 0, "source_file").unwrap(),
+            format!("{prefix}crate/")
+        );
+        assert_eq!(
+            label(3, 0, "source_file").unwrap(),
+            format!("{prefix}model/")
+        );
+        for (part, kind, expected) in [
+            ("Work {", "trait_item", "Work#"),
+            ("Item {", "struct_item", "Item#"),
+            ("value:u32", "field_declaration", "Item#value."),
+            ("new()", "function_item", "impl#[Item]new()."),
+            ("answer:u8", "field_declaration", "Choice#One#answer."),
+        ] {
+            assert_eq!(
+                label(3, model.find(part).unwrap(), kind).unwrap(),
+                format!("{prefix}model/{expected}")
+            );
+        }
+        assert_eq!(
+            label(3, model.rfind("do_it").unwrap(), "function_item").unwrap(),
+            format!("{prefix}model/impl#[Item][Work]do_it().")
+        );
+        assert_eq!(label(2, lib.find("local:").unwrap(), "parameter"), None);
+        assert_eq!(label(4, 3, "function_item"), None);
+    });
+}
+
+#[test]
+fn tuple_projections_follow_source_slots_past_nested_patterns_and_wildcards() {
+    let text = "fn unpack(input: Pack){ let (a, (b, c), _, mut d) = input; }";
+    let analysis = crate::domain::code::analyze(crate::domain::code::Language::Rust, text);
+    let initializers = &analysis.rust.as_ref().unwrap().members.initializers;
+    let mut actual = Vec::new();
+    for (&decl, &(site, projection)) in initializers {
+        if let Projection::Tuple(slot) = projection {
+            let span = analysis.declarations[decl].span.clone();
+            assert_eq!(&text[analysis.calls[site].span.clone()], "input");
+            actual.push((&text[span], slot));
+        }
     }
-    assert_eq!(
-        label(3, model.rfind("do_it").unwrap(), "function_item").unwrap(),
-        format!("{prefix}model/impl#[Item][Work]do_it().")
-    );
-    assert_eq!(label(2, lib.find("local:").unwrap(), "parameter"), None);
-    assert_eq!(label(4, 3, "function_item"), None);
+    actual.sort();
+    assert_eq!(actual, [("a", 0), ("d", 3)]);
+}
+
+#[test]
+fn imported_module_paths_preserve_suffixes_and_bound_cycles() {
+    use crate::domain::code::{Language, analyze};
+    let text = r#"
+mod base { pub mod mid { pub mod leaf { pub fn run() {} } } }
+use crate::base as root;
+use root::mid as before_leaf;
+use before_leaf::leaf as alias;
+mod relay { pub use crate::before_leaf::*; }
+use cycle_b as cycle_a;
+use cycle_a as cycle_b;
+fn probe() { alias::run(); relay::leaf::run(); cycle_a::run(); }
+"#;
+    let analysis = analyze(Language::Rust, text);
+    let unit = Unit { path: "lib.rs", text, analysis: &analysis };
+    let names = Names::build(&[unit]);
+    let targets = |path: &str| {
+        let at = text.find(path).unwrap() + path.rfind("run").unwrap();
+        let local = analysis.calls.iter().position(|c| c.span.start == at).unwrap();
+        names.targets.get(&Site { file: 0, local }).map_or(&[][..], Vec::as_slice)
+    };
+    for path in ["alias::run()", "relay::leaf::run()"] {
+        let [target] = targets(path) else { panic!("unresolved {path}") };
+        assert_eq!(analysis.declarations[target.local].span.start, text.find("run()").unwrap());
+    }
+    assert!(targets("cycle_a::run()").is_empty());
+}
+
+#[test]
+fn closure_parameters_project_their_written_tuple_and_array_element_types() {
+    use crate::domain::code::{Language, analyze};
+    let text = "struct First; impl First { fn hit(&self) {} }
+                struct Second; impl Second { fn hit(&self) {} }
+                fn probe() {
+                    let tuple = |pair: (First, (), Second)| { let (a, _, b) = pair; a.hit(); b.hit(); };
+                    let array = |items: [First; 2]| { for item in items { item.hit(); } };
+                }";
+    let analysis = analyze(Language::Rust, text);
+    let unit = Unit { path: "lib.rs", text, analysis: &analysis };
+    let names = Names::build(&[unit]);
+    for (call, owner) in [("a.hit", "First"), ("b.hit", "Second"), ("item.hit", "First")] {
+        let at = text.find(call).unwrap() + call.find('.').unwrap() + 1;
+        let local = analysis.calls.iter().position(|c| c.span.start == at).unwrap();
+        let targets = &names.targets[&Site { file: 0, local }];
+        let [target] = targets.as_slice() else { panic!("ambiguous {call}") };
+        let implementation = text.find(&format!("impl {owner}")).unwrap();
+        assert_eq!(analysis.declarations[target.local].span.start,
+                   implementation + text[implementation..].find("fn hit").unwrap() + 3);
+    }
+}
+
+#[test]
+fn bounded_patterns_skip_nested_commas_and_recover_unfinished_groups() {
+    use crate::domain::code::{Language, lexer};
+    let t = lexer::tokens("path::Item(a, b), (c, d", Language::Rust);
+    let pairs = delimiters(&t).mates;
+    let separators = &[",", ":"];
+    assert_eq!(until_before(&t, &pairs, 0..7, separators), 7);
+    assert_eq!(until_before(&t, &pairs, 0..t.len(), separators), 9);
+    assert_eq!(until_before(&t, &pairs, 10..t.len(), separators), 12);
+}
+
+#[test]
+fn guarded_inline_former_neighbors_are_bounded_to_candidate_files() {
+    let mut sources=vec![
+        ("src/lib.rs".to_owned(), "#[cfg_attr(target_os=\"linux\",path=\"alt\")] mod holder { pub mod leaf; }"),
+        ("src/alt/leaf.rs".to_owned(),"pub fn work() {}"),
+        ("src/holder/leaf.rs".to_owned(),"pub fn work() {}"),
+    ];
+    sources.extend((0..128).map(|n|(format!("unrelated{n}/lib.rs"),"pub fn work() {}")));
+    let files:Vec<_>=sources.iter().map(|(name,text)|(name.as_str(),*text)).collect();
+    exercise(&files, |units,_| {
+        let project=crate::domain::code::ProjectView::new(units);
+        let mut neighbors=Vec::new();
+        binding::previous_neighbors(0,&project,units[0].analysis.rust.as_deref().unwrap(),&mut neighbors);
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        assert_eq!(neighbors, [1,2]);
+    });
+}
+
+#[test]
+fn a_nested_module_named_tests_does_not_make_its_children_crate_roots() {
+    let source = "mod child; fn run() { child::marker(); }";
+    let files = [
+        ("src/lib.rs", "mod tests;"),
+        ("src/tests/mod.rs", "mod host;"),
+        ("src/tests/host.rs", source),
+        ("src/tests/host/child.rs", "pub fn marker() {}"),
+        ("src/tests/child.rs", "pub fn marker() {}"),
+    ];
+    exercise(&files, |units, names| {
+        let offset = source.find("marker").unwrap();
+        let local = units[2]
+            .analysis
+            .calls
+            .iter()
+            .position(|c| c.span.start == offset)
+            .unwrap();
+        let [target] = names.targets[&Site { file: 2, local }].as_slice() else {
+            panic!("expected one child module target");
+        };
+        assert_eq!(units[target.file].path, "src/tests/host/child.rs");
+    });
 }

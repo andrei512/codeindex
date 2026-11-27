@@ -1,26 +1,19 @@
 //! Pester and Perl subtests pass executable blocks to the runner. The generic
 //! scorer sees their delimiters as nested braces. Each registration owns its
 //! own decisions, including decisions written directly in the suite body.
+use super::owners::{Opening, OwnerCursor, with_registrations};
 use super::{Language, Rule, Score, Token, scan};
-use crate::domain::code::{analyze, lexer, roles, script};
+use crate::domain::code::roles;
 
-pub(crate) fn candidate(path: &str) -> Option<Language> {
-    if path.ends_with(".t") {
-        return Some(Language::Perl);
-    }
-    let lang = Language::for_path(path)?;
+pub(super) fn candidate(lang: Language, test_path: impl FnOnce() -> bool) -> bool {
     match lang {
         Language::Powershell
         | Language::Dart
         | Language::Ruby
         | Language::Php
-        | Language::Kotlin
-            if roles::on_test_path(path, lang) =>
-        {
-            Some(lang)
-        }
-        Language::Perl | Language::Html | Language::Nix => Some(lang),
-        _ => None,
+        | Language::Kotlin => test_path(),
+        Language::Perl | Language::Html | Language::Nix => true,
+        _ => false,
     }
 }
 
@@ -33,54 +26,6 @@ pub(crate) fn perl_source(text: &str) -> bool {
         })
 }
 
-fn block(lang: Language, t: &[Token], pairs: &[usize], i: usize) -> Option<usize> {
-    let name = t[i].text;
-    if lang == Language::Perl {
-        if name != "subtest" || i > 0 && matches!(t[i - 1].text, ">" | "&" | "sub") {
-            return None;
-        }
-    } else {
-        if ![
-            "Describe",
-            "Context",
-            "It",
-            "BeforeAll",
-            "BeforeEach",
-            "AfterAll",
-            "AfterEach",
-            "BeforeDiscovery",
-        ]
-        .iter()
-        .any(|s| name.eq_ignore_ascii_case(s))
-        {
-            return None;
-        }
-        if i > 0 && t[i - 1].line == t[i].line && !matches!(t[i - 1].text, ";" | "{" | "}") {
-            return None;
-        }
-    }
-    let mut j = i + 1;
-    while j < t.len() {
-        let prev = t[j - 1].text;
-        match t[j].text {
-            "{" if lang == Language::Powershell && prev == "@" => j = pairs[j].min(t.len()),
-            "{" => {
-                return (pairs[j] < t.len() && (lang != Language::Perl || prev == "sub"))
-                    .then_some(j);
-            }
-            "(" if lang == Language::Perl && j == i + 1 => (),
-            "(" | "[" => j = pairs[j].min(t.len()),
-            ";" | "}" | ")" => return None,
-            _ if lang == Language::Powershell && t[j].line != t[j - 1].line && prev != "`" => {
-                return None;
-            }
-            _ => (),
-        }
-        j += 1;
-    }
-    None
-}
-
 // Inspect the header attached to a brace. A hash initializer, variable lookup,
 // registration body or assertion callback has no control header.
 fn control_body(t: &[Token], pairs: &[usize], i: usize) -> bool {
@@ -88,26 +33,25 @@ fn control_body(t: &[Token], pairs: &[usize], i: usize) -> bool {
         return false;
     };
     let header = if t[prev].text == ")" {
-        let Some(k) = pairs[prev].checked_sub(1).filter(|&k| k < prev) else {
-            return false;
-        };
-        k
+        pairs[prev].checked_sub(1).filter(|&k| k < prev)
     } else {
-        prev
+        Some(prev)
     };
-    let keyword = |word: &str| {
-        [
-            "if", "else", "elsif", "elseif", "unless", "for", "foreach", "while", "until", "do",
-            "switch", "given", "when", "default", "try", "catch", "finally", "continue", "eval",
-            "trap",
-        ]
-        .iter()
-        .any(|x| word.eq_ignore_ascii_case(x))
-    };
-    if keyword(t[header].text) {
-        return true;
-    }
-    // Perl permits an explicit iteration variable before the list.
+    header.is_some_and(|at| control_keyword(t[at].text) || perl_iteration_variable(t, at))
+}
+
+fn control_keyword(word: &str) -> bool {
+    [
+        "if", "else", "elsif", "elseif", "unless", "for", "foreach", "while", "until", "do",
+        "switch", "given", "when", "default", "try", "catch", "finally", "continue", "eval",
+        "trap",
+    ]
+    .iter()
+    .any(|x| word.eq_ignore_ascii_case(x))
+}
+
+// Perl permits an explicit iteration variable before the list.
+fn perl_iteration_variable(t: &[Token], header: usize) -> bool {
     let mut k = header;
     while k > 0
         && header - k < 4
@@ -121,47 +65,23 @@ fn control_body(t: &[Token], pairs: &[usize], i: usize) -> bool {
     false
 }
 
-pub(crate) fn adjust(lang: Language, path: &str, text: &str, original: &Score) -> Option<Score> {
-    if matches!(lang, Language::Html | Language::Nix) {
-        return super::embedded_tests::adjust(lang, path, text, original);
+fn has_registered_suites(lang: Language, role: &roles::RolePath, text: &str) -> bool {
+    match lang {
+        Language::Perl => perl_suites(role, text),
+        Language::Kotlin => text.contains("kotest"),
+        _ => true,
     }
-    if lang == Language::Perl
-        && (!text.contains("subtest") || !(roles::on_test_path(path, lang) || perl_source(text)))
-    {
-        return None;
+}
+
+fn perl_suites(role: &roles::RolePath, text: &str) -> bool {
+    if !text.contains("subtest") {
+        return false;
     }
-    let t = lexer::tokens(text, lang);
-    let pairs = script::paired_for_score(&t);
-    if lang == Language::Kotlin && !text.contains("kotest") {
-        return None;
-    }
-    let ruby_ends = if lang == Language::Ruby {
-        super::registrations::ruby_ends(&t)
-    } else {
-        Vec::new()
-    };
-    let mut registrations = if matches!(lang, Language::Powershell | Language::Perl) {
-        t.iter()
-            .enumerate()
-            .filter_map(|(i, token)| {
-                block(lang, &t, &pairs, i)
-                    .map(|open| (open, pairs[open] + 1, token.line, token.text))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        super::registrations::bodies(lang, &t, &pairs, &ruby_ends)
-    };
-    if registrations.is_empty() {
-        return None;
-    }
-    registrations.sort_unstable_by_key(|entry| entry.0);
-    let facts = analyze(lang, text);
-    let mut declarations = scan::regions(lang, text, &t, &pairs, &facts)
-        .into_iter()
-        .peekable();
-    let mut registrations = registrations.into_iter().peekable();
-    let mut stack = vec![Depth::new("<file>", 1, t.len())];
-    let mut score = Score {
+    role.is_support() || perl_source(text)
+}
+
+fn retained_score(lang: Language, original: &Score) -> Score {
+    Score {
         lines: original.lines,
         findings: original
             .findings
@@ -172,92 +92,61 @@ pub(crate) fn adjust(lang: Language, path: &str, text: &str, original: &Score) -
             })
             .cloned()
             .collect(),
-    };
-    for (i, token) in t.iter().enumerate() {
-        while stack.len() > 1 && stack.last()?.end <= i {
-            stack.pop()?.record(&mut score);
-        }
-        while declarations.peek().is_some_and(|r| r.start == i) {
-            let r = declarations.next()?;
-            stack.push(Depth::new(r.name, token.line, r.end));
-        }
-        if let Some(&(open, end, line, name)) = registrations.peek()
-            && open == i
-        {
-            registrations.next();
-            stack.push(Depth::new(name, line, end));
-        }
-        let u = stack.last_mut()?;
-        if lang == Language::Powershell {
-            u.branches += usize::from(scan::branch(lang, token.text));
-            if u.name.eq_ignore_ascii_case("It")
-                && token.text.eq_ignore_ascii_case("if")
-                && scan::at(&t, i + 1) == "("
-                && pairs[i + 1] < t.len()
-            {
-                let open = pairs[i + 1] + 1;
-                if scan::at(&t, open) == "{"
-                    && pairs[open] < t.len()
-                    && scan::at(&t, open + 1).eq_ignore_ascii_case("throw")
-                    && t.get(open + 2)
-                        .is_some_and(|arg| arg.kind == crate::domain::code::Kind::String)
-                    && (pairs[open] == open + 3
-                        || pairs[open] == open + 4 && scan::at(&t, open + 3) == ";")
-                    && !["else", "elseif"]
-                        .iter()
-                        .any(|w| scan::at(&t, pairs[open] + 1).eq_ignore_ascii_case(w))
-                {
-                    // Stored findings have line precision. Preserve a compound
-                    // expression when another decision shares the guard's line.
-                    let first = t[..i].partition_point(|v| v.line < token.line);
-                    let after = i + t[i..].partition_point(|v| v.line == token.line);
-                    if t[first..after]
-                        .iter()
-                        .filter(|v| scan::branch(lang, v.text))
-                        .count()
-                        == 1
-                    {
-                        score
-                            .findings
-                            .retain(|f| !(f.rule == Rule::Conditionals && f.line == token.line));
-                    }
-                }
-            }
-        }
-        let depth = match lang {
-            Language::Dart | Language::Php | Language::Kotlin => {
-                u.suites.depth(lang, &t, &pairs, i, u.end)
-            }
-            Language::Ruby => {
-                while u.ends.last().is_some_and(|&end| end <= i) {
-                    u.ends.pop();
-                }
-                if ruby_ends[i] < t.len()
-                    && matches!(
-                        token.text,
-                        "if" | "unless" | "for" | "while" | "until" | "case" | "begin"
-                    )
-                {
-                    u.ends.push(ruby_ends[i]);
-                }
-                u.ends.len()
-            }
-            _ => {
-                while u.ends.last().is_some_and(|&end| end <= i) {
-                    u.ends.pop();
-                }
-                if token.text == "{" && pairs[i] < t.len() && control_body(&t, &pairs, i) {
-                    u.ends.push(pairs[i]);
-                }
-                u.ends.len()
-            }
-        };
-        u.peak = u.peak.max(depth);
-        u.regions += usize::from(depth >= 2 && !u.deep);
-        u.deep = depth >= 2;
     }
-    for unit in stack.into_iter().rev() {
-        unit.record(&mut score);
+}
+
+pub(super) fn adjust(
+    role: &roles::RolePath,
+    original: &Score,
+    syntax: &super::TestSyntax<'_, '_>,
+) -> Option<Score> {
+    let (lang, text) = (syntax.lang, syntax.text);
+    if matches!(lang, Language::Html | Language::Nix) {
+        return super::embedded_tests::adjust(lang, role.path, text, original);
+    }
+    if !has_registered_suites(lang, role, text) {
+        return None;
+    }
+    let input = syntax.paired();
+    let (t, pairs) = (input.tokens, input.pairs);
+    let empty = roles::RubyBlocks::default();
+    let ruby_blocks = if lang == Language::Ruby {
+        syntax
+            .ruby_blocks
+            .get_or_init(|| roles::RubyBlocks::read(t))
+    } else {
+        &empty
+    };
+    let registrations = roles::suite_bodies(lang, input, ruby_blocks)?;
+    let declarations = syntax.regions().iter().map(|r| Opening {
+        start: r.start,
+        end: r.end,
+        owner: Depth::new(lang, r.name, t[r.start].line, r.end),
+    });
+    let registrations = registrations.into_iter().map(|body| Opening {
+        start: body.open,
+        end: body.end,
+        owner: Depth::new(lang, body.name, body.line, body.end),
+    });
+    let mut openings = with_registrations(declarations, registrations).peekable();
+    let syntax = ControlSyntax {
+        tokens: t,
+        pairs,
+        ruby_blocks,
+    };
+    let mut owners = OwnerCursor::new(t.len(), Depth::new(lang, "<file>", 1, t.len()));
+    let mut score = retained_score(lang, original);
+    let mut throw_guards = Vec::new();
+    while let Some((unit, run)) = owners.next_run(&mut openings, |unit| unit.record(&mut score)) {
+        unit.observe_run(&syntax, run, &mut throw_guards);
+    }
+    owners
+        .finish(|unit| unit.record(&mut score))
+        .record(&mut score);
+    if !throw_guards.is_empty() {
+        score.findings.retain(|f| {
+            f.rule != Rule::Conditionals || throw_guards.binary_search(&f.line).is_err()
+        });
     }
     Some(score)
 }
@@ -267,29 +156,144 @@ struct Depth<'a> {
     line: usize,
     end: usize,
     branches: usize,
-    regions: usize,
-    peak: usize,
-    deep: bool,
-    ends: Vec<usize>,
-    suites: super::control::Suites,
+    pester_case: Option<bool>,
+    depth: super::control::DepthSummary,
+    controls: ControlStack,
 }
+
+struct ControlSyntax<'a, 'text> {
+    tokens: &'a [Token<'text>],
+    pairs: &'a [usize],
+    ruby_blocks: &'a roles::RubyBlocks,
+}
+
+enum ControlStack {
+    Statements(super::control::BraceGrammar, super::control::Suites),
+    Ruby(Vec<usize>),
+    Blocks(Vec<usize>),
+}
+
+impl ControlStack {
+    fn new(lang: Language) -> Self {
+        match lang {
+            Language::Dart | Language::Php | Language::Kotlin => Self::Statements(
+                super::control::BraceGrammar::for_language(lang),
+                Default::default(),
+            ),
+            Language::Ruby => Self::Ruby(Vec::new()),
+            _ => Self::Blocks(Vec::new()),
+        }
+    }
+
+    fn depth(&mut self, syntax: &ControlSyntax, i: usize, end: usize) -> usize {
+        let t = syntax.tokens;
+        let (ends, opens) = match self {
+            Self::Statements(grammar, suites) => {
+                return suites.depth(grammar.with_tokens(t, syntax.pairs), i, end);
+            }
+            Self::Ruby(ends) => (ends, syntax.ruby_blocks.control_end(t, i)),
+            Self::Blocks(ends) => {
+                let opens = t[i].text == "{"
+                    && syntax.pairs[i] < t.len()
+                    && control_body(t, syntax.pairs, i);
+                (ends, opens.then(|| syntax.pairs[i]))
+            }
+        };
+        super::control::expire(ends, i);
+        ends.extend(opens);
+        ends.len()
+    }
+}
+
 impl<'a> Depth<'a> {
-    fn new(name: &'a str, line: usize, end: usize) -> Self {
+    fn new(lang: Language, name: &'a str, line: usize, end: usize) -> Self {
         Self {
             name,
             line,
             end,
             branches: 0,
-            regions: 0,
-            peak: 0,
-            deep: false,
-            ends: Vec::new(),
-            suites: Default::default(),
+            pester_case: (lang == Language::Powershell).then(|| name.eq_ignore_ascii_case("It")),
+            depth: Default::default(),
+            controls: ControlStack::new(lang),
         }
     }
+
+    fn observe_run(
+        &mut self,
+        syntax: &ControlSyntax,
+        run: std::ops::Range<usize>,
+        throw_guards: &mut Vec<usize>,
+    ) {
+        for i in run {
+            self.observe(syntax, i, throw_guards);
+        }
+    }
+
+    fn observe(&mut self, syntax: &ControlSyntax, i: usize, throw_guards: &mut Vec<usize>) {
+        if let Some(case) = self.pester_case {
+            let token = &syntax.tokens[i];
+            self.branches += usize::from(scan::branch(Language::Powershell, token.text));
+            if case && standalone_throw_guard(syntax.tokens, syntax.pairs, i) {
+                throw_guards.push(token.line);
+            }
+        }
+        self.depth.observe(self.controls.depth(syntax, i, self.end));
+    }
+
     fn record(&self, score: &mut Score) {
         score.record(Rule::Complexity, self.branches + 1, self.line, self.name);
-        score.record(Rule::Bumps, self.regions, self.line, self.name);
-        score.record(Rule::Nesting, self.peak, self.line, self.name);
+        self.depth.record(score, self.line, self.name);
     }
+}
+
+/// A single-statement throw guard is a Pester assertion. Keep a conditional
+/// finding when another decision shares the line (findings have line precision).
+fn standalone_throw_guard(t: &[Token], pairs: &[usize], i: usize) -> bool {
+    if !pester_throw_body(t, pairs, i) {
+        return false;
+    }
+    let line = t[i].line;
+    let first = t[..i].partition_point(|v| v.line < line);
+    let after = i + t[i..].partition_point(|v| v.line == line);
+    t[first..after]
+        .iter()
+        .filter(|v| scan::branch(Language::Powershell, v.text))
+        .take(2)
+        .count()
+        == 1
+}
+
+fn pester_throw_body(t: &[Token], pairs: &[usize], i: usize) -> bool {
+    let syntax = super::PairedSyntax { tokens: t, pairs };
+    if !t[i].text.eq_ignore_ascii_case("if") {
+        return false;
+    }
+    let Some(open) = syntax.close_paren(i + 1).map(|end| end + 1) else {
+        return false;
+    };
+    if scan::at(t, open) != "{" || pairs[open] >= t.len() {
+        return false;
+    }
+    let close = pairs[open];
+    throw_statement(t, open, close) && !pester_alternative(t, close + 1)
+}
+
+fn pester_alternative(tokens: &[Token], next: usize) -> bool {
+    ["else", "elseif"]
+        .iter()
+        .any(|word| scan::at(tokens, next).eq_ignore_ascii_case(word))
+}
+
+fn throw_statement(tokens: &[Token], open: usize, close: usize) -> bool {
+    if !scan::at(tokens, open + 1).eq_ignore_ascii_case("throw") {
+        return false;
+    }
+    let literal = tokens
+        .get(open + 2)
+        .is_some_and(|arg| arg.kind == crate::domain::code::Kind::String);
+    literal && throw_terminator(tokens, open, close)
+}
+
+fn throw_terminator(tokens: &[Token], open: usize, close: usize) -> bool {
+    close == open + 3 || (close == open + 4 && scan::at(tokens, open + 3) == ";")
 }

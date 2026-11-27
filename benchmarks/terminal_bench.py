@@ -40,25 +40,35 @@ def main():
     jobs = ROOT / "target/terminal-bench" / uuid.uuid4().hex
     status = 0
     for arm in ("baseline", "cx"):
-        cmd = ["uvx", "--from", "harbor==0.27.0", "harbor", "run",
-               "-d", "terminal-bench@2.0", "-i", args.task, "-a", "codex",
-               "--ak", "version=0.171.0", "--effort", "low", "-m", args.model,
-               "-e", "docker", "-k", str(args.attempts), "--jobs-dir", str(jobs), "--job-name", arm]
-        if arm == "cx":
-            mount = {"type": "bind", "source": str(binary), "target": "/usr/local/bin/cx", "read_only": True}
-            cmd += ["--mounts-json", json.dumps([mount]), "--extra-instruction-path",
-                    str(ROOT / "src/adapters/cli/intro.txt")]
+        command = trial_command(args, binary, jobs, arm)
         if args.dry_run:
-            print(json.dumps(cmd))
+            print(json.dumps(command))
             continue
-        status |= int(subprocess.run(cmd).returncode != 0)
-        rows = [summarize(f.parent) for f in sorted((jobs / arm).glob("*/result.json"))]
-        jobs.mkdir(parents=True, exist_ok=True)
-        (jobs / (arm + ".json")).write_text(json.dumps(rows, indent=2) + "\n")
-        status |= int(len(rows) != args.attempts or any(r["error"] or r["reward"] is None for r in rows))
+        status |= run_trial(command, jobs, arm, args.attempts)
     if not args.dry_run:
         print(jobs)
     return status
+
+
+def trial_command(args, binary, jobs, arm):
+    cmd = ["uvx", "--from", "harbor==0.27.0", "harbor", "run",
+               "-d", "terminal-bench@2.0", "-i", args.task, "-a", "codex",
+               "--ak", "version=0.171.0", "--effort", "low", "-m", args.model,
+               "-e", "docker", "-k", str(args.attempts), "--jobs-dir", str(jobs), "--job-name", arm]
+    if arm == "cx":
+        mount = {"type": "bind", "source": str(binary), "target": "/usr/local/bin/cx", "read_only": True}
+        cmd += ["--mounts-json", json.dumps([mount]), "--extra-instruction-path",
+                str(ROOT / "src/adapters/cli/intro.txt")]
+    return cmd
+
+
+def run_trial(command, jobs, arm, attempts):
+    status = int(subprocess.run(command).returncode != 0)
+    rows = [summarize(f.parent) for f in sorted((jobs / arm).glob("*/result.json"))]
+    jobs.mkdir(parents=True, exist_ok=True)
+    (jobs / (arm + ".json")).write_text(json.dumps(rows, indent=2) + "\n")
+    incomplete = len(rows) != attempts or any(r["error"] or r["reward"] is None for r in rows)
+    return status | int(incomplete)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,8 @@ fn identities(files: &[(&str, &str)]) -> Vec<String> {
         })
         .collect();
     let mut labels = HashMap::new();
-    public_labels(&units, &mut labels);
+    let files: Vec<_> = (0..units.len()).filter(|&i| units[i].analysis.script.is_some()).collect();
+    public_labels(&files, &units, &mut labels);
     let mut result: Vec<_> = labels.into_values().collect();
     result.sort();
     result
@@ -76,4 +77,18 @@ fn python_global_class_and_method_parameters() {
         .map(|s| format!("{base}{s}"))
         .collect();
     assert_eq!(out, expected);
+}
+
+#[test]
+fn paths_preserve_unicode_and_escape_each_literal_backtick() {
+    let ts = identities(&[("é`name.ts", "export const x = 1;")]);
+    assert_eq!(
+        ts,
+        ["scip-typescript  scip-typescript npm . . `é``name.ts`/x."]
+    );
+    let py = identities(&[("lib/é`name.py", "def run():\n    pass\n")]);
+    assert_eq!(
+        py,
+        ["scip-python  scip-python python workspace 0 `lib.é``name`/run()."]
+    );
 }

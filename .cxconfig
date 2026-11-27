@@ -1,0 +1,10 @@
+# These files carry ucd-generate's generated-file header. The handwritten
+# Unicode lookup code in the same directory is scored.
+[src/domain/pattern/unicode/{age,case_folding_simple,general_category,grapheme_cluster_break,perl_decimal,perl_space,perl_word,property_bool,property_names,property_values,script,script_extension,sentence_break,word_break}.rs]
+file = off # Generated Unicode 16 lookup tables distributed with regex-syntax.
+
+[benchmarks/test_quality/pairs/go/branch/transform_test.go]
+file = off # The nested assertion is the behavior evaluated by this score fixture.
+
+[tests/fixtures/languages/hcl/discovery_heredoc_template/repo/main.tf]
+file = off # This parser fixture requires a nested template expression inside a heredoc.

@@ -6,582 +6,345 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod cmake;
+pub(super) use cmake::CTest;
+mod pgxs;
+#[cfg(test)]
+use pgxs::pg_regress;
+
+#[derive(Default)]
+pub(super) struct BuildRoles {
+    pub(super) ctest: CTest,
+    pgxs: pgxs::Pgxs,
+    perl_distribution: Option<bool>,
+}
+
 type Reader<'a> = dyn FnMut(&Path) -> io::Result<Option<String>> + 'a;
 
-pub(super) fn collect(
-    lang: Language,
-    path: &str,
-    s: &Syntax<'_>,
-    out: &mut Roles,
-    read: &mut impl FnMut(&Path) -> io::Result<Option<String>>,
-) -> io::Result<()> {
-    match lang {
-        Language::CMake => cmake(path, s, out, read, false)?,
-        Language::C | Language::Cpp if s.tokens.iter().any(|t| t.text == "main") => {
-            cmake(path, s, out, read, true)?
+impl BuildRoles {
+    pub(super) fn perl_distribution(&mut self, read: &mut Reader<'_>) -> io::Result<bool> {
+        if let Some(present) = self.perl_distribution {
+            return Ok(present);
         }
-        Language::Makefile => make_targets(s.text, out),
-        Language::Sql | Language::PlPgSql => sql(path, s, out, read)?,
-        _ => {}
+        for manifest in ["dist.ini", "Makefile.PL", "cpanfile", "Build.PL"] {
+            if read(Path::new(manifest))?.is_some() {
+                self.perl_distribution = Some(true);
+                return Ok(true);
+            }
+        }
+        self.perl_distribution = Some(false);
+        Ok(false)
     }
-    Ok(())
 }
 
-#[derive(Clone)]
-struct Call {
-    name: String,
-    args: Vec<String>,
-    first: usize,
-    last: usize,
-}
-fn calls(s: &Syntax<'_>) -> Vec<Call> {
-    let mut calls = Vec::new();
-    let mut i = 0;
-    while i + 1 < s.tokens.len() {
-        if s.w(i + 1) != "(" {
-            i += 1;
-            continue;
-        }
-        let Some(last) = s.close(i + 1) else {
-            i += 1;
-            continue;
-        };
-        let mut args = Vec::new();
-        let mut begin = i + 2;
-        while begin < last {
-            let mut end = begin;
-            while end + 1 < last && s.tokens[end].span.end == s.tokens[end + 1].span.start {
-                end += 1
-            }
-            args.push(
-                s.text[s.tokens[begin].span.start..s.tokens[end].span.end]
-                    .trim_matches('"')
-                    .to_owned(),
-            );
-            begin = end + 1;
-        }
-        calls.push(Call {
-            name: s.w(i).to_ascii_lowercase(),
-            args,
-            first: i,
-            last,
-        });
-        i = last + 1;
-    }
-    calls
-}
-#[derive(Default)]
-struct Manifest {
-    top: Vec<Call>,
-    defs: HashMap<String, Vec<Call>>,
-}
-fn manifest(calls: Vec<Call>) -> Manifest {
-    let mut m = Manifest::default();
-    let mut def = None;
-    for c in calls {
-        match c.name.as_str() {
-            "macro" | "function" => def = c.args.first().map(|a| a.to_ascii_lowercase()),
-            "endmacro" | "endfunction" => def = None,
-            _ => {
-                if let Some(name) = &def {
-                    m.defs.entry(name.clone()).or_default().push(c)
-                } else {
-                    m.top.push(c)
-                }
-            }
-        }
-    }
-    m
-}
-fn direct(c: &Call) -> bool {
-    matches!(
-        c.name.as_str(),
-        "add_test" | "gtest_discover_tests" | "gtest_add_tests" | "catch_discover_tests"
-    )
-}
-fn disabled(args: &[String], body: &[Call]) -> bool {
-    // cmake_parse_arguments prefixes each boolean option. Honor a simple unconditional return for that option.
-    for parse in body.iter().filter(|c| c.name == "cmake_parse_arguments") {
-        let p = usize::from(parse.args.first().is_some_and(|a| a == "PARSE_ARGV")) * 2;
-        let (Some(prefix), Some(options)) = (parse.args.get(p), parse.args.get(p + 1)) else {
-            continue;
-        };
-        for flag in options.split(';').filter(|f| args.iter().any(|a| a == f)) {
-            if body.windows(3).any(|w| {
-                w[0].name == "if"
-                    && w[0].args == [format!("{prefix}_{flag}")]
-                    && w[1].name == "return"
-                    && w[2].name == "endif"
-            }) {
-                return true;
-            }
-        }
-    }
-    false
-}
-fn registrations<'a>(call: &'a Call, defs: &'a HashMap<String, Vec<Call>>) -> Vec<&'a Call> {
-    if direct(call) {
-        return vec![call];
-    }
-    if !defs.contains_key(&call.name) {
-        return Vec::new();
-    }
-    let mut stack = vec![call];
-    let mut visited = HashSet::new();
-    let mut found = Vec::new();
-    while let Some(c) = stack.pop() {
-        if direct(c) {
-            found.push(c);
-            continue;
-        }
-        if let Some(body) = defs.get(&c.name)
-            && !visited.contains(&c.name)
-            && !disabled(&c.args, body)
-        {
-            visited.insert(&c.name);
-            stack.extend(body);
-        }
-    }
-    found
-}
 fn script_path(dir: &Path, arg: &str) -> Option<PathBuf> {
     let value = arg
         .strip_prefix("${CMAKE_CURRENT_SOURCE_DIR}/")
         .or_else(|| arg.strip_prefix("${CMAKE_CURRENT_LIST_DIR}/"))
         .unwrap_or(arg);
-    if value.contains('$') || Path::new(value).is_absolute() {
+    if value.contains('$') {
         return None;
     }
-    let mut p = dir.to_path_buf();
-    for part in Path::new(value).components() {
-        match part {
-            std::path::Component::Normal(x) => p.push(x),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir if p.pop() => {}
-            _ => return None,
-        }
-    }
-    Some(p)
+    crate::domain::code::relative_path(dir, value)
 }
-fn executable(c: &Call) -> Option<&str> {
-    let a = &c.args;
-    if c.name == "add_test" {
-        if a.first()?.eq_ignore_ascii_case("NAME") {
-            return a
-                .get(a.iter().position(|w| w == "COMMAND")? + 1)
-                .map(String::as_str);
-        }
-        return a.get(1).map(String::as_str);
-    }
-    if direct(c) {
-        a.first().map(String::as_str)
-    } else {
-        None
-    }
-}
-fn cmake(
-    path: &str,
-    s: &Syntax<'_>,
-    out: &mut Roles,
-    read: &mut Reader<'_>,
-    c_source: bool,
-) -> io::Result<()> {
-    let file = Path::new(path);
-    let current = file.file_name().is_some_and(|n| n == "CMakeLists.txt");
-    let own = if c_source {
-        Manifest::default()
-    } else {
-        manifest(calls(s))
-    };
-    let Some(dir) = file.parent() else {
-        return Ok(());
-    };
-    let mut context = Vec::new();
-    let mut child = None;
-    for parent in dir.ancestors() {
-        let lists = parent.join("CMakeLists.txt");
-        if current && parent == dir {
-            child = Some(parent);
-            continue;
-        }
-        let Some(text) = read(&lists)? else { continue };
-        let tokens = lexer::tokens(&text, Language::CMake);
-        let pairs = script::paired_for_score(&tokens);
-        let m = manifest(calls(&Syntax {
-            tokens: &tokens,
-            pairs: &pairs,
-            text: &text,
-        }));
-        if child.is_some_and(|ch| {
-            !m.top.iter().any(|c| {
-                c.name == "add_subdirectory"
-                    && c.args
-                        .first()
-                        .and_then(|a| script_path(parent, a))
-                        .as_deref()
-                        == Some(ch)
-            })
-        }) {
-            break;
-        }
-        context.push((parent.to_path_buf(), m));
-        child = Some(parent);
-    }
-    context.insert(0, (dir.to_path_buf(), own));
-    let mut defs = HashMap::new();
-    for (index, (base, m)) in context.iter_mut().enumerate().rev() {
-        defs.extend(m.defs.drain());
-        let mut executed = HashSet::new();
-        for c in &m.top {
-            let found = registrations(c, &defs);
-            if found.is_empty() {
-                continue;
-            }
-            if index == 0 && !c_source {
-                s.add(out, c.first, Some(c.last), Role::Test, "CTest registration")
-            }
-            for f in found {
-                if let Some(e) = executable(f) {
-                    executed.insert(
-                        e.strip_prefix("$<TARGET_FILE:")
-                            .and_then(|w| w.strip_suffix('>'))
-                            .unwrap_or(e),
-                    );
-                }
-                if !c_source
-                    && matches!(executable(f), Some("cmake" | "${CMAKE_COMMAND}"))
-                    && f.args
-                        .windows(2)
-                        .any(|a| a[0] == "-P" && script_path(base, &a[1]).as_deref() == Some(file))
-                {
-                    out.base = Evidence(Role::Test, "script invoked by CTest");
-                }
-            }
-        }
-        if c_source
-            && m.top.iter().any(|c| {
-                c.name == "add_executable"
-                    && c.args
-                        .first()
-                        .is_some_and(|t| executed.contains(t.as_str()))
-                    && c.args
-                        .iter()
-                        .skip(1)
-                        .any(|a| script_path(base, a).as_deref() == Some(file))
-            })
-        {
-            for i in 0..s.tokens.len() {
-                if s.seq(i, &["main", "("])
-                    && let Some(close) = s.close(i + 1)
-                    && s.w(close + 1) == "{"
-                {
-                    s.add(
-                        out,
-                        i,
-                        s.close(close + 1),
-                        Role::Test,
-                        "entry point of a CTest executable",
-                    );
-                }
-            }
-            break;
-        }
-    }
-    Ok(())
+enum MakeLine<'a> {
+    Recipe(&'a str),
+    Header,
+    Trivia,
 }
 
-fn make_targets(text: &str, out: &mut Roles) {
-    let mut at = 0;
-    let mut current: Option<(usize, usize, usize, usize, bool)> = None;
-    let emit = |target: Option<(usize, usize, usize, usize, bool)>, out: &mut Roles| {
-        if let Some((first, last, start, end, true)) = target {
-            out.regions.push(Region {
-                first,
-                last,
-                start,
-                end,
-                evidence: Evidence(Role::Support, "build target runs a test framework"),
-            })
+impl<'a> MakeLine<'a> {
+    fn read(line: &'a str) -> Self {
+        if let Some(command) = line.strip_prefix('\t') {
+            return Self::Recipe(command);
         }
-    };
-    for (n, line) in text.split_inclusive('\n').enumerate() {
-        if let Some(cmd) = line.strip_prefix('\t') {
-            if let Some((_, last, _, end, runs)) = &mut current {
-                *last = n + 1;
-                *end = at + line.trim_end_matches('\n').len();
-                *runs |= test_runner(cmd);
+        let content = line.trim_start();
+        if content.is_empty() || content.starts_with('#') {
+            Self::Trivia
+        } else {
+            Self::Header
+        }
+    }
+}
+
+struct MakeTarget {
+    region: Region,
+    runs_tests: bool,
+}
+
+impl MakeTarget {
+    fn header(line: &str, at: usize, number: usize) -> Option<Self> {
+        let (target, rest) = line.split_once(':')?;
+        if target.contains('=') || rest.starts_with('=') {
+            return None;
+        }
+        Some(Self {
+            region: Region {
+                first: number,
+                last: number,
+                start: at,
+                end: at + line.trim_end_matches('\n').len(),
+                evidence: Evidence(Role::Support, "build target runs a test framework"),
+            },
+            runs_tests: rest
+                .split_once(';')
+                .is_some_and(|(_, cmd)| test_runner(cmd)),
+        })
+    }
+
+    fn recipe(&mut self, line: &str, at: usize, number: usize, command: &str) {
+        self.region.last = number;
+        self.region.end = at + line.trim_end_matches('\n').len();
+        self.runs_tests = self.runs_tests || test_runner(command);
+    }
+
+    fn emit(target: Option<Self>, out: &mut Roles) {
+        out.regions.extend(
+            target
+                .filter(|target| target.runs_tests)
+                .map(|target| target.region),
+        );
+    }
+}
+
+pub(super) fn make_targets(text: &str, out: &mut Roles) {
+    let mut at = 0;
+    let mut current: Option<MakeTarget> = None;
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        let number = i + 1;
+        match MakeLine::read(line) {
+            MakeLine::Recipe(command) => {
+                if let Some(target) = &mut current {
+                    target.recipe(line, at, number, command);
+                }
             }
-        } else if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
-            emit(current.take(), out);
-            if let Some((target, rest)) = line.split_once(':')
-                && !target.contains('=')
-                && !rest.starts_with('=')
-            {
-                current = Some((
-                    n + 1,
-                    n + 1,
-                    at,
-                    at + line.trim_end_matches('\n').len(),
-                    rest.split_once(';')
-                        .is_some_and(|(_, cmd)| test_runner(cmd)),
-                ));
+            MakeLine::Header => {
+                MakeTarget::emit(current.take(), out);
+                current = MakeTarget::header(line, at, number);
             }
+            MakeLine::Trivia => {}
         }
         at += line.len();
     }
-    emit(current, out);
+    MakeTarget::emit(current, out);
 }
+
+fn recipe_tool<'a>(rest: &mut &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    loop {
+        let raw = rest.trim_start();
+        let word = recipe_word(rest)?;
+        let assignment = crate::domain::code::direct::shell_word::name_len(raw.as_bytes())
+            .is_some_and(|end| raw.as_bytes().get(end) == Some(&b'='));
+        if !assignment {
+            return Some(word);
+        }
+    }
+}
+
 fn test_runner(cmd: &str) -> bool {
-    let mut a = cmd
-        .trim_start()
-        .trim_start_matches(['@', '+', '-'])
-        .split_whitespace()
-        .skip_while(|v| {
-            v.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.bytes().all(|c| c == b'_' || c.is_ascii_alphanumeric())
-            })
-        });
-    let Some(tool) = a.next() else { return false };
-    let arg = a.next();
-    match tool.rsplit('/').next().unwrap_or(tool) {
-        "go" | "cargo" | "dotnet" | "npm" | "bun" => arg == Some("test"),
+    let mut rest = cmd.trim_start().trim_start_matches(['@', '+', '-']);
+    let Some(tool) = recipe_tool(&mut rest) else {
+        return false;
+    };
+    match tool.rsplit('/').next().unwrap_or(&tool) {
+        "go" | "cargo" | "dotnet" | "npm" | "bun" => {
+            recipe_word(&mut rest).as_deref() == Some("test")
+        }
         "pytest" | "ctest" | "prove" | "pg_prove" | "phpunit" | "jest" | "vitest" => true,
         "python" | "python3" => {
-            arg == Some("-m") && matches!(a.next(), Some("pytest" | "unittest"))
+            recipe_word(&mut rest).as_deref() == Some("-m")
+                && matches!(
+                    recipe_word(&mut rest).as_deref(),
+                    Some("pytest" | "unittest")
+                )
         }
         _ => false,
     }
 }
 
-fn sql(path: &str, s: &Syntax<'_>, out: &mut Roles, read: &mut Reader<'_>) -> io::Result<()> {
-    if tap_regions(s, out) {
-        out.base = Evidence(Role::Test, "pgTAP script with a plan and finish");
-        return Ok(());
-    }
-    let file = Path::new(path);
-    let Some(dir) = file
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == "sql"))
-    else {
-        return Ok(());
-    };
-    for ancestor in dir.ancestors().skip(1) {
-        let Some(make) = read(&ancestor.join("Makefile"))? else {
-            continue;
-        };
-        let relative = file.strip_prefix(ancestor).unwrap().to_string_lossy();
-        if pg_regress(&make, &relative) {
-            out.base = Evidence(Role::Test, "SQL case selected by PostgreSQL pg_regress");
-            break;
+fn recipe_word<'a>(rest: &mut &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    use crate::domain::code::direct::shell_word::WordChars;
+    let source = rest.trim_start();
+    let mut word = WordChars::new(source);
+    let decoded = word.decoded()?;
+    *rest = &source[word.consumed()..];
+    Some(decoded)
+}
+
+impl BuildRoles {
+    pub(super) fn sql(
+        &mut self,
+        path: &str,
+        s: &Syntax<'_>,
+        out: &mut Roles,
+        read: &mut Reader<'_>,
+    ) -> io::Result<()> {
+        if tap_regions(s, out) {
+            out.base = Evidence(Role::Test, "pgTAP script with a plan and finish");
+            return Ok(());
         }
+        let file = Path::new(path);
+        let Some(dir) = file
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "sql"))
+        else {
+            return Ok(());
+        };
+        for ancestor in dir.ancestors().skip(1) {
+            let relative = file.strip_prefix(ancestor).unwrap().to_string_lossy();
+            if self
+                .pgxs
+                .selects(ancestor.join("Makefile"), &relative, read)?
+            {
+                out.base = Evidence(Role::Test, "SQL case selected by PostgreSQL pg_regress");
+                break;
+            }
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+fn select_call(s: &Syntax, i: usize) -> Option<(usize, bool)> {
+    let mut f = i + 1;
+    let from = s.w(f) == "*" && s.w(f + 1).eq_ignore_ascii_case("from");
+    if from {
+        f += 2
+    }
+    if s.w(f + 1) == "." {
+        f += 2
+    }
+    if s.w(f + 1) != "(" {
+        return None;
+    }
+    Some((f, from))
+}
+
+fn wrapper_end(s: &Syntax, statement: usize, function: usize) -> Option<usize> {
+    if statement != 0 && s.w(statement - 1) != ";" {
+        return None;
+    }
+    let end = s.close(function + 1)?;
+    matches!(s.w(end + 1), ";" | "").then_some(end)
+}
+
+enum TapCall {
+    Plan,
+    Finish,
+    Wrapper,
+    Assertion,
+}
+
+impl TapCall {
+    fn parse(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("plan") || name.eq_ignore_ascii_case("no_plan") {
+            return Some(Self::Plan);
+        }
+        if name.eq_ignore_ascii_case("finish") {
+            return Some(Self::Finish);
+        }
+        if name.eq_ignore_ascii_case("check_test") {
+            return Some(Self::Wrapper);
+        }
+        ["ok", "is", "isnt", "throws_ok", "lives_ok", "results_eq"]
+            .iter()
+            .any(|a| name.eq_ignore_ascii_case(a))
+            .then_some(Self::Assertion)
+    }
 }
 
 pub(super) fn tap_regions(s: &Syntax, out: &mut Roles) -> bool {
-    let (mut plan, mut finish) = (false, false);
-    let mut wrappers = Vec::new();
-    for i in 0..s.tokens.len() {
-        if !s.w(i).eq_ignore_ascii_case("select") {
-            continue;
-        }
-        let mut f = i + 1;
-        if s.w(f) == "*" && s.w(f + 1).eq_ignore_ascii_case("from") {
-            f += 2
-        }
-        if s.w(f + 1) == "." {
-            f += 2
-        }
-        if s.w(f + 1) != "(" {
-            continue;
-        }
-        match s.w(f).to_ascii_lowercase().as_str() {
-            "plan" | "no_plan" => plan = true,
-            "finish" => finish = true,
-            "check_test" if plan && !finish && (i == 0 || s.w(i - 1) == ";")
-                && s.w(i + 1) == "*" && s.w(i + 2).eq_ignore_ascii_case("from") => {
-                if let Some(end) = s.close(f + 1)
-                    && matches!(s.w(end + 1), ";" | "") {
-                    wrappers.push((i, end));
-                }
-            }
-            "ok" | "is" | "isnt" | "throws_ok" | "lives_ok" | "results_eq"
-                if out.base.0 == Role::Support =>
-            {
-                s.add(out, i, s.close(f + 1), Role::Test, "pgTAP assertion")
-            }
-            _ => {}
-        }
+    let mut script = TapScript::default();
+    for (i, _) in s
+        .tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.text.eq_ignore_ascii_case("select"))
+    {
+        script.select(s, i, out);
     }
-    if plan && finish {
-        for (i, end) in wrappers {
-            s.add(out, i, Some(end), Role::Test, "pgTAP assertion");
-        }
-    }
-    plan && finish
+    script.commit(s, out)
 }
 
-// Evaluate the small, side-effect-free subset of GNU make used to select a SQL case.
-// Wildcard membership is evaluated for this one existing path; no directory listing is needed.
-fn make_value(value: &str, vars: &HashMap<&str, String>, file: &str) -> String {
-    let mut steps = 128;
-    let result = expand_make_value(value, vars, file, &mut steps);
-    if steps == 0 { String::new() } else { result }
-}
-fn expand_make_value(
-    value: &str,
-    vars: &HashMap<&str, String>,
-    file: &str,
-    steps: &mut usize,
-) -> String {
-    if *steps == 0 {
-        return String::new();
-    }
-    *steps -= 1;
-    let mut tail = value;
-    let mut result = String::new();
-    while let Some((prefix, rest)) = tail.split_once("$(") {
-        result.push_str(prefix);
-        if *steps == 0 {
-            return String::new();
-        }
-        let mut level = 1;
-        let Some(end) = rest.char_indices().find_map(|(at, ch)| {
-            match ch {
-                '(' => level += 1,
-                ')' => level -= 1,
-                _ => {}
-            }
-            (level == 0).then_some(at)
-        }) else {
-            return String::new();
-        };
-        let expr = &rest[..end];
-        let v = if let Some(args) = expr.strip_prefix("wildcard ") {
-            let args = expand_make_value(args, vars, file, steps);
-            if args.split_whitespace().any(|pat| {
-                pat.split_once('*').is_some_and(|(a, b)| {
-                    file.strip_prefix(a)
-                        .and_then(|part| part.strip_suffix(b))
-                        .is_some_and(|middle| !middle.contains('/'))
-                }) || pat == file
-            }) {
-                file.to_owned()
-            } else {
-                String::new()
-            }
-        } else if let Some(args) = expr.strip_prefix("patsubst ") {
-            let mut parts = args.splitn(3, ',');
-            let (Some(pattern), Some(replacement), Some(list)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                return String::new();
-            };
-            expand_make_value(list, vars, file, steps)
-                .split_whitespace()
-                .map(|v| {
-                    if let Some((a, b)) = pattern.split_once('%')
-                        && let Some(stem) = v.strip_prefix(a).and_then(|v| v.strip_suffix(b))
-                    {
-                        replacement.replace('%', stem)
-                    } else {
-                        v.to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            vars.get(expr)
-                .map(|v| expand_make_value(v, vars, file, steps))
-                .unwrap_or_default()
-        };
-        result.push_str(&v);
-        tail = &rest[end + 1..];
-    }
-    result.push_str(tail);
-    result
-}
-fn pg_regress(make: &str, file: &str) -> bool {
-    let make = make.replace("\\\n", " ");
-    if !make.lines().map(str::trim).any(|l| {
-        l.strip_prefix("include ").is_some_and(|v| {
-            v.split_whitespace()
-                .any(|v| v == "$(PGXS)" || v.ends_with("/pgxs.mk"))
-        })
-    }) {
-        return false;
-    }
-    let mut vars: HashMap<&str, String> = HashMap::new();
-    for line in make.lines().filter(|l| !l.starts_with('\t')) {
-        let line = line.split('#').next().unwrap_or("");
-        if let Some((lhs, rhs)) = line.split_once('=') {
-            let lhs = lhs.trim();
-            let name = lhs.trim_end_matches([':', '+', '?']).trim();
-            if name.is_empty() || name.contains(char::is_whitespace) {
-                continue;
-            }
-            if lhs.ends_with('+') {
-                let v = vars.entry(name).or_default();
-                v.push(' ');
-                v.push_str(rhs.trim())
-            } else if !lhs.ends_with('?') || !vars.contains_key(name) {
-                vars.insert(name, rhs.trim().to_owned());
-            }
-        }
-    }
-    let Some(regress) = vars.get("REGRESS") else {
-        return false;
-    };
-    let opts = make_value(
-        vars.get("REGRESS_OPTS").map_or("", String::as_str),
-        &vars,
-        file,
-    );
-    let mut words = opts.split_whitespace();
-    let mut dir = ".";
-    while let Some(opt) = words.next() {
-        if let Some(d) = opt.strip_prefix("--inputdir=") {
-            dir = d
-        } else if opt == "--inputdir" {
-            dir = words.next().unwrap_or(".")
-        }
-    }
-    let Some(folder) = script_path(Path::new(""), dir).map(|d| d.join("sql")) else {
-        return false;
-    };
-    make_value(regress, &vars, file)
-        .split_whitespace()
-        .any(|case| folder.join(format!("{case}.sql")) == Path::new(file))
+#[derive(Default)]
+struct TapScript {
+    plan: bool,
+    finish: bool,
+    wrappers: Vec<(usize, usize)>,
 }
 
+impl TapScript {
+    const ASSERTION: Evidence = Evidence(Role::Test, "pgTAP assertion");
+
+    fn select(&mut self, s: &Syntax, i: usize, out: &mut Roles) {
+        let Some((kind, f, from)) =
+            select_call(s, i).and_then(|(f, from)| Some((TapCall::parse(s.w(f))?, f, from)))
+        else {
+            return;
+        };
+        self.observe(kind, s, (i, f, from), out);
+    }
+
+    fn observe(&mut self, kind: TapCall, s: &Syntax, call: (usize, usize, bool), out: &mut Roles) {
+        let (i, f, from) = call;
+        match kind {
+            TapCall::Plan => self.plan = true,
+            TapCall::Finish => self.finish = true,
+            TapCall::Wrapper => self.wrapper(s, i, f, from),
+            TapCall::Assertion => Self::assertion(s, i, f, out),
+        }
+    }
+
+    fn wrapper(&mut self, s: &Syntax, i: usize, f: usize, from: bool) {
+        let inside = self.plan && !self.finish;
+        if from && inside {
+            self.wrappers
+                .extend(wrapper_end(s, i, f).map(|end| (i, end)));
+        }
+    }
+
+    fn assertion(s: &Syntax, i: usize, f: usize, out: &mut Roles) {
+        if out.base.0 == Role::Support {
+            s.add(out, i, s.close(f + 1), Self::ASSERTION);
+        }
+    }
+
+    fn commit(self, s: &Syntax, out: &mut Roles) -> bool {
+        if !self.plan || !self.finish {
+            return false;
+        }
+        for (i, end) in self.wrappers {
+            s.add(out, i, Some(end), Self::ASSERTION);
+        }
+        true
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     fn run(path: &str, lang: Language, text: &str, files: &[(&str, &str)]) -> Roles {
         let tokens = lexer::tokens(text, lang);
         let pairs = script::paired_for_score(&tokens);
-        let mut result = Roles {
+        let result = Roles {
             base: Evidence(Role::Production, "ordinary"),
             regions: Vec::new(),
         };
-        collect(
-            lang,
-            path,
-            &Syntax {
-                tokens: &tokens,
-                pairs: &pairs,
-                text,
-            },
-            &mut result,
-            &mut |p| {
-                Ok(files
-                    .iter()
-                    .find(|(n, _)| Path::new(n) == p)
-                    .map(|(_, s)| s.to_string()))
-            },
-        )
-        .unwrap();
-        result
+        RolePath::new(path, lang)
+            .collect_syntax(
+                Syntax {
+                    tokens: &tokens,
+                    pairs: &pairs,
+                    text,
+                },
+                result,
+                &mut Context::default(),
+                &mut |p| {
+                    Ok(files
+                        .iter()
+                        .find(|(name, _)| Path::new(name) == p)
+                        .map(|(_, source)| source.to_string()))
+                },
+            )
+            .unwrap()
     }
     #[test]
     fn scoped_wrappers_label_invocations_and_registered_scripts() {
@@ -681,4 +444,28 @@ mod tests {
         assert_eq!((r.regions[0].first, r.regions[0].last), (3, 4));
         assert_eq!(r.regions[0].evidence.0, Role::Support);
     }
+}
+#[cfg(test)]
+#[test]
+fn manifests_read_by_a_shared_role_query() {
+    use std::collections::BTreeMap;
+    let root = "add_subdirectory(sub)\nfunction(run_case)\nadd_test(NAME demo COMMAND checked)\nendfunction()";
+    let local = "add_executable(checked first.c second.c)\nrun_case()";
+    let mut reads: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    let mut context = super::Context::default();
+    for name in ["sub/first.c", "sub/second.c", "sub/other.c"] {
+        let roles = super::classify_with(name, "int main(){return 0;}", &mut context, |p| {
+            *reads.entry(p.to_owned()).or_default() += 1;
+            Ok(match p.to_str().unwrap() {
+                "sub/CMakeLists.txt" => Some(local.into()),
+                "CMakeLists.txt" => Some(root.into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(roles.regions.len(), usize::from(!name.ends_with("other.c")));
+    }
+    eprintln!("manifest reads {reads:?}");
+    assert_eq!(reads[Path::new("CMakeLists.txt")], 1);
+    assert_eq!(reads[Path::new("sub/CMakeLists.txt")], 1);
 }

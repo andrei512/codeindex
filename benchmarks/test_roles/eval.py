@@ -5,23 +5,28 @@ Only an explicit --split test evaluates held-out projects. Sources are cached
 under target/test-role-eval. The cache and gold labels stay outside cx's input.
 """
 import argparse
+import bisect
 import collections
 import concurrent.futures
 import hashlib
 import json
 import os
-import re
 import subprocess
+import sys
 import tempfile
-import urllib.parse
-import urllib.request
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 import testroutes
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-ROLES = ("production", "test", "test-support", "unknown")
+sys.path.insert(0, str(HERE.parent))
+from score_response import result_paths
+from role_source import (
+    InputFile, ROLES, byte_span, checked_path, labelled_file, pin_key, pinned_files,
+    pinned_source, reason_text,
+)
 
 
 def baseline(path):
@@ -34,127 +39,158 @@ def baseline(path):
     return "production"
 
 
-def checked_path(name):
-    p = PurePosixPath(name)
-    if p.is_absolute() or not p.parts or any(s in {".", "..", ".git"} for s in p.parts):
-        raise ValueError(f"unsafe fixture path: {name!r}")
-    return p
+class Manifest(NamedTuple):
+    rows: list
+    digest: str
 
 
-def read_manifests(paths, split):
-    splits = {repo.lower(): project_split for project_split, _, repo, _ in testroutes.PROJECTS}
-    rows = []
+def manifest_hashes(manifests, paths):
+    selected = list(dict.fromkeys(paths))
+    names = collections.Counter(path.name for path in selected)
+    return {(path.name if names[path.name] == 1 else str(path)): manifests[path].digest
+            for path in selected}
+
+
+def record_manifest_pin(row, splits, by_digest):
+    repo, split = row["repository"].lower(), row["split"]
+    if split not in {"dev", "test"} or splits.setdefault(repo, split) != split:
+        raise ValueError(f"invalid or overlapping repository split: {repo}")
+    if by_digest.setdefault(row["sha256"], split) != split:
+        raise ValueError(f"identical source crosses repository splits: {repo}/{row['path']}")
+
+
+def load_manifests(paths):
+    """Validate every source pin across splits before selecting a report population."""
+    manifests = {}
+    splits = {repo.lower(): split for split, _, repo, _ in testroutes.PROJECTS}
     by_digest = {}
-    for path in paths:
-        for line in path.read_text().splitlines():
-            r = json.loads(line)
-            repo = r["repository"].lower()
-            if r["split"] not in {"dev", "test"} or splits.setdefault(repo, r["split"]) != r["split"]:
-                raise ValueError(f"invalid or overlapping repository split: {repo}")
-            if by_digest.setdefault(r["sha256"], r["split"]) != r["split"]:
-                raise ValueError(f"identical source crosses repository splits: {repo}/{r['path']}")
-            if split is None or r["split"] == split:
-                rows.append(r)
-    return rows
+    for path in dict.fromkeys(paths):
+        source = InputFile.read(path)
+        rows = source.json_lines()
+        for row in rows:
+            record_manifest_pin(row, splits, by_digest)
+        manifests[path] = Manifest(rows, source.digest())
+    return manifests
 
 
-def get_source(cache, r):
-    repo, revision, path, digest = (r[k] for k in ("repository", "revision", "path", "sha256"))
-    checked_path(path)
-    if (not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not re.fullmatch(r"[a-f0-9]{40}", revision)
-            or not re.fullmatch(r"[a-f0-9]{64}", digest)):
-        raise ValueError(f"invalid pin for {repo}/{path}")
-    blob = cache / "blobs" / digest
-    if blob.exists():
-        data = blob.read_bytes()
-    else:
-        url = f"https://raw.githubusercontent.com/{repo}/{revision}/{urllib.parse.quote(path)}"
-        with urllib.request.urlopen(url, timeout=60) as stream:
-            data = stream.read()
-    if hashlib.sha256(data).hexdigest() != digest:
-        raise ValueError(f"source hash mismatch: {repo}/{path}")
-    if not blob.exists():
-        with tempfile.NamedTemporaryFile(dir=blob.parent, delete=False) as tmp:
-            tmp.write(data)
-        Path(tmp.name).replace(blob)
-    return data
+def rate(n, d):
+    return round(n / d, 5) if d else None
 
 
-def classify(default, ranges, line):
-    for region in reversed(ranges):
-        if region["start_line"] <= line <= region["end_line"]:
-            return region["role"]
-    return default
-
-
-def mixed_roles(data, start, end, default, spans):
-    """Distinct effective roles on non-whitespace bytes; catches default-role gaps too."""
-    bounds = sorted({start, end} | {n for r in spans for n in (r["start_byte"], r["end_byte"])
-                                    if start < n < end})
-    seen = set()
-    for left, right in zip(bounds, bounds[1:]):
-        if not data[left:right].strip():
-            continue
-        role = next((r["role"] for r in reversed(spans) if r["start_byte"] <= left < r["end_byte"]), default)
-        seen.add(role)
-        if len(seen) > 1:
-            return True
-    return False
-
-
-def metrics(pairs):
-    matrix = collections.Counter(pairs)
-    def rate(n, d):
-        return round(n / d, 5) if d else None
-    measured = [(gold, pred) for gold, pred in pairs if gold != "unknown"]
-    per_role = {}
-    for role in ROLES[:-1]:
-        right = matrix[role, role]
-        per_role[role] = {
-            "precision": rate(right, sum(pred == role for _, pred in measured)),
-            "recall": rate(right, sum(gold == role for gold, _ in measured)),
-        }
-    test_roles = {"test", "test-support"}
+def precision_recall(expected, predicted):
     return {
-        "test_or_support_recall": rate(sum(a in test_roles and b in test_roles for a, b in measured),
-                                       sum(a in test_roles for a, _ in measured)),
-        "production_mislabelled_as_test": sum(a == "production" and b in test_roles for a, b in measured),
-        "labels": len(pairs),
-        "known_labels": len(measured),
-        "correct_known": sum(a == b for a, b in measured),
-        "abstained_on_known": sum(b == "unknown" for _, b in measured),
-        "accuracy_known": rate(sum(a == b for a, b in measured), len(measured)),
-        "roles": per_role,
-        "confusion_gold_to_prediction": {
-            g: {p: matrix[g, p] for p in ROLES if matrix[g, p]} for g in ROLES if any(a == g for a, _ in pairs)
-        },
+        role: {"precision": rate(row[role], predicted[role]),
+               "recall": rate(row[role], sum(row.values()))}
+        for role, row in expected.items()
+    }
+
+
+def sparse_confusion(matrix):
+    return {gold: {prediction: row[prediction] for prediction in ROLES if row[prediction]}
+            for gold, row in matrix.items() if row}
+
+
+def metrics(matrix):
+    known = {role: matrix[role] for role in ROLES if role != "unknown"}
+    predicted = sum(known.values(), collections.Counter())
+    known_count = sum(predicted.values())
+    correct = sum(row[role] for role, row in known.items())
+    test_roles = ("test", "test-support")
+
+    return {
+        "test_or_support_recall": rate(sum(known[gold][pred] for gold in test_roles for pred in test_roles),
+                                       sum(sum(known[gold].values()) for gold in test_roles)),
+        "production_mislabelled_as_test": sum(known["production"][p] for p in test_roles),
+        "labels": known_count + sum(matrix["unknown"].values()),
+        "known_labels": known_count,
+        "correct_known": correct,
+        "abstained_on_known": predicted["unknown"],
+        "accuracy_known": rate(correct, known_count),
+        "roles": precision_recall(known, predicted),
+        "confusion_gold_to_prediction": sparse_confusion(matrix),
     }
 
 
 def load_panel(rows, cache):
-    # One vote per labelled line. Never use two versions of a project to evaluate the same split.
-    projects, revisions = {}, {}
+    # Fetch each immutable source once; every label row still contributes its evidence.
+    projects = {}
+    groups = pinned_files(rows)
+    revisions = {}
+    for repo, revision, _ in groups:
+        if revisions.setdefault(repo, revision) != revision:
+            raise ValueError(f"repository has two revisions: {repo}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as workers:
-        for r, data in zip(rows, workers.map(lambda r: get_source(cache, r), rows)):
-            repo, rev, path = r["repository"].lower(), r["revision"], r["path"]
-            if revisions.setdefault(repo, rev) != rev:
-                raise ValueError(f"repository has two revisions: {repo}")
-            files = projects.setdefault(repo, {})
-            row = files.setdefault(path, {"language": r["language"], "revision": rev, "data": data, "labels": {}})
-            if row["data"] != data or row["language"] != r["language"]:
-                raise ValueError(f"conflicting file rows: {repo}/{path}")
-            if not r["labels"] and r.get("context") is not True:
-                raise ValueError(f"empty label list without context=true: {repo}/{path}")
-            if r.get("context") and r["labels"]:
-                raise ValueError(f"context-only file also has labels: {repo}/{path}")
-            line_count = data.count(b"\n") + int(bool(data) and not data.endswith(b"\n"))
-            for line, role, evidence in r["labels"]:
-                if type(line) is not int or not 1 <= line <= line_count or role not in ROLES or not evidence:
-                    raise ValueError(f"invalid label in {repo}/{path} at {line}")
-                old = row["labels"].setdefault(line, (role, evidence))
-                if old[0] != role:
-                    raise ValueError(f"conflicting labels: {repo}/{path}:{line}")
+        files = workers.map(lambda entry: labelled_file(entry, cache), groups.items())
+        for (repo, _, path), file in zip(groups, files):
+            projects.setdefault(repo, {})[path] = file
     return projects
+
+
+def role_evidence(row, key, location):
+    role = row[key]
+    if role not in ROLES or not reason_text(row.get("reason")):
+        if key == "default_role":
+            raise ValueError(f"invalid default role in {location}")
+        raise ValueError(f"invalid region in {location}: {row}")
+    return role
+
+
+def add_region(spans, covered, region):
+    for line in covered:
+        spans[line].append(region)
+
+
+def accumulate_regions(regions, source, location, spans):
+    lines = list(spans)
+    for region in regions:
+        role_evidence(region, "role", location)
+        if not source.valid_region_bounds(region):
+            raise ValueError(f"invalid region in {location}: {region}")
+        first = bisect.bisect_left(lines, region["start_line"])
+        after = bisect.bisect_right(lines, region["end_line"], lo=first)
+        add_region(spans, lines[first:after], region)
+
+
+def line_predictions(file, output, location):
+    # Validate and project each reported region once, even on context-only files.
+    source = file["source"]
+    lines = sorted(file["labels"])
+    spans = {line: [] for line in lines}
+    default = "unknown"
+    if output is not None:
+        default = role_evidence(output, "default_role", location)
+        accumulate_regions(output["regions"], source, location, spans)
+    for line, covering in spans.items():
+        role = covering[-1]["role"] if covering else default
+        mixed = bool(covering and source.mixed_roles(line, default, covering))
+        yield line, (role, mixed, output is not None)
+
+
+def labelled_predictions(repo, files, actual):
+    for path, file in sorted(files.items()):
+        for line, prediction in line_predictions(file, actual.get(path), f"{repo}/{path}"):
+            yield (repo, file["revision"], path, line), prediction
+
+
+def tracked_checkout(root, home, files):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # A relative Git config requires cx to run in this process (the
+    # macOS watcher lives at /). The named file exists only in the
+    # disposable HOME. No process or index survives the experiment.
+    (home / "gitconfig").touch()
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+               GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="../home/gitconfig")
+    for path, r in files.items():
+        dest = root / checked_path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r["source"].data)
+    # Every labelled input is tracked in its public source revision.
+    # Preserve that property, including intentionally hidden fixtures.
+    for git_args in (["init", "--quiet", "--template="], ["add", "-f", "--", "."],
+                     ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                      "commit", "--quiet", "-m", "Pinned evaluation inputs"]):
+        subprocess.run(["git", *git_args], cwd=root, env=env, check=True, capture_output=True)
+    return env
 
 
 def evaluate(projects, binary):
@@ -165,50 +201,143 @@ def evaluate(projects, binary):
             home = Path(directory, "home")
             root.mkdir()
             home.mkdir()
-            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-            # A relative Git config requires cx to run in this process (the
-            # macOS watcher lives at /). The named file exists only in the
-            # disposable HOME. No process or index survives the experiment.
-            (home / "gitconfig").touch()
-            env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
-                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="../home/gitconfig")
-            for path, r in files.items():
-                dest = root / checked_path(path)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(r["data"])
-            # Every labelled input is tracked in its public source revision.
-            # Preserve that property, including intentionally hidden fixtures.
-            for git_args in (["init", "--quiet", "--template="], ["add", "-f", "--", "."],
-                             ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                              "commit", "--quiet", "-m", "Pinned evaluation inputs"]):
-                subprocess.run(["git", *git_args], cwd=root, env=env, check=True, capture_output=True)
+            env = tracked_checkout(root, home, files)
             proc = subprocess.run([binary, "--score", "--roles", "--json"], cwd=root, env=env,
                                   capture_output=True, check=False)
             if proc.returncode:
                 raise RuntimeError(f"cx failed for {repo} (exit {proc.returncode}): {proc.stderr.decode(errors='replace')}")
-            actual = {f["path"]: f for f in json.loads(proc.stdout)["files"]}
-            for path, r in sorted(files.items()):
-                output = actual.get(path)
-                if output:
-                    if output["default_role"] not in ROLES:
-                        raise ValueError(f"invalid default role in {repo}/{path}")
-                    for region in output["regions"]:
-                        if (region["role"] not in ROLES
-                                or not 1 <= region["start_line"] <= region["end_line"]):
-                            raise ValueError(f"invalid region in {repo}/{path}: {region}")
-                # The gold labels identify lines. Two declarations may share
-                # one line, or a method may start halfway through a class line.
-                line_starts = [0, *(i + 1 for i, b in enumerate(r["data"]) if b == 10), len(r["data"])]
-                for line, (gold, evidence) in sorted(r["labels"].items()):
-                    spans = [] if not output else [region for region in output["regions"]
-                                                    if region["start_line"] <= line <= region["end_line"]]
-                    ambiguity = bool(output and mixed_roles(r["data"], line_starts[line - 1], line_starts[line],
-                                                            output["default_role"], spans))
-                    prediction = classify(output["default_role"], output["regions"], line) if output else "unknown"
-                    samples.append(dict(repository=repo, revision=r["revision"], path=path, line=line, language=r["language"],
-                                        expected=gold, cx=prediction, baseline=baseline(path),
-                                        mixed_line=ambiguity, file_returned=output is not None, evidence=evidence))
+            actual = result_paths(json.loads(proc.stdout), files, allow_missing=True)
+            samples.extend(labelled_predictions(repo, files, actual))
     return samples
+
+
+def scores(votes):
+    cx_rows = {role: collections.Counter() for role in ROLES}
+    baseline_rows = {role: collections.Counter() for role in ROLES}
+    for (gold, cx, baseline), count in votes.items():
+        cx_rows[gold][cx] += count
+        baseline_rows[gold][baseline] += count
+    return {"cx": metrics(cx_rows), "baseline": metrics(baseline_rows)}
+
+
+def macro_accuracy(by_language, arm):
+    accuracies = [r[arm]["accuracy_known"] for r in by_language.values()
+                  if r[arm]["accuracy_known"] is not None]
+    return round(sum(accuracies) / len(accuracies), 5) if accuracies else None
+
+
+def anchor(row):
+    if type(row["line"]) is not int or row["line"] < 1:
+        raise ValueError(f"invalid role anchor line: {row['line']!r}")
+    return row["repository"], row["revision"], row["path"], row["line"]
+
+
+def index_anchors(rows):
+    indexed = {anchor(row): row for row in rows}
+    if len(indexed) != len(rows):
+        raise ValueError("duplicate role anchor")
+    return indexed
+
+
+class FrozenPanel:
+    """Gold, evidence and the path baseline belong to the source manifest."""
+    def __init__(self, projects):
+        self.sites = {}
+        self.languages = collections.Counter()
+        for repo, files in projects.items():
+            for path, file in files.items():
+                predicted = baseline(path)
+                self.languages[file["language"]] += len(file["labels"])
+                for line, (gold, evidence) in file["labels"].items():
+                    self.sites[repo, file["revision"], path, line] = (file["language"], gold, predicted, evidence)
+        self.languages = +self.languages  # context-only files contribute no language denominator
+
+    def join(self, observations):
+        pending = self.sites.copy()
+        for site, (cx, mixed, returned) in observations:
+            if type(site[3]) is not int or site not in pending:
+                raise ValueError(f"duplicate or unexpected role observation: {site}")
+            language, gold, path_baseline, evidence = pending.pop(site)
+            repo, revision, path, line = site
+            yield dict(repository=repo, revision=revision, path=path, line=line, language=language,
+                       expected=gold, cx=cx, baseline=path_baseline, mixed_line=mixed,
+                       file_returned=returned, evidence=evidence)
+        if pending:
+            raise ValueError(f"missing role observation: {next(iter(pending))}")
+
+
+def reviewed_vote(decisions, sample, vote, applied):
+    decision = decisions.get(anchor(sample))
+    if decision is None:
+        return vote
+    gold, cx, path_baseline = vote
+    if (gold != decision["original_role"]
+            or decision["id"] not in sample["evidence"].removeprefix("TestRoutes ").split(", ")):
+        raise ValueError(f"review does not match original label: {anchor(sample)}")
+    applied.append(decision["id"])
+    return decision["reviewed_role"], cx, path_baseline
+
+
+def print_coverage(rows, without_testroutes):
+    repos = collections.defaultdict(lambda: collections.defaultdict(set))
+    for row in rows:
+        repos[row["language"]][row["split"]].add(row["repository"].lower())
+    if not without_testroutes:
+        for split, _, repo, _ in testroutes.PROJECTS:
+            repos["java"][split].add(repo.lower())
+    for lang, groups in sorted(repos.items()):
+        print(f"{lang:15} dev {len(groups['dev']):3} repos | test {len(groups['test']):3} repos")
+
+
+def prediction_report(observations, binary, panel):
+    review_file = HERE / "adjudications.json"
+    review_data = review_file.read_bytes()
+    decisions = index_anchors(json.loads(review_data)["adjudications"])
+    groups = collections.defaultdict(collections.Counter)
+    mixed, reviewed = collections.Counter(), collections.Counter()
+    missing_files, missing_anchors = set(), 0
+    samples, applied = [], []
+    for sample in panel.join(observations):
+        samples.append(sample)
+        vote = sample["expected"], sample["cx"], sample["baseline"]
+        groups[sample["language"]][vote] += 1
+        reviewed[reviewed_vote(decisions, sample, vote, applied)] += 1
+        if sample["mixed_line"]:
+            mixed[vote] += 1
+        if not sample["file_returned"]:
+            missing_files.add(sample["repository"] + "/" + sample["path"])
+            missing_anchors += 1
+    overall = sum(groups.values(), collections.Counter())
+    report = dict(binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                  input_visibility=dict(missing_files=sorted(missing_files), missing_anchors=missing_anchors),
+                  overall=scores(overall),
+                  reviewed=dict(overall=scores(reviewed), applied=sorted(applied),
+                                adjudications_sha256=hashlib.sha256(review_data).hexdigest()))
+    report["by_language"] = {lang: scores(groups[lang]) for lang in sorted(groups)}
+    report["language_macro_accuracy_known"] = {arm: macro_accuracy(report["by_language"], arm) for arm in ("cx", "baseline")}
+    report["ambiguous_line_anchors"] = sum(mixed.values())
+    report["excluding_ambiguous_lines"] = scores(overall - mixed)
+    report["samples"] = samples
+    return report
+
+
+def selected_cases(args, selected):
+    rows = [row for row in selected if row["split"] == args.split]
+    omitted = []
+    if not args.without_testroutes:
+        routes, omitted = testroutes.cases(args.cache, args.split)
+        rows.extend(routes)
+    return rows, omitted
+
+
+def score_selected_cases(report, projects, binary, panel):
+    binary = binary.resolve()
+    samples = evaluate(projects, binary)
+    report.update(prediction_report(samples, binary, panel))
+    for lang, row in report["by_language"].items():
+        print(f"{lang:15} cx {row['cx']['correct_known']:3}/{row['cx']['known_labels']:<3}  "
+              f"path {row['baseline']['correct_known']:3}/{row['baseline']['known_labels']:<3}  "
+              f"abstentions {row['cx']['abstained_on_known']}")
 
 
 def main():
@@ -229,76 +358,25 @@ def main():
     # to avoid inflating accuracy for ordinary programs and runnable tests.
     fixture_panel = HERE / "lexer_inputs.jsonl"
     paths = args.manifest if args.manifest is not None else canonical
-    read_manifests(list(dict.fromkeys([*canonical, fixture_panel, *paths])), None)
+    manifests = load_manifests([*canonical, fixture_panel, *paths])
+    selected = (row for path in paths for row in manifests[path].rows)
     if args.coverage:
-        repos = collections.defaultdict(lambda: collections.defaultdict(set))
-        for row in read_manifests(paths, None):
-            repos[row["language"]][row["split"]].add(row["repository"].lower())
-        if not args.without_testroutes:
-            for split, _, repo, _ in testroutes.PROJECTS:
-                repos["java"][split].add(repo.lower())
-        for lang, groups in sorted(repos.items()):
-            print(f"{lang:15} dev {len(groups['dev']):3} repos | test {len(groups['test']):3} repos")
+        print_coverage(selected, args.without_testroutes)
         return
     (args.cache / "blobs").mkdir(exist_ok=True, parents=True)
-    rows = read_manifests(paths, args.split)
-    omitted = []
-    if not args.without_testroutes:
-        routes, omitted = testroutes.cases(args.cache, args.split)
-        rows.extend(routes)
+    rows, omitted = selected_cases(args, selected)
     projects = load_panel(rows, args.cache)
     if not projects:
         parser.error("split has no cases")
-    counts = collections.Counter()
-    for files in projects.values():
-        for r in files.values():
-            if r["labels"]:
-                counts[r["language"]] += len(r["labels"])
+    panel = FrozenPanel(projects)
+    counts = panel.languages
     print(f"{args.split}: {len(projects)} repositories, {len(counts)} languages, {sum(counts.values())} labelled lines")
     report = dict(split=args.split, repositories=sorted(projects), labels_by_language=dict(sorted(counts.items())),
-                  manifest_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
+                  manifest_sha256=manifest_hashes(manifests, paths),
                   testroutes_sha256=None if args.without_testroutes else testroutes.DIGEST,
                   testroutes_excluded=omitted)
     if not args.prepare_only:
-        binary = args.binary.resolve()
-        samples = evaluate(projects, binary)
-        report["binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
-        report["input_visibility"] = {
-            "missing_files": sorted({s["repository"] + "/" + s["path"] for s in samples if not s["file_returned"]}),
-            "missing_anchors": sum(not s["file_returned"] for s in samples),
-        }
-        def scores(selected):
-            return {arm: metrics([(s["expected"], s[arm]) for s in selected]) for arm in ("cx", "baseline")}
-        report["overall"] = scores(samples)
-        review_file = HERE / "adjudications.json"
-        decisions = {(a["repository"], a["revision"], a["path"], a["line"]): a
-                     for a in json.loads(review_file.read_text())["adjudications"]}
-        reviewed, applied = [], []
-        for sample in samples:
-            key = tuple(sample[k] for k in ("repository", "revision", "path", "line"))
-            decision = decisions.get(key)
-            if decision:
-                if (sample["expected"] != decision["original_role"]
-                        or decision["id"] not in sample["evidence"].removeprefix("TestRoutes ").split(", ")):
-                    raise ValueError(f"review does not match original label: {key}")
-                sample = dict(sample, expected=decision["reviewed_role"])
-                applied.append(decision["id"])
-            reviewed.append(sample)
-        report["reviewed"] = dict(overall=scores(reviewed), applied=sorted(applied),
-                                  adjudications_sha256=hashlib.sha256(review_file.read_bytes()).hexdigest())
-        report["by_language"] = {lang: scores([s for s in samples if s["language"] == lang]) for lang in sorted(counts)}
-        def macro(arm):
-            accuracies = [r[arm]["accuracy_known"] for r in report["by_language"].values()
-                          if r[arm]["accuracy_known"] is not None]
-            return round(sum(accuracies) / len(accuracies), 5) if accuracies else None
-        report["language_macro_accuracy_known"] = {arm: macro(arm) for arm in ("cx", "baseline")}
-        report["ambiguous_line_anchors"] = sum(s["mixed_line"] for s in samples)
-        report["excluding_ambiguous_lines"] = scores([s for s in samples if not s["mixed_line"]])
-        report["samples"] = samples
-        for lang, row in report["by_language"].items():
-            print(f"{lang:15} cx {row['cx']['correct_known']:3}/{row['cx']['known_labels']:<3}  "
-                  f"path {row['baseline']['correct_known']:3}/{row['baseline']['known_labels']:<3}  "
-                  f"abstentions {row['cx']['abstained_on_known']}")
+        score_selected_cases(report, projects, args.binary, panel)
     filename = ("prepared" if args.prepare_only else "results") + "-" + args.split + ".json"
     output = args.output or args.cache / filename
     output.parent.mkdir(parents=True, exist_ok=True)

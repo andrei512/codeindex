@@ -7,7 +7,7 @@ use std::{
 };
 
 const HEADER: u64 = 64;
-const BLOCK: u64 = 4096;
+pub(super) const BLOCK: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileKind {
@@ -44,25 +44,47 @@ fn valid_root(kind: FileKind, root: &Range<u64>, len: u64) -> bool {
         }
 }
 
-fn header(kind: FileKind, id: u64, root: &Range<u64>, len: u64) -> [u8; 64] {
-    let mut h = [0u8; 64];
-    h[..8].copy_from_slice(kind.magic());
-    let major: u16 = if kind == FileKind::Manifest && root == &(0..312) {
-        2
-    } else {
-        1
-    };
-    h[8..10].copy_from_slice(&major.to_le_bytes());
-    h[10] = u8::from(kind == FileKind::Manifest && root == &(0..264));
-    h[12..14].copy_from_slice(&64u16.to_le_bytes());
-    h[16..24].copy_from_slice(&id.to_le_bytes());
-    h[24..32].copy_from_slice(&len.to_le_bytes());
-    h[32..40].copy_from_slice(&root.start.to_le_bytes());
-    h[40..48].copy_from_slice(&(root.end - root.start).to_le_bytes());
-    h[48..52].copy_from_slice(&(BLOCK as u32).to_le_bytes());
-    let crc = crc32c(&h[..60]);
-    h[60..].copy_from_slice(&crc.to_le_bytes());
-    h
+/// Metadata for the envelope and its declared payload length.
+pub struct EnvelopeHeader {
+    pub kind: FileKind,
+    pub generation: u64,
+    pub root: Range<u64>,
+    pub len: u64,
+}
+
+impl EnvelopeHeader {
+    fn version(&self) -> (u8, u8) {
+        match (self.kind, &self.root) {
+            (FileKind::Manifest, Range { start: 0, end: 312 }) => (2, 0),
+            (FileKind::Manifest, Range { start: 0, end: 264 }) => (1, 1),
+            _ => (1, 0),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.generation != 0 && valid_root(self.kind, &self.root, self.len)
+    }
+
+    fn encode(&self) -> [u8; 64] {
+        let Self {
+            kind,
+            generation,
+            root,
+            len,
+        } = self;
+        let mut h = [0u8; 64];
+        h[..8].copy_from_slice(kind.magic());
+        (h[8], h[10]) = self.version();
+        h[12..14].copy_from_slice(&64u16.to_le_bytes());
+        h[16..24].copy_from_slice(&generation.to_le_bytes());
+        h[24..32].copy_from_slice(&len.to_le_bytes());
+        h[32..40].copy_from_slice(&root.start.to_le_bytes());
+        h[40..48].copy_from_slice(&(root.end - root.start).to_le_bytes());
+        h[48..52].copy_from_slice(&(BLOCK as u32).to_le_bytes());
+        let crc = crc32c(&h[..60]);
+        h[60..].copy_from_slice(&crc.to_le_bytes());
+        h
+    }
 }
 
 /// Writes extent payload bytes directly to their final offsets. Only one partial
@@ -99,8 +121,13 @@ impl SegmentWriter {
         }
         self.sink.write_all(&self.checksums)?;
         self.sink.rewind()?;
-        self.sink
-            .write_all(&header(FileKind::Segment, id, &(0..0), self.length))?;
+        let header = EnvelopeHeader {
+            kind: FileKind::Segment,
+            generation: id,
+            root: 0..0,
+            len: self.length,
+        };
+        self.sink.write_all(&header.encode())?;
         self.sink.into_inner().map_err(|e| e.into_error())
     }
 }
@@ -137,21 +164,18 @@ impl Write for SegmentWriter {
 /// directory synchronization after all referenced extents have been sealed.
 pub fn write_envelope(
     file: &mut File,
-    kind: FileKind,
-    id: u64,
-    root: Range<u64>,
-    len: u64,
+    header: EnvelopeHeader,
     mut input: impl Read,
 ) -> io::Result<()> {
+    let len = header.len;
     physical_size(len)?;
-    if id == 0
-        || !valid_root(kind, &root, len)
-        || file.metadata()?.len() != 0
-        || file.stream_position()? != 0
-    {
+    if !header.valid() {
         return Err(invalid());
     }
-    let h = header(kind, id, &root, len);
+    if file.metadata()?.len() != 0 || file.stream_position()? != 0 {
+        return Err(invalid());
+    }
+    let h = header.encode();
     let mut sink = BufWriter::new(file);
     sink.write_all(&h)?;
     let mut checksums = Vec::new();
@@ -172,6 +196,24 @@ pub fn write_envelope(
     sink.flush()
 }
 
+fn validate_fixed_header(kind: FileKind, bytes: &[u8; 64]) -> io::Result<()> {
+    let magic = &bytes[..8] == kind.magic();
+    let version = matches!(bytes[8..10], [1, 0] | [2, 0]);
+    let geometry =
+        bytes[11..16] == [0, 64, 0, 0, 0] && bytes[48..52] == (BLOCK as u32).to_le_bytes();
+    let reserved = bytes[52..60] == [0; 8];
+    if ![magic, version, geometry, reserved]
+        .into_iter()
+        .all(|valid| valid)
+    {
+        return Err(invalid());
+    }
+    if bytes[60..] != crc32c(&bytes[..60]).to_le_bytes() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 pub struct Envelope {
     file: File,
     len: u64,
@@ -180,31 +222,73 @@ pub struct Envelope {
 
 impl Envelope {
     pub fn open(file: File, kind: FileKind, expected_id: u64) -> io::Result<Self> {
-        let mut h = [0u8; 64];
-        file.read_exact_at(&mut h, 0)?;
-        if &h[..8] != kind.magic()
-            || !matches!(h[8..10], [1, 0] | [2, 0])
-            || h[11..16] != [0, 64, 0, 0, 0]
-            || h[48..52] != (BLOCK as u32).to_le_bytes()
-            || h[52..60] != [0; 8]
-            || h[60..] != crc32c(&h[..60]).to_le_bytes()
-        {
+        let (envelope, generation) = Self::read_header(file, kind)?;
+        if generation != expected_id {
             return Err(invalid());
         }
+        Ok(envelope)
+    }
+
+    pub(super) fn open_manifest(file: File) -> io::Result<(Self, u64)> {
+        Self::read_header(file, FileKind::Manifest)
+    }
+
+    /// Read the selector directly into the buffer its table views will borrow.
+    pub(super) fn manifest_payload(&self) -> io::Result<Vec<u8>> {
+        if self.root.start != 0 || !matches!(self.root.end, 240 | 264 | 312) {
+            return Err(invalid());
+        }
+        let len = usize::try_from(self.len).map_err(|_| invalid())?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(io::Error::other)?;
+        let mut hashes = [0; 64 * 4];
+        while bytes.len() < len {
+            let start = bytes.len();
+            let n = (len - start).min(64 * BLOCK as usize);
+            bytes.resize(start + n, 0);
+            let checks = n.div_ceil(BLOCK as usize) * 4;
+            self.read_blocks(
+                start as u64 / BLOCK,
+                &mut bytes[start..],
+                &mut hashes[..checks],
+            )?;
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn into_file(self) -> File {
+        self.file
+    }
+
+    fn read_header(file: File, kind: FileKind) -> io::Result<(Self, u64)> {
+        let mut h = [0u8; 64];
+        file.read_exact_at(&mut h, 0)?;
+        validate_fixed_header(kind, &h)?;
         let word = |i: usize| u64::from_le_bytes(h[i..][..8].try_into().unwrap());
         let len = word(24);
         let start = word(32);
         let root = start..start.checked_add(word(40)).ok_or_else(invalid)?;
-        if expected_id == 0
-            || word(16) != expected_id
-            || h[10] != u8::from(kind == FileKind::Manifest && root == (0..264))
-            || (h[8] == 2) != (kind == FileKind::Manifest && root == (0..312))
-            || !valid_root(kind, &root, len)
-            || physical_size(len)? != file.metadata()?.len()
-        {
+        let generation = word(16);
+        let header = EnvelopeHeader {
+            kind,
+            generation,
+            root,
+            len,
+        };
+        if !header.valid() || header.version() != (h[8], h[10]) {
             return Err(invalid());
         }
-        Ok(Self { file, len, root })
+        if physical_size(len)? != file.metadata()?.len() {
+            return Err(invalid());
+        }
+        Ok((
+            Self {
+                file,
+                len,
+                root: header.root,
+            },
+            generation,
+        ))
     }
 
     pub fn payload_len(&self) -> u64 {
@@ -214,8 +298,31 @@ impl Envelope {
         self.root.clone()
     }
 
-    /// Deliver one verified borrowed slice per touched block. An error can
-    /// follow earlier successful calls to the consumer.
+    // Callers supply complete checksum blocks, including a short final block.
+    fn read_blocks(&self, first: u64, data: &mut [u8], hashes: &mut [u8]) -> io::Result<()> {
+        debug_assert_eq!(data.len().div_ceil(BLOCK as usize) * 4, hashes.len());
+        self.file.read_exact_at(data, HEADER + first * BLOCK)?;
+        self.file
+            .read_exact_at(hashes, HEADER + self.len + 4 * first)?;
+        for (block, hash) in data.chunks(BLOCK as usize).zip(hashes.as_chunks::<4>().0) {
+            if crc32c(block) != u32::from_le_bytes(*hash) {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_block(&self, block: u64, bytes: &mut Vec<u8>) -> io::Result<()> {
+        let begin = block
+            .checked_mul(BLOCK)
+            .filter(|&at| at < self.len)
+            .ok_or_else(invalid)?;
+        bytes.resize((self.len - begin).min(BLOCK) as usize, 0);
+        self.read_blocks(block, bytes, &mut [0; 4])
+    }
+
+    /// Deliver checksum-verified bytes in batches. A later batch can fail
+    /// after the consumer has received earlier bytes.
     pub fn visit(
         &self,
         range: Range<u64>,
@@ -238,14 +345,7 @@ impl Envelope {
             let len = (self.len - start).min(count * BLOCK) as usize;
             let data = &mut bytes[..len];
             let hashes = &mut checks[..count as usize * 4];
-            self.file.read_exact_at(data, HEADER + start)?;
-            self.file
-                .read_exact_at(hashes, HEADER + self.len + 4 * first)?;
-            for (block, hash) in data.chunks(BLOCK as usize).zip(hashes.as_chunks::<4>().0) {
-                if crc32c(block) != u32::from_le_bytes(*hash) {
-                    return Err(invalid());
-                }
-            }
+            self.read_blocks(first, data, hashes)?;
             consume(
                 &data[range.start.saturating_sub(start) as usize
                     ..(range.end - start).min(len as u64) as usize],
@@ -261,6 +361,39 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     #[test]
+    fn manifest_payload_checks_every_batch_including_the_short_tail() {
+        let path =
+            std::env::temp_dir().join(format!("codeindex-manifest-batches-{}", std::process::id()));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        let data = (0..64 * BLOCK as usize + 19)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        write_envelope(
+            &mut file,
+            EnvelopeHeader {
+                kind: FileKind::Manifest,
+                generation: 1,
+                root: 0..312,
+                len: data.len() as u64,
+            },
+            &data[..],
+        )
+        .unwrap();
+        let (manifest, _) = Envelope::open_manifest(file.try_clone().unwrap()).unwrap();
+        assert_eq!(manifest.manifest_payload().unwrap(), data);
+        let tail = data.len() - 1;
+        file.write_all_at(&[!data[tail]], HEADER + tail as u64)
+            .unwrap();
+        assert!(manifest.manifest_payload().is_err());
+    }
+
+    #[test]
     fn detects_damage_only_in_visited_blocks() {
         let path = std::env::temp_dir().join(format!("codeindex-envelope-{}", std::process::id()));
         let mut file = OpenOptions::new()
@@ -271,12 +404,28 @@ mod tests {
             .unwrap();
         std::fs::remove_file(path).unwrap();
         let bytes = vec![42; 4097];
-        write_envelope(&mut file, FileKind::Segment, 9, 0..0, 4097, &bytes[..]).unwrap();
+        write_envelope(
+            &mut file,
+            EnvelopeHeader {
+                kind: FileKind::Segment,
+                generation: 9,
+                root: 0..0,
+                len: bytes.len() as u64,
+            },
+            &bytes[..],
+        )
+        .unwrap();
         let pin = Envelope::open(file.try_clone().unwrap(), FileKind::Segment, 9).unwrap();
         let mut out = Vec::new();
         pin.visit(4095..4097, |b| out.write_all(b)).unwrap();
         assert_eq!(out, &[42, 42]);
+        let mut page = Vec::new();
+        pin.read_block(0, &mut page).unwrap();
+        assert_eq!(page, bytes[..4096]);
+        pin.read_block(1, &mut page).unwrap();
+        assert_eq!(page, bytes[4096..]);
         file.write_all_at(&[41], 64 + 4096).unwrap();
+        assert!(pin.read_block(1, &mut page).is_err());
         pin.visit(0..2, |_| Ok(())).unwrap();
         assert!(pin.visit(4096..4097, |_| Ok(())).is_err());
     }

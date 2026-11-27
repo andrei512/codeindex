@@ -2,7 +2,7 @@
 mod crc;
 mod envelope;
 
-pub use envelope::{Envelope, FileKind, SegmentWriter, write_envelope};
+pub use envelope::{Envelope, EnvelopeHeader, FileKind, SegmentWriter, write_envelope};
 pub mod manifest;
 
 mod store;

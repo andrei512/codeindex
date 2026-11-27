@@ -5,6 +5,7 @@
 # dependencies = ["lizard==1.17.31", "pathspec==1.1.1", "pygments==2.21.0", "tree-sitter-language-pack==0.9.0", "tree-sitter==0.27.0"]
 # ///
 import argparse
+from bisect import insort
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -18,6 +19,7 @@ import tempfile
 import lizard
 from finding_grammars import measure
 from score_sources import REPOS, TEST
+from score_response import scored_paths, physical_lines, observed_findings
 
 HERE = Path(__file__).resolve().parent
 LIMITS = {"branch complexity": 9, "parameters": 5, "unit lines": 70}
@@ -36,6 +38,72 @@ PER_REPO = 12
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def eligible_archive_path(member, extensions):
+    path = Path(member.name.partition("/")[2])
+    if not member.isfile() or not 100 <= member.size <= 70000:
+        return None
+    if path.suffix[1:] not in extensions:
+        return None
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    if EXCLUDED.intersection(part.lower() for part in path.parts):
+        return None
+    return path
+
+
+def ranked_members(tar, repo, extensions):
+    for member in tar:
+        if path := eligible_archive_path(member, extensions):
+            yield sha(f"{repo}/{path}".encode()), path, member
+
+
+def sample_archive(archive, repo, extensions):
+    candidates = []
+    with tarfile.open(archive, "r|gz") as tar:
+        for key, path, member in ranked_members(tar, repo, extensions):
+            if len(candidates) == 160 and key >= candidates[-1][0]:
+                continue
+            insort(candidates, (key, str(path), tar.extractfile(member).read()))
+            del candidates[160:]
+    return candidates
+
+
+def measure_source(grammar, path, text, data):
+    if grammar:
+        count, findings, rules = measure(grammar, data)
+        if not count:
+            return None
+        oracle = "tree-sitter:" + grammar
+    else:
+        return lizard_findings(path, text)
+    return count, findings, rules, oracle
+
+
+def lizard_findings(path, text):
+    funcs = [
+        f
+        for f in lizard.analyze_file.analyze_source_code(
+            path, text
+        ).function_list
+        if f.start_line > 0 and f.name != "*global*"
+    ]
+    if not funcs:
+        return None
+    findings = []
+    for f in funcs:
+        for rule, value in zip(
+            LIMITS, (f.cyclomatic_complexity, f.parameter_count, f.nloc)
+        ):
+            if value >= LIMITS[rule]:
+                findings.append(
+                    dict(rule=rule, line=f.start_line, value=value, unit=f.name)
+                )
+    count = len(funcs)
+    rules = list(LIMITS)
+    oracle = "Lizard 1.17.31"
+    return count, findings, rules, oracle
 
 
 def fetch(project, folder):
@@ -58,62 +126,36 @@ def fetch(project, folder):
             check=True,
         )
         tmp.replace(archive)
-    candidates = []
-    with tarfile.open(archive, "r|gz") as tar:
-        for member in tar:
-            path = Path(member.name.partition("/")[2])
-            if (
-                not member.isfile()
-                or not 100 <= member.size <= 70000
-                or path.suffix[1:] not in project["extensions"]
-                or EXCLUDED.intersection(p.lower() for p in path.parts)
-                or path.is_absolute()
-                or ".." in path.parts
-            ):
-                continue
-            key = sha(f"{repo}/{path}".encode())
-            if len(candidates) == 160 and key >= candidates[-1][0]:
-                continue
-            candidates.append((key, str(path), tar.extractfile(member).read()))
-            candidates.sort()
-            del candidates[160:]
-    buckets = [[], []]
+    candidates = sample_archive(archive, repo, project["extensions"])
+    return balance_cases(project, candidates)
+
+
+def distinct_utf8_sources(candidates):
     seen = set()
     for _, path, data in candidates:
         try:
             text = data.decode()
         except UnicodeDecodeError:
             continue
-        if sha(data) in seen:
+        digest = sha(data)
+        if digest not in seen:
+            seen.add(digest)
+            yield path, text, digest, data
+
+
+def measured_sources(candidates, grammar):
+    for path, text, digest, data in distinct_utf8_sources(candidates):
+        measurement = measure_source(grammar, path, text, data)
+        if measurement is None:
             continue
-        seen.add(sha(data))
-        if grammar := project.get("grammar"):
-            count, findings, rules = measure(grammar, data)
-            if not count:
-                continue
-            oracle = "tree-sitter:" + grammar
-        else:
-            funcs = [
-                f
-                for f in lizard.analyze_file.analyze_source_code(
-                    path, text
-                ).function_list
-                if f.start_line > 0 and f.name != "*global*"
-            ]
-            if not funcs:
-                continue
-            findings = []
-            for f in funcs:
-                for rule, value in zip(
-                    LIMITS, (f.cyclomatic_complexity, f.parameter_count, f.nloc)
-                ):
-                    if value >= LIMITS[rule]:
-                        findings.append(
-                            dict(rule=rule, line=f.start_line, value=value, unit=f.name)
-                        )
-            count = len(funcs)
-            rules = list(LIMITS)
-            oracle = "Lizard 1.17.31"
+        yield path, text, digest, measurement
+
+
+def balance_cases(project, candidates):
+    repo, rev = project["repository"], project["revision"]
+    buckets = [[], []]
+    for path, text, digest, measurement in measured_sources(candidates, project.get("grammar")):
+        count, findings, rules, oracle = measurement
         bucket = buckets[bool(findings)]
         if len(bucket) < PER_REPO:
             bucket.append(
@@ -122,7 +164,7 @@ def fetch(project, folder):
                     revision=rev,
                     language=project["language"],
                     path=path,
-                    source_hash=sha(data),
+                    source_hash=digest,
                     functions=count,
                     oracle=oracle,
                     rules=rules,
@@ -141,21 +183,22 @@ def fetch(project, folder):
     return selected
 
 
+def development_cases(folder, projects):
+    repos = Counter(p["language"] for p in projects)
+    if len(set(repos.values())) != 1:
+        raise ValueError("unbalanced language coverage")
+    with ThreadPoolExecutor(5) as pool:
+        return [case for block in pool.map(lambda project: fetch(project, folder), projects) for case in block]
+
+
 def prepare(folder):
     projects = json.loads((HERE / "finding_projects.json").read_text())
-    repos = Counter(p["language"] for p in projects)
-    assert len(set(repos.values())) == 1
-    with ThreadPoolExecutor(5) as pool:
-        cases = [
-            c for block in pool.map(lambda p: fetch(p, folder), projects) for c in block
-        ]
+    cases = development_cases(folder, projects)
     if len({c["source_hash"] for c in cases}) != len(cases):
         raise ValueError("Duplicate files across projects")
     body = "".join(json.dumps(c, sort_keys=True) + "\n" for c in cases)
     fingerprint = sha(body.encode())
-    lock = HERE / "finding_panel.sha256"
-    if lock.exists() and fingerprint != lock.read_text().strip():
-        raise ValueError("Pinned panel or labels changed")
+    check_panel_lock(fingerprint)
     (folder / "panel.jsonl").write_text(body)
     return dict(
         files=len(cases),
@@ -165,7 +208,13 @@ def prepare(folder):
     )
 
 
-def evaluate(folder, binary, controls=False):
+def check_panel_lock(fingerprint):
+    lock = HERE / "finding_panel.sha256"
+    if lock.exists() and fingerprint != lock.read_text().strip():
+        raise ValueError("Pinned panel or labels changed")
+
+
+def panel_inputs(folder, controls):
     if controls:
         from finding_controls import cases as control_cases
 
@@ -176,13 +225,36 @@ def evaluate(folder, binary, controls=False):
         if sha(raw) != (HERE / "finding_panel.sha256").read_text().strip():
             raise ValueError("Unexpected panel hash")
         cases = list(map(json.loads, raw.splitlines()))
+    return cases, raw
+
+
+def count_sites(summary, rules, expected, actual):
+    for label, counts in (("matched", expected & actual), ("missed", expected - actual),
+                          ("extra", actual - expected)):
+        totals = Counter()
+        for (rule, _line), count in counts.items():
+            totals[rule] += count
+        for rule in rules:
+            summary[rule][label] += totals[rule]
+
+
+def finding_sites(findings, rules, include_file, line_count):
+    selected = observed_findings(findings, line_count, rules, include_file=include_file)
+    return Counter((f["rule"], f["line"]) for f in selected)
+
+
+def evaluate(folder, binary, controls=False):
+    cases, raw = panel_inputs(folder, controls)
+    indexed = {c["project"] + "/" + c["path"]: c for c in cases}
+    if len(indexed) != len(cases):
+        raise ValueError("duplicate score finding input path")
     summary = defaultdict(lambda: defaultdict(Counter))
     details = []
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "src"
         subprocess.run(["git", "init", "-q", root], check=True)
-        for c in cases:
-            dest = root / c["project"] / c["path"]
+        for path, c in indexed.items():
+            dest = root / path
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(c["source"])
         out = json.loads(
@@ -192,25 +264,13 @@ def evaluate(folder, binary, controls=False):
                 env=dict(os.environ, HOME=td, XDG_CONFIG_HOME=td + "/.config"),
             )
         )
-        by_path = {f["path"]: f for f in out["files"]}
-        for c in cases:
-            path = c["project"] + "/" + c["path"]
+        by_path = scored_paths(out, indexed)
+        for path, c in indexed.items():
             row = by_path[path]
             expected = Counter((f["rule"], f["line"]) for f in c["findings"])
-            actual = Counter(
-                (f["rule"], f["line"])
-                for f in row["findings"]
-                if f["rule"] in c["rules"]
-                and (c.get("include_file") or f["unit"] != "<file>")
-            )
-            for rule in c["rules"]:
-                stats = summary[c["language"]][rule]
-                for key, counts in [
-                    ("matched", expected & actual),
-                    ("missed", expected - actual),
-                    ("extra", actual - expected),
-                ]:
-                    stats[key] += sum(v for (r, line), v in counts.items() if r == rule)
+            line_count = physical_lines(c["source"])
+            actual = finding_sites(row["findings"], c["rules"], c.get("include_file", False), line_count)
+            count_sites(summary[c["language"]], c["rules"], expected, actual)
             details.append(
                 dict(path=path, expected=c["findings"], actual=row["findings"])
             )

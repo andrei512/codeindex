@@ -7,80 +7,86 @@ import subprocess
 from tempfile import TemporaryDirectory
 
 
-def cases():
-    # Each translation has the same two independent decisions. A fixed expected
-    # count, a single decision, and overwriting the accumulator are controls.
-    for label, path, unit, init, branch, read in [
-        (
-            "Python",
-            "test_rules.py",
-            "def test_sample():\n{}",
-            "total = 0",
-            "if {}:\n    total += 1",
-            "assert total == {}",
-        ),
-        (
-            "Go",
-            "example_test.go",
-            'package sample\nimport "testing"\nfunc TestSample(t *testing.T) {{\n{}\n}}',
-            "total := 0",
-            "if {} {{ total++ }}",
-            'if total != {} {{ t.Errorf("count differs") }}',
-        ),
-        (
-            "C++",
-            "test/sample.cc",
-            "#include <gtest/gtest.h>\nTEST(Sample, Count) {{\n{}\n}}",
-            "int total = 0;",
-            "if ({}) {{ total++; }}",
-            "EXPECT_EQ(total, {});",
-        ),
-        (
-            "Swift",
-            "SampleTests.swift",
-            "import XCTest\nclass SampleTests: XCTestCase {{\nfunc testSample() {{\n{}\n}}\n}}",
-            "var total = 0",
-            "if {} {{ total += 1 }}",
-            "XCTAssertEqual(total, {})",
-        ),
-        (
-            "JS",
-            "sample.test.js",
-            "import {{test,expect}} from 'vitest';\ntest('sample', () => {{{}\n}});",
-            "let total = 0;",
-            "if ({}) {{ total++; }}",
-            "expect(total).toEqual({});",
-        ),
-        (
-            "Java",
-            "SampleTest.java",
-            "import org.junit.jupiter.api.*;\nclass SampleTest {{\n@Test void sample() {{\n{}\n}}\n}}",
-            "int total = 0;",
-            "if ({}) {{ total++; }}",
-            "Assertions.assertEquals(total, {});",
-        ),
+TRANSLATIONS = [
+    (
+        "Python",
+        "test_rules.py",
+        "def test_sample():\n{}",
+        "total = 0",
+        "if {}:\n    total += 1",
+        "assert total == {}",
+    ),
+    (
+        "Go",
+        "example_test.go",
+        'package sample\nimport "testing"\nfunc TestSample(t *testing.T) {{\n{}\n}}',
+        "total := 0",
+        "if {} {{ total++ }}",
+        'if total != {} {{ t.Errorf("count differs") }}',
+    ),
+    (
+        "C++",
+        "test/sample.cc",
+        "#include <gtest/gtest.h>\nTEST(Sample, Count) {{\n{}\n}}",
+        "int total = 0;",
+        "if ({}) {{ total++; }}",
+        "EXPECT_EQ(total, {});",
+    ),
+    (
+        "Swift",
+        "SampleTests.swift",
+        "import XCTest\nclass SampleTests: XCTestCase {{\nfunc testSample() {{\n{}\n}}\n}}",
+        "var total = 0",
+        "if {} {{ total += 1 }}",
+        "XCTAssertEqual(total, {})",
+    ),
+    (
+        "JS",
+        "sample.test.js",
+        "import {{test,expect}} from 'vitest';\ntest('sample', () => {{{}\n}});",
+        "let total = 0;",
+        "if ({}) {{ total++; }}",
+        "expect(total).toEqual({});",
+    ),
+    (
+        "Java",
+        "SampleTest.java",
+        "import org.junit.jupiter.api.*;\nclass SampleTest {{\n@Test void sample() {{\n{}\n}}\n}}",
+        "int total = 0;",
+        "if ({}) {{ total++; }}",
+        "Assertions.assertEquals(total, {});",
+    ),
+]
+
+
+def expectation_cases(translation):
+    label, path, unit, init, branch, read = translation
+    for scenario, want in [
+        ("assembled", 1),
+        ("fixed", 0),
+        ("one", 0),
+        ("overwritten", 0),
     ]:
-        for scenario, want in [
-            ("assembled", 1),
-            ("fixed", 0),
-            ("one", 0),
-            ("overwritten", 0),
-        ]:
-            lines = [init, branch.format("first")]
-            if scenario != "one":
-                lines.append(branch.format("second"))
-            if scenario == "overwritten":
-                lines.append("total = 0" + (";" if label in ("Java", "C++") else ""))
-            lines.append(read.format("2" if scenario == "fixed" else "actual"))
-            yield (
-                label + " " + scenario,
-                path,
-                unit.format(
-                    "\n".join("    " + s.replace("\n", "\n    ") for s in lines)
-                ),
-                "conditional test expectation",
-                want,
-            )
+        lines = [init, branch.format("first")]
+        if scenario != "one":
+            lines.append(branch.format("second"))
+        if scenario == "overwritten":
+            lines.append("total = 0" + (";" if label in ("Java", "C++") else ""))
+        lines.append(read.format("2" if scenario == "fixed" else "actual"))
+        yield (
+            label + " " + scenario,
+            path,
+            unit.format(
+                "\n".join("    " + s.replace("\n", "\n    ") for s in lines)
+            ),
+            "conditional test expectation",
+            want,
+        )
+
+
+def cases():
+    for translation in TRANSLATIONS:
+        yield from expectation_cases(translation)
     yield (
         "value used only for diagnostic",
         "test_rules.py",
@@ -95,6 +101,13 @@ def cases():
         "conditional test expectation",
         0,
     )
+    yield from indexed_expectations()
+    yield from swift_alternatives()
+    yield from pester_guards()
+    yield from pester_ownership()
+
+
+def indexed_expectations():
     for condition, second, want in [
         ("format", "items", 1),
         ("format", "other", 0),
@@ -115,6 +128,9 @@ TEST(Sample, Encoding) {
             "conditional test expectation",
             want,
         )
+
+
+def swift_alternatives():
     for separate, want in [(False, 0), (True, 1)]:
         yield (
             "alternatives " + str(separate),
@@ -132,6 +148,9 @@ class SampleTests: XCTestCase {
             "nested regions",
             want,
         )
+
+
+def pester_guards():
     for body, want in [
         ('throw "unexpected"', 0),
         ('update()\n        throw "unexpected"', 1),
@@ -150,6 +169,9 @@ Describe "sample" {{
             "compound conditions",
             want,
         )
+
+
+def pester_ownership():
     for sibling, want in [(True, 0), (False, 1)]:
         unit = 'It "many" {\n' + ("if ($flag) { Write-Output 1 }\n" * 9) + "}"
         if sibling:
@@ -165,19 +187,24 @@ Describe "sample" {{
         )
 
 
+def materialize_cases(root):
+    labels = {}
+    for n, (label, path, source, rule, want) in enumerate(cases()):
+        rel = f"{n}/{path}"
+        dest = root / rel
+        dest.parent.mkdir(parents=True)
+        dest.write_text(source)
+        labels[rel] = (label, rule, want)
+    return labels
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/cx"))
     args = parser.parse_args()
     with TemporaryDirectory() as tmp:
         root = Path(tmp)
-        labels = {}
-        for n, (label, path, source, rule, want) in enumerate(cases()):
-            rel = f"{n}/{path}"
-            dest = root / rel
-            dest.parent.mkdir(parents=True)
-            dest.write_text(source)
-            labels[rel] = (label, rule, want)
+        labels = materialize_cases(root)
         rows = json.loads(
             subprocess.check_output(
                 [args.binary.resolve(), "--score", "--json"], cwd=root

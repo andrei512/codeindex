@@ -23,6 +23,39 @@ LEXERS.update({"js":"js","jsx":"js","typescript":"js","tsx":"js","bash":"shell",
                "rb":"ruby","nixos":"nix","nasm":"assembly","ca65":"assembly","tasm":"assembly","mips":"assembly",
                "terraform":"hcl"})
 
+def paired_inputs(tar):
+    prefix = f"pygments-{REV}/"
+    files = {m.name.removeprefix(prefix): m for m in tar if m.name.startswith(prefix) and m.isfile()}
+    for path, member in sorted(files.items()):
+        language = fixture_language(path)
+        if language and path + ".output" in files:
+            yield language, path, member
+
+
+def fixture_language(path):
+    parts = path.split("/")
+    if len(parts) == 4 and parts[:2] == ["tests", "examplefiles"]:
+        return LEXERS.get(parts[2])
+
+
+def fixture_label(language, path, data):
+    if not data or b"\0" in data:
+        return None
+    try:
+        lines = data.decode().splitlines()
+    except UnicodeDecodeError:
+        return None
+    gold = [i for i, line in enumerate(lines, 1) if line.strip()]
+    if not gold:
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    (CACHE / "blobs" / digest).write_bytes(data)
+    label = [gold[len(gold) // 2], "test-support",
+             "LexerSeparateTestItem reads this file as input and compares tokens with its sibling .output golden."]
+    return dict(language=language, repository="pygments/pygments", revision=REV,
+                path=path, sha256=digest, split="dev", labels=[label])
+
+
 def main():
     ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
     (CACHE / "blobs").mkdir(exist_ok=True)
@@ -30,28 +63,10 @@ def main():
         urllib.request.urlretrieve(f"https://codeload.github.com/pygments/pygments/tar.gz/{REV}", ARCHIVE)
     rows = []
     with tarfile.open(ARCHIVE) as tar:
-        prefix = f"pygments-{REV}/"
-        files = {m.name.removeprefix(prefix): m for m in tar if m.name.startswith(prefix) and m.isfile()}
-        for path, member in sorted(files.items()):
-            parts = path.split("/")
-            if (len(parts) != 4 or parts[:2] != ["tests", "examplefiles"]
-                    or parts[2] not in LEXERS or path + ".output" not in files):
-                continue
-            data = tar.extractfile(member).read()
-            if not data or b"\0" in data:
-                continue
-            try:
-                lines = data.decode().splitlines()
-            except UnicodeDecodeError:
-                continue
-            gold = [i for i, line in enumerate(lines,1) if line.strip()]
-            if not gold:
-                continue
-            digest = hashlib.sha256(data).hexdigest()
-            (CACHE / "blobs" / digest).write_bytes(data)
-            rows.append(dict(language=LEXERS[parts[2]], repository="pygments/pygments",revision=REV,
-                path=path,sha256=digest,split="dev",labels=[[gold[len(gold)//2],"test-support",
-                "LexerSeparateTestItem reads this file as input and compares tokens with its sibling .output golden."]]))
+        for language, path, member in paired_inputs(tar):
+            row = fixture_label(language, path, tar.extractfile(member).read())
+            if row is not None:
+                rows.append(row)
     manifest = ROOT / "benchmarks/test_roles/lexer_inputs.jsonl"
     text = "".join(json.dumps(r,sort_keys=True,ensure_ascii=False)+"\n" for r in rows)
     manifest.write_text(text)

@@ -75,6 +75,13 @@ fn namespace_calls_follow_only_explicit_namespace_bindings() {
             "def f(): pass",
             "import a as m\nm.f()\nunknown.f()",
         ),
+        (
+            Language::Python,
+            "pkg/sub/module.py",
+            "app.py",
+            "def f(): pass",
+            "import pkg.sub.module\npkg . sub . module . f()\npkg.sub.module.extra.f()\ndef shadow(pkg):\n    pkg.sub.module.f()",
+        ),
     ] {
         let a = super::super::analyze(lang, source);
         let b = super::super::analyze(lang, consumer);
@@ -95,7 +102,7 @@ fn namespace_calls_follow_only_explicit_namespace_bindings() {
         assert_eq!(hits.len(), 1);
         assert_eq!(
             b.calls[hits[0].local].span.start,
-            consumer.find("m.f").unwrap() + 2
+            consumer.find("f()").unwrap()
         );
     }
 }
@@ -199,7 +206,7 @@ fn jsx_template_text_and_component_props_have_distinct_bindings() {
 }
 #[test]
 fn python_receivers_keyword_arguments_and_comprehension_scopes() {
-    let text = "class Client:\n    def send(self, value):\n        self.name = value\n        return self.name\ndef keep(value): return value\nouter=1\nseq=[outer for outer in items]\nkeep(value=outer)\n";
+    let text = "class Client:\n    def send(self, value):\n        self.name = value\n        return self.name\ndef keep(value): return value\nouter=1\nseq=[outer for outer in items]\nkeep(value=outer)\ndef nested():\n    def keep(value): return value\n    keep(value=1)\n";
     let a = super::super::analyze(Language::Python, text);
     let names = Names::build(&[Unit {
         path: "p.py",
@@ -229,8 +236,12 @@ fn python_receivers_keyword_arguments_and_comprehension_scopes() {
         text.find("outer").unwrap()
     );
     assert_eq!(
-        definition(text.rfind("value=").unwrap()),
+        definition(text.find("value=outer").unwrap()),
         text.find("keep(value").unwrap() + 5
+    );
+    assert_eq!(
+        definition(text.find("value=1").unwrap()),
+        text.find("    def keep(value").unwrap() + "    def keep(".len()
     );
 }
 
@@ -431,7 +442,12 @@ fn methods_skip_python_class_locals_and_nested_js_functions_reset_this() {
     let py = "x=0\nclass C:\n    x=1\n    def run(self):\n        return x\n";
     let js =
         "class C { value=0; run() { function inner(){ return this.value; } return this.value; } }";
-    for (path, text, lang) in [("a.py", py, Language::Python), ("a.js", js, Language::Js)] {
+    let python_reference = py.rfind('x').unwrap();
+    let inner_value = js.find("this.value").unwrap() + 5;
+    for (path, text, lang, reference, expected) in [
+        ("a.py", py, Language::Python, python_reference, Some(0)),
+        ("a.js", js, Language::Js, inner_value, None),
+    ] {
         let a = super::super::analyze(lang, text);
         let n = Names::build(&[Unit {
             path,
@@ -445,11 +461,7 @@ fn methods_skip_python_class_locals_and_nested_js_functions_reset_this() {
                 .and_then(|local| n.targets.get(&Site { file: 0, local }))
                 .map(|v| a.declarations[v[0].local].span.start)
         };
-        if lang == Language::Python {
-            assert_eq!(target(text.rfind('x').unwrap()), Some(0));
-        } else {
-            assert_eq!(target(text.find("this.value").unwrap() + 5), None);
-        }
+        assert_eq!(target(reference), expected);
     }
 }
 
@@ -502,4 +514,20 @@ fn super_call_requires_builtin_and_one_written_parent() {
         analysis: &analysis,
     }]);
     assert!(!graph.incoming.contains_key(&graph.by_name["save"][0]));
+}
+
+#[test]
+fn only_a_single_object_return_supplies_an_inferred_shape() {
+    let source = "function one() {return {x: 1};}
+        function twice() {return {x: 1}; return {x: 2};}
+        function before() {return 0; return {x: 1};}
+        function after() {return {x: 1}; return 0;}
+        function outer() {function inner() {return 0;} return {x: 1};}";
+    let analysis = super::super::analyze(Language::Js, source);
+    let evidence = analysis.script.as_ref().unwrap();
+    let mut shaped: Vec<_> = evidence.result_shapes.keys()
+        .map(|&id| &source[analysis.declarations[id].span.clone()])
+        .collect();
+    shaped.sort_unstable();
+    assert_eq!(shaped, ["one", "outer"]);
 }

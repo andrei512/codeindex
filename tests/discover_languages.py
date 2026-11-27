@@ -26,6 +26,29 @@ def run(name, command):
             "log": str(log.relative_to(ROOT))}
 
 
+def language_command(name, public):
+    command = [sys.executable, TESTS / f"language_{name}.py"]
+    if public and name in ("conformance", "named_references"):
+        command.append("--public")
+    return command
+
+
+def run_public_oracles():
+    summaries = {}
+    summaries["python_oracle"] = run("python_oracle", [sys.executable, TESTS / "language_python_oracle.py"])
+    for name in ("compiled_oracle", "format_oracle"):
+        summaries[name] = run(name, ["uv", "run", TESTS / f"language_{name}.py"])
+    # Install the pinned reference tool in the test cache; cx has no runtime dependency on it.
+    prefix = ROOT / "target/typescript-oracle"
+    summaries["typescript_setup"] = run("typescript_setup", [
+        "npm", "install", "--prefix", prefix, "--no-save", "--package-lock=false", "--ignore-scripts",
+        "--no-audit", "--no-fund", "typescript@5.9.3"])
+    if not summaries["typescript_setup"]["exit"]:
+        summaries["script_oracle"] = run("script_oracle", [
+            "node", TESTS / "language_script_oracle.cjs", prefix / "node_modules/typescript"])
+    return summaries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--public", action="store_true", help="include pinned public projects and independent compiler/parser checks")
@@ -34,22 +57,9 @@ def main():
     summaries = {}
     for name in ("conformance", "paths", "named_references", "compiled_sweeps", "script_sweeps",
                  "format_sweeps", "repository_transitions"):
-        cmd = [sys.executable, TESTS / f"language_{name}.py"]
-        if args.public and name in ("conformance", "named_references"):
-            cmd.append("--public")
-        summaries[name] = run(name, cmd)
+        summaries[name] = run(name, language_command(name, args.public))
     if args.public:
-        summaries["python_oracle"] = run("python_oracle", [sys.executable, TESTS / "language_python_oracle.py"])
-        for name in ("compiled_oracle", "format_oracle"):
-            summaries[name] = run(name, ["uv", "run", TESTS / f"language_{name}.py"])
-        # Install the pinned reference tool in the test cache; cx has no runtime dependency on it.
-        prefix = ROOT / "target/typescript-oracle"
-        summaries["typescript_setup"] = run("typescript_setup", [
-            "npm", "install", "--prefix", prefix, "--no-save", "--package-lock=false", "--ignore-scripts",
-            "--no-audit", "--no-fund", "typescript@5.9.3"])
-        if not summaries["typescript_setup"]["exit"]:
-            summaries["script_oracle"] = run("script_oracle", [
-                "node", TESTS / "language_script_oracle.cjs", prefix / "node_modules/typescript"])
+        summaries.update(run_public_oracles())
     (OUT / "suites.json").write_text(json.dumps(summaries, indent=2) + "\n")
     return int(any(result["exit"] for result in summaries.values()))
 

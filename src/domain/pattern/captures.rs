@@ -1,33 +1,158 @@
-//! Recover capture positions for the winning span only when a replacement
-//! requests them. Ordinary searches carry no per-thread capture registers.
-use super::{Regex,Inst};
-use std::ops::Range;
-pub(super) fn groups(re:&Regex,text:&str,span:Range<usize>)->Option<Vec<Option<Range<usize>>>> {
-    let mut stack=vec![(re.start,vec![None;(re.names.len()+1)*2])];
-    let mut seen=vec![usize::MAX;re.program.len()];
-    let mut next=Vec::new();
-    let mut pos=span.start;
-    let mut prev=text[..pos].chars().next_back();
-    loop {
-        let ch=text[pos..].chars().next();
-        while let Some((pc,mut slots))=stack.pop() {
-            if seen[pc]==pos {continue}
-            seen[pc]=pos;
-            match &re.program[pc] {
-                Inst::Save(slot,dest)=>{slots[*slot]=Some(pos);stack.push((*dest,slots));}
-                Inst::Fork(first,second)=>{stack.push((*second,slots.clone()));stack.push((*first,slots));}
-                Inst::Assert(a,dest) if a.accepts(prev,ch)=>stack.push((*dest,slots)),
-                Inst::Consume(c,dest) if pos<span.end && ch.is_some_and(|c1|c.accepts(c1))=>next.push((*dest,slots)),
-                Inst::Accept if pos==span.end=>{
-                    slots[0]=Some(span.start);slots[1]=Some(span.end);
-                    return Some(slots.chunks_exact(2).map(|s|Some(s[0]?..s[1]?)).collect());
-                }
-                _=>{}
+//! Replay the winning span for replacements. Forks share registers until
+//! a path writes a new capture position.
+use super::{ChunkEdges, InputBoundary, Inst, Regex, Transition, vm::Marks};
+use std::{ops::Range, rc::Rc};
+
+const UNSET: usize = usize::MAX;
+
+#[derive(Default)]
+pub(crate) struct CaptureScratch {
+    single: Threads<[usize; 2]>,
+    multiple: Threads<Rc<[usize]>>,
+    marks: Marks,
+}
+
+#[derive(Default)]
+struct Threads<R> {
+    stack: Vec<(usize, R)>,
+    next: Vec<(usize, R)>,
+}
+
+pub(crate) struct CaptureSpan<'a> {
+    pub text: &'a str,
+    pub span: Range<usize>,
+    pub edges: ChunkEdges,
+}
+
+impl CaptureScratch {
+    pub(crate) fn groups(
+        &mut self,
+        re: &Regex,
+        matched: CaptureSpan,
+    ) -> Option<Vec<Option<Range<usize>>>> {
+        self.marks.prepare(re.program.len());
+        if re.names.len() <= 1 {
+            self.single
+                .replay(re, matched, [UNSET; 2], &mut self.marks)
+        } else {
+            let registers: Rc<[usize]> = std::iter::repeat_n(UNSET, re.names.len() * 2).collect();
+            self.multiple
+                .replay(re, matched, registers, &mut self.marks)
+        }
+    }
+}
+
+trait Registers: AsRef<[usize]> + Clone {
+    fn save(&mut self, slot: usize, at: usize);
+}
+
+impl Registers for [usize; 2] {
+    fn save(&mut self, slot: usize, at: usize) {
+        self[slot] = at;
+    }
+}
+
+impl Registers for Rc<[usize]> {
+    fn save(&mut self, slot: usize, at: usize) {
+        Rc::make_mut(self)[slot] = at;
+    }
+}
+
+impl<R: Registers> Threads<R> {
+    fn replay(
+        &mut self,
+        re: &Regex,
+        matched: CaptureSpan,
+        registers: R,
+        marks: &mut Marks,
+    ) -> Option<Vec<Option<Range<usize>>>> {
+        let CaptureSpan { text, span, edges } = matched;
+        self.stack.push((re.start, registers));
+        let mut pos = span.start;
+        let mut prev = text[..pos].chars().next_back();
+        loop {
+            let ch = text[pos..].chars().next();
+            let input = CapturePosition::new(pos, &span, edges, (prev, ch));
+            if let Some(slots) = self.step(&re.program, input, marks) {
+                return Some(captured_groups(span, slots.as_ref(), re.names.len()));
+            }
+            prev = ch;
+            pos += self.resume(ch)?.len_utf8();
+        }
+    }
+
+    fn resume(&mut self, ch: Option<char>) -> Option<char> {
+        let ch = ch.filter(|_| !self.next.is_empty())?;
+        std::mem::swap(&mut self.stack, &mut self.next);
+        self.stack.reverse();
+        Some(ch)
+    }
+
+    fn step(
+        &mut self,
+        program: &[Inst],
+        input: CapturePosition,
+        marks: &mut Marks,
+    ) -> Option<R> {
+        marks.advance();
+        while let Some((pc, slots)) = self.stack.pop() {
+            if let Some(accepted) = self.visit(program, input, marks, (pc, slots)) {
+                return Some(accepted);
             }
         }
-        if next.is_empty() {return None}
-        prev=ch;
-        pos+=ch?.len_utf8();
-        stack.extend(next.drain(..).rev());
+        None
     }
+
+    fn visit(&mut self, program: &[Inst], input: CapturePosition, marks: &mut Marks, (pc, slots): (usize, R)) -> Option<R> {
+        if !marks.visit(pc) {
+            return None;
+        }
+        self.transition(program[pc].transition(input.boundary), input, slots)
+    }
+
+    fn transition(&mut self, transition: Transition, input: CapturePosition, mut slots: R) -> Option<R> {
+        match transition {
+            Transition::Save(slot, dest) => {
+                slots.save(slot - 2, input.pos);
+                self.stack.push((dest, slots));
+            }
+            Transition::Fork(first, second) => {
+                self.stack.push((second, slots.clone()));
+                self.stack.push((first, slots));
+            }
+            Transition::Follow(dest) => self.stack.push((dest, slots)),
+            Transition::Consume(dest) => self.next.push((dest, slots)),
+            Transition::Accept if input.pos == input.end => {
+                self.stack.clear();
+                self.next.clear();
+                return Some(slots);
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CapturePosition {
+    boundary: InputBoundary,
+    pos: usize,
+    end: usize,
+}
+
+impl CapturePosition {
+    fn new(pos: usize, span: &Range<usize>, edges: ChunkEdges, (prev, ch): (Option<char>, Option<char>)) -> Self {
+        let edges = ChunkEdges {
+            left_invalid: edges.left_invalid && pos == span.start,
+            right_invalid: edges.right_invalid && pos == span.end,
+        };
+        Self { pos, boundary: InputBoundary::replay(prev, ch, edges, pos < span.end), end: span.end }
+    }
+}
+
+fn captured_groups(span: Range<usize>, slots: &[usize], count: usize) -> Vec<Option<Range<usize>>> {
+    let captures = slots.chunks_exact(2).take(count).map(|pair| {
+        (pair[0] != UNSET && pair[1] != UNSET).then(|| pair[0]..pair[1])
+    });
+    std::iter::once(Some(span)).chain(captures).collect()
 }

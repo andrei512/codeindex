@@ -211,15 +211,14 @@ ${local.util()} ${self.util()} ${remote.util()} ${local.hidden()}</%def>"#;
 
 #[test]
 fn mixed_sql_preserves_outer_declarations_and_only_opens_explicit_plpgsql() {
-    use crate::domain::code::{lexer, markup};
+    use crate::domain::code::lexer;
     let s = r#"CREATE TABLE t(id int);
 CREATE FUNCTION no_pl(language plpgsql) RETURNS int AS $$ CREATE TABLE ghost(id int); $$ LANGUAGE sql;
 CREATE OR REPLACE PROCEDURE app."Refresh"() AS $p$ <<again>> LOOP EXIT again; END LOOP again; $p$ LANGUAGE plpgsql;
 CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$;
 CREATE VIEW v AS SELECT 'CREATE TABLE invalid(id int)';
 "#;
-    let mut out = markup::sql(&lexer::tokens(s, Language::Sql));
-    sql_routines(s, &mut out);
+    let out = sql(s, &lexer::tokens(s, Language::Sql));
     let syms = out
         .declarations
         .iter()

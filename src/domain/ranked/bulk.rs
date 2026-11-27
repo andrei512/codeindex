@@ -45,14 +45,15 @@ impl BulkRank {
         }
     }
     pub(crate) fn add_file(&mut self, path: &str, body: &str, chunks: &[ChunkRange]) {
-        if self.short.is_empty() && (body.len() >= 64 * 1024 || self.rank.tokens >= 2048) {
+        let large_input = body.len() >= 64 * 1024 || self.rank.tokens >= 2048;
+        if self.short.is_empty() && large_input {
             // The high byte of a packed key is its length (0..=7). MAX is unused.
             self.short.resize(4096, (u64::MAX, 0));
         }
         let first_position = self.rank.tokens;
         let file = self
             .rank
-            .add_file_with(path, body, chunks, &mut self.short, |id| self.touched.push(id));
+            .add_file_with(super::RankingDocument { path, body, chunks }, &mut self.short, |id| self.touched.push(id));
         self.terms
             .resize_with(self.rank.terms.len(), PackedTerm::default);
         for id in self.touched.drain(..) {
@@ -100,17 +101,7 @@ impl BulkRank {
         let mut rows = Vec::new();
         let mut previous = 0;
         for row in &self.rank.rows {
-            for n in [
-                self.first_file + row.file,
-                row.chunk.first_line,
-                row.chunk.last_line - row.chunk.first_line,
-                row.chunk.bytes.start,
-                row.chunk.bytes.len(),
-                row.span_start,
-                row.body_start - previous,
-                row.parts_start - row.body_start,
-                row.end - row.parts_start,
-            ] {
+            for n in row.encoded_fields(self.first_file + row.file, previous) {
                 varint(&mut rows, n);
             }
             previous = row.end;

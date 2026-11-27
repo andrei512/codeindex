@@ -10,6 +10,33 @@ use super::Document;
 pub type Trigram = [char; 3];
 pub(crate) const SAMPLE: usize = 64;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostingLayout {
+    Offsets,
+    Sampled,
+}
+
+impl PostingLayout {
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Offsets),
+            2 => Some(Self::Sampled),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn tag(self) -> [u8; 1] {
+        match self {
+            Self::Offsets => [1],
+            Self::Sampled => [2],
+        }
+    }
+
+    pub(crate) fn boundaries(self, keys: u64) -> Option<u64> {
+        keys.checked_add(u64::from(self == Self::Offsets))
+    }
+}
+
 /// Lengths remain valid when a different key gains an owner. Sampling their
 /// prefix sums bounds the number of additions required for a successful lookup.
 pub(crate) fn sampled_lengths(
@@ -36,6 +63,16 @@ pub(crate) fn sampled_lengths(
 // Three UTF-8 scalars fit in 63 bits. Numeric order matches scalar-tuple
 // order, so sorting the packed keys also orders the durable dictionary.
 const SCALAR_MASK: u64 = (1 << 21) - 1;
+pub(crate) fn encoded_key(key: u64) -> [u8; 12] {
+    let mut bytes = [0; 12];
+    for (word, shift) in bytes.chunks_exact_mut(4).zip([42, 21, 0]) {
+        word.copy_from_slice(&(((key >> shift) & SCALAR_MASK) as u32).to_le_bytes());
+    }
+    bytes
+}
+fn ascii_grams(text: &str) -> impl Iterator<Item = [u8; 3]> + '_ {
+    text.as_bytes().array_windows::<3>().copied()
+}
 pub(crate) fn grams(text: &str) -> impl Iterator<Item = u64> + '_ {
     let mut chars = text.chars();
     let mut prefix = chars
@@ -49,20 +86,58 @@ pub(crate) fn grams(text: &str) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
+/// Per-document ASCII membership shared by ordinary and sharded posting builders.
+#[derive(Default)]
+struct SeenAscii {
+    words: Vec<u64>,
+    touched: Vec<usize>,
+}
+impl SeenAscii {
+    fn allocate(&mut self) {
+        if self.words.is_empty() {
+            self.words.resize(128 * 128 * 128 / 64, 0);
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, gram: usize) -> bool {
+        let slot = gram / 64;
+        let mask = 1 << (gram % 64);
+        let old = self.words[slot];
+        if old & mask != 0 {
+            return false;
+        }
+        if old == 0 {
+            self.touched.push(slot);
+        }
+        self.words[slot] = old | mask;
+        true
+    }
+
+    fn clear(&mut self) {
+        for slot in self.touched.drain(..) {
+            self.words[slot] = 0;
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ContentBuilder {
     lists: HashMap<u64, Vec<u64>>,
     last_id: Option<u64>,
-    seen_ascii: Vec<u64>,
-    used_words: Vec<usize>,
+    seen_ascii: SeenAscii,
 }
 
 impl ContentBuilder {
     pub(crate) fn append_later(&mut self, later: Self) {
         for (key, mut owners) in later.lists {
             match self.lists.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().append(&mut owners),
-                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(owners); }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().append(&mut owners)
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(owners);
+                }
             }
         }
         self.last_id = later.last_id.or(self.last_id);
@@ -78,53 +153,58 @@ impl ContentBuilder {
         self.last_id = Some(doc.file.0);
         // The regular source alphabet has only 128³ triples. Reject repeated
         // ASCII triples before probing a posting vector for each occurrence.
-        if doc.text.len() >= 256 {
-            if self.seen_ascii.is_empty() {
-                self.seen_ascii.resize(1 << 15, 0);
-            }
-            if doc.text.is_ascii() {
-                for triple in doc.text.as_bytes().windows(3) {
-                    let [a, b, c] = [triple[0] as u64, triple[1] as u64, triple[2] as u64];
-                    self.add_ascii(a, b, c, doc.file.0);
-                }
-            } else {
-                let ascii = (127 << 42) | (127 << 21) | 127;
-                for key in grams(doc.text) {
-                    if key & !ascii == 0 {
-                        self.add_ascii(key >> 42, (key >> 21) & 127, key & 127, doc.file.0);
-                    } else {
-                        let owners = self.lists.entry(key).or_default();
-                        if owners.last() != Some(&doc.file.0) {
-                            owners.push(doc.file.0);
-                        }
-                    }
-                }
-            }
-            for word in self.used_words.drain(..) {
-                self.seen_ascii[word] = 0;
-            }
-        } else {
+        if doc.text.len() < 256 {
             for key in grams(doc.text) {
-                let owners = self.lists.entry(key).or_default();
-                if owners.last() != Some(&doc.file.0) {
-                    owners.push(doc.file.0);
-                }
+                self.insert_owner(key, doc.file.0);
             }
+            return Ok(());
         }
+        self.seen_ascii.allocate();
+        if doc.text.is_ascii() {
+            self.add_ascii_document(doc);
+        } else {
+            self.add_unicode(doc);
+        }
+        self.seen_ascii.clear();
         Ok(())
+    }
+
+    fn add_ascii_document(&mut self, doc: Document<'_>) {
+        for [a, b, c] in ascii_grams(doc.text) {
+            self.add_ascii(a.into(), b.into(), c.into(), doc.file.0);
+        }
+    }
+
+    fn add_unicode(&mut self, doc: Document<'_>) {
+        let ascii = (127 << 42) | (127 << 21) | 127;
+        for key in grams(doc.text) {
+            self.add_unicode_gram(key, doc.file.0, ascii);
+        }
+    }
+
+    fn add_unicode_gram(&mut self, key: u64, id: u64, ascii: u64) {
+        if key & !ascii == 0 {
+            self.add_ascii(key >> 42, (key >> 21) & 127, key & 127, id);
+        } else {
+            self.insert_owner(key, id);
+        }
+    }
+
+    fn insert_owner(&mut self, key: u64, id: u64) {
+        let owners = self.lists.entry(key).or_default();
+        if owners.last() != Some(&id) {
+            owners.push(id);
+        }
     }
 
     #[inline]
     fn add_ascii(&mut self, a: u64, b: u64, c: u64, id: u64) {
         let compact = ((a << 14) | (b << 7) | c) as usize;
-        let slot = &mut self.seen_ascii[compact >> 6];
-        let mask = 1 << (compact & 63);
-        if *slot & mask == 0 {
-            if *slot == 0 {
-                self.used_words.push(compact >> 6);
-            }
-            *slot |= mask;
-            self.lists.entry((a << 42) | (b << 21) | c).or_default().push(id);
+        if self.seen_ascii.insert(compact) {
+            self.lists
+                .entry((a << 42) | (b << 21) | c)
+                .or_default()
+                .push(id);
         }
     }
 
@@ -136,34 +216,45 @@ impl ContentBuilder {
         let mut out = io::BufWriter::with_capacity(64 * 1024, out);
         let mut entries: Vec<_> = self.lists.into_iter().collect();
         entries.sort_unstable_by_key(|(key, _)| *key);
-        out.write_all(&[if sampled { 2 } else { 1 }])?;
+        let layout = if sampled {
+            PostingLayout::Sampled
+        } else {
+            PostingLayout::Offsets
+        };
+        out.write_all(&layout.tag())?;
         let count = entries.len() as u64;
         out.write_all(&count.to_le_bytes())?;
         for (key, _) in &entries {
-            for shift in [42, 21, 0] {
-                out.write_all(&(((key >> shift) & SCALAR_MASK) as u32).to_le_bytes())?;
-            }
+            out.write_all(&encoded_key(*key))?;
         }
         let end = if sampled {
             sampled_lengths(&mut out, entries.iter().map(|(_, list)| list.len() as u64))?
         } else {
-            out.write_all(&(count + 1).to_le_bytes())?;
-            let mut end = 0u64;
-            out.write_all(&end.to_le_bytes())?;
-            for (_, list) in &entries {
-                end += list.len() as u64;
-                out.write_all(&end.to_le_bytes())?;
-            }
-            end
+            write_offsets(&mut out, entries.iter().map(|(_, list)| list.len() as u64))?
         };
         out.write_all(&end.to_le_bytes())?;
-        for (_, list) in entries {
-            for id in list {
-                out.write_all(&id.to_le_bytes())?;
-            }
+        for id in entries.into_iter().flat_map(|(_, owners)| owners) {
+            out.write_all(&id.to_le_bytes())?;
         }
         out.flush()
     }
+}
+
+fn write_offsets(
+    out: &mut impl Write,
+    lengths: impl ExactSizeIterator<Item = u64>,
+) -> io::Result<u64> {
+    let count = PostingLayout::Offsets
+        .boundaries(lengths.len() as u64)
+        .ok_or_else(invalid)?;
+    out.write_all(&count.to_le_bytes())?;
+    let mut end = 0u64;
+    out.write_all(&end.to_le_bytes())?;
+    for len in lengths {
+        end += len;
+        out.write_all(&end.to_le_bytes())?;
+    }
+    Ok(end)
 }
 
 fn invalid() -> io::Error {
@@ -191,37 +282,52 @@ pub struct ContentRun<'a> {
     ids: &'a [u8],
 }
 
+fn sampled_starts(data: &[u8], anchors: &[u8], n: usize) -> io::Result<Vec<u8>> {
+    if data.len() / 8 != n || anchors.len() / 8 != n.div_ceil(SAMPLE) {
+        return Err(invalid());
+    }
+    let mut cumulative = Vec::with_capacity(data.len() + 8);
+    let mut total = 0u64;
+    cumulative.extend(total.to_le_bytes());
+    for (block, anchor) in data.chunks(SAMPLE * 8).zip(anchors.as_chunks::<8>().0) {
+        if total != u64::from_le_bytes(*anchor) {
+            return Err(invalid());
+        }
+        total = decode_lengths(block, total, &mut cumulative)?;
+    }
+    Ok(cumulative)
+}
+
+fn decode_lengths(block: &[u8], mut total: u64, cumulative: &mut Vec<u8>) -> io::Result<u64> {
+    for word in block.as_chunks::<8>().0 {
+        let length = std::num::NonZeroU64::new(u64::from_le_bytes(*word)).ok_or_else(invalid)?;
+        total = total.checked_add(length.get()).ok_or_else(invalid)?;
+        cumulative.extend(total.to_le_bytes());
+    }
+    Ok(total)
+}
+
+fn sorted_posting(values: &[u8]) -> bool {
+    let ids = values.as_chunks::<8>().0;
+    !ids.is_empty()
+        && ids
+            .iter()
+            .copied()
+            .map(u64::from_le_bytes)
+            .is_sorted_by(|a, b| a < b)
+}
+
 impl<'a> ContentRun<'a> {
     pub fn open(bytes: &'a [u8]) -> io::Result<Self> {
         let (&tag, mut rest) = bytes.split_first().ok_or_else(invalid)?;
-        if !matches!(tag, 1 | 2) {
-            return Err(invalid());
-        }
+        let layout = PostingLayout::from_tag(tag).ok_or_else(invalid)?;
         let keys = vector(&mut rest, 12)?;
         let data = vector(&mut rest, 8)?;
-        let starts: std::borrow::Cow<'_, [u8]> = if tag == 1 {
+        let starts: std::borrow::Cow<'_, [u8]> = if layout == PostingLayout::Offsets {
             data.into()
         } else {
             let anchors = vector(&mut rest, 8)?;
-            let n = keys.len() / 12;
-            if data.len() / 8 != n || anchors.len() / 8 != n.div_ceil(SAMPLE) {
-                return Err(invalid());
-            }
-            let mut cumulative = Vec::with_capacity(data.len() + 8);
-            let mut total = 0u64;
-            cumulative.extend(total.to_le_bytes());
-            for (i, w) in data.as_chunks::<8>().0.iter().enumerate() {
-                if i % SAMPLE == 0 && total != number(&anchors[i / SAMPLE * 8..][..8]) {
-                    return Err(invalid());
-                }
-                let len = u64::from_le_bytes(*w);
-                if len == 0 {
-                    return Err(invalid());
-                }
-                total = total.checked_add(len).ok_or_else(invalid)?;
-                cumulative.extend(total.to_le_bytes());
-            }
-            cumulative.into()
+            sampled_starts(data, anchors, keys.len() / 12)?.into()
         };
         let ids = vector(&mut rest, 8)?;
         if !rest.is_empty()
@@ -245,15 +351,27 @@ impl<'a> ContentRun<'a> {
         Ok(key)
     }
 
-    fn values(&self, index: usize) -> io::Result<&'a [u8]> {
-        let offset = |i: usize| {
-            usize::try_from(number(&self.starts[i * 8..][..8]))
-                .ok()?
-                .checked_mul(8)
-        };
-        self.ids
-            .get(offset(index).ok_or_else(invalid)?..offset(index + 1).ok_or_else(invalid)?)
+    fn boundary(&self, index: usize) -> io::Result<usize> {
+        usize::try_from(number(&self.starts[index * 8..][..8]))
+            .ok()
+            .and_then(|n| n.checked_mul(8))
             .ok_or_else(invalid)
+    }
+    fn values(&self, index: usize) -> io::Result<&'a [u8]> {
+        self.ids
+            .get(self.boundary(index)?..self.boundary(index + 1)?)
+            .ok_or_else(invalid)
+    }
+
+    fn lists(&self) -> impl Iterator<Item = io::Result<(Trigram, &'a [u8])>> + '_ {
+        let mut start = 0;
+        (0..self.keys.len() / 12).map(move |slot| {
+            let key = self.key(slot)?;
+            let end = self.boundary(slot + 1)?;
+            let values = self.ids.get(start..end).ok_or_else(invalid)?;
+            start = end;
+            Ok((key, values))
+        })
     }
 
     pub fn lookup(&self, key: Trigram) -> io::Result<impl Iterator<Item = u64> + 'a> {
@@ -281,29 +399,12 @@ impl<'a> ContentRun<'a> {
 
     pub fn validate(&self) -> io::Result<()> {
         let mut previous = None;
-        for i in 0..self.keys.len() / 12 {
-            let key = self.key(i)?;
-            if previous.is_some_and(|p| p >= key) {
+        for record in self.lists() {
+            let (key, values) = record?;
+            if previous.is_some_and(|p| p >= key) || !sorted_posting(values) {
                 return Err(invalid());
             }
             previous = Some(key);
-            let mut prev_id = None;
-            let values = self.values(i)?;
-            if values.is_empty() {
-                return Err(invalid());
-            }
-            for id in values
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .copied()
-                .map(u64::from_le_bytes)
-            {
-                if prev_id.is_some_and(|p| p >= id) {
-                    return Err(invalid());
-                }
-                prev_id = Some(id);
-            }
         }
         Ok(())
     }
@@ -387,7 +488,12 @@ mod tests {
                     owners.push(file as u64);
                 }
             }
-            batches[file / 2].add(Document { file: FileId(file as u64), text }).unwrap();
+            batches[file / 2]
+                .add(Document {
+                    file: FileId(file as u64),
+                    text,
+                })
+                .unwrap();
         }
         let [mut first, second] = batches;
         first.append_later(second);

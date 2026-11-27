@@ -1,10 +1,12 @@
 //! Ripgrep's newline-delimited events for UTF-8 text.
 use super::{
     super::json::{array, object, quote},
-    Lines,
+    Lines, RecordAdmission, RegexScratch,
+    line_matches::{Evidence, RecordInput, Totals},
+    multiline::FullText,
+    operands::FileSearch,
 };
 use std::{
-    collections::VecDeque,
     io::Write,
     ops::Range,
     time::{Duration, Instant},
@@ -41,20 +43,13 @@ impl Stats {
         self.matches += other.matches;
         self.elapsed += other.elapsed;
     }
-    pub(super) fn scanned(
-        &mut self,
-        bytes: usize,
-        printed: usize,
-        lines: usize,
-        matches: usize,
-        start: Instant,
-    ) {
+    pub(super) fn scanned(&mut self, totals: &Totals, printed: usize, start: Instant) {
         self.searches += 1;
-        self.matched_files += usize::from(lines > 0);
-        self.bytes += bytes;
+        self.matched_files += usize::from(totals.hits > 0);
+        self.bytes += totals.byte_end;
         self.printed += printed;
-        self.lines += lines;
-        self.matches += matches;
+        self.lines += totals.hits;
+        self.matches += totals.occurrences;
         self.elapsed += start.elapsed();
     }
     pub(super) fn plain_summary(&self, start: Instant, out: &mut Vec<u8>) {
@@ -105,145 +100,183 @@ fn binary(bytes: &[u8]) -> String {
     }
     object(&[("bytes", quote(&encoded))])
 }
-fn record(
-    out: &mut Vec<u8>,
-    path: &str,
-    body: &[u8],
+struct Record<'a> {
     line: usize,
     offset: usize,
-    matched: bool,
-    ranges: &[Range<usize>],
-) {
-    let subs = ranges.iter().map(|r| {
-        object(&[
-            ("match", binary(&body[r.clone()])),
-            ("start", r.start.to_string()),
-            ("end", r.end.to_string()),
-        ])
-    });
-    event(
-        out,
-        if matched { "match" } else { "context" },
-        object(&[
-            ("path", path.into()),
-            ("lines", binary(body)),
-            ("line_number", line.to_string()),
-            ("absolute_offset", offset.to_string()),
-            ("submatches", array(subs)),
-        ]),
-    );
+    body: &'a [u8],
 }
 
-pub(super) fn search(
-    q: &Lines<'_>,
-    path: &str,
-    source: &[u8],
-    out: &mut Vec<u8>,
-    total: &mut Stats,
-) -> bool {
-    let start = Instant::now();
-    let initial = out.len();
-    let mut stats = Stats {
-        searches: 1,
-        ..Stats::default()
-    };
-    let path = text(path);
-    let mut pending = VecDeque::new();
-    let mut after_end = 0;
-    let term = if q.null_data { 0 } else { b'\n' };
-    let mut cursor = 0;
-    let mut index = 0;
-    let view = q.multiline.then(|| q.view(source));
-    let spans = view.as_ref().map(|s| q.ranges(s)).unwrap_or_default();
-    let blocks = view
-        .as_ref()
-        .map(|s| super::multiline::blocks(s, &spans))
-        .unwrap_or_default();
-    let mut groups = blocks.iter().peekable();
-    while cursor < source.len() {
-        let offset = cursor;
-        let mut end = source[cursor..]
-            .iter()
-            .position(|&b| b == term)
-            .map_or(source.len(), |i| cursor + i + 1);
-        let mut ranges = Vec::new();
-        if let Some(full) = &view {
-            if let Some(block) = groups.peek()
-                && q.original(source, full, block.start) == cursor
-            {
-                end = q.original(source, full, block.end);
-                ranges.extend(spans[block.hits.clone()].iter().map(|r| {
-                    q.original(source, full, r.start) - offset
-                        ..q.original(source, full, r.end) - offset
-                }));
-                groups.next();
-            }
-        } else {
-            let raw = &source[cursor..end];
-            let body = raw.strip_suffix(&[term]).unwrap_or(raw);
-            let body = if q.crlf {
-                body.strip_suffix(b"\r").unwrap_or(body)
-            } else {
-                body
-            };
-            let decoded = q.view(body);
-            ranges.extend(
-                q.ranges(&decoded).into_iter().map(|r| {
-                    q.original(body, &decoded, r.start)..q.original(body, &decoded, r.end)
-                }),
-            );
-        }
-        let raw = &source[cursor..end];
-        let line = index + 1;
-        let count =
-            raw.iter().filter(|&&b| b == term).count() + usize::from(!raw.ends_with(&[term]));
-        index += count;
-        cursor = end;
-        stats.bytes += raw.len();
-        let hit = (ranges.is_empty() == q.invert) && stats.lines < q.max.unwrap_or(usize::MAX);
-        if hit {
-            if stats.lines == 0 {
-                event(out, "begin", object(&[("path", path.clone())]));
-            }
-            stats.lines += count;
-            stats.matches += ranges.len();
-            for (n, at, s) in pending.drain(..) {
-                record(out, &path, s, n, at, false, &[]);
-            }
-            record(out, &path, raw, line, offset, true, &ranges);
-            after_end = line.saturating_add(q.after);
-        } else if line <= after_end {
-            record(out, &path, raw, line, offset, false, &[]);
-        } else if q.before > 0 {
-            if pending.len() == q.before {
-                pending.pop_front();
-            }
-            pending.push_back((line, offset, raw));
-        }
-        if stats.lines == q.max.unwrap_or(usize::MAX) && line >= after_end {
-            break;
-        }
-    }
-    stats.elapsed = start.elapsed();
-    stats.printed = out.len() - initial;
-    if stats.lines > 0 {
-        stats.matched_files = 1;
+impl Record<'_> {
+    fn emit(&self, out: &mut Vec<u8>, path: &str, kind: &str, ranges: &[Range<usize>]) {
+        let subs = ranges.iter().map(|r| {
+            object(&[
+                ("match", binary(&self.body[r.clone()])),
+                ("start", r.start.to_string()),
+                ("end", r.end.to_string()),
+            ])
+        });
         event(
             out,
-            "end",
+            kind,
             object(&[
-                ("path", path),
-                ("binary_offset", "null".into()),
-                ("stats", stats.json()),
+                ("path", path.into()),
+                ("lines", binary(self.body)),
+                ("line_number", self.line.to_string()),
+                ("absolute_offset", self.offset.to_string()),
+                ("submatches", array(subs)),
             ]),
         );
     }
-    total.searches += 1;
-    total.matched_files += stats.matched_files;
-    total.bytes += stats.bytes;
-    total.printed += stats.printed;
-    total.lines += stats.lines;
-    total.matches += stats.matches;
-    total.elapsed += stats.elapsed;
-    stats.lines > 0
+}
+
+/// One file's event stream owns its counters and pending context records.
+struct FileEvents<'a, 'out> {
+    out: &'out mut Vec<u8>,
+    path: String,
+    stats: Stats,
+    context: super::output::Context<'a>,
+    initial: usize,
+    started: Instant,
+}
+
+impl<'a, 'out> FileEvents<'a, 'out> {
+    fn new(q: &Lines<'_>, path: &str, out: &'out mut Vec<u8>) -> Self {
+        Self {
+            started: Instant::now(),
+            initial: out.len(),
+            out,
+            path: text(path),
+            context: super::output::Context::new(q.before, q.after, q.passthru),
+            stats: Stats { searches: 1, ..Stats::default() },
+        }
+    }
+
+    fn record(&mut self, record: Record<'a>, count: usize, ranges: &[Range<usize>], hit: bool) {
+        self.stats.bytes += record.body.len();
+        let mut emit = |row: &Record, kind: &str, spans: &[Range<usize>]| {
+            if self.out.len() == self.initial {
+                event(self.out, "begin", object(&[("path", self.path.clone())]));
+            }
+            row.emit(self.out, &self.path, kind, spans);
+        };
+        self.context.observe((record.line, record.offset, record.body), hit.then_some(record.line + (count - 1)), |line, offset, body| {
+            emit(&Record { line, offset, body }, "context", &[])
+        });
+        if hit {
+            self.stats.lines += count;
+            self.stats.matches += ranges.len();
+            emit(&record, "match", ranges);
+        }
+    }
+
+    fn finish(mut self, searched: Option<usize>, binary: Option<usize>, total: &mut Stats) -> bool {
+        if let Some(bytes) = searched {
+            self.stats.bytes = bytes;
+        }
+        self.stats.elapsed = self.started.elapsed();
+        self.stats.printed = self.out.len() - self.initial;
+        let hit = self.stats.lines > 0;
+        if self.stats.printed == 0 { return hit; }
+        self.stats.matched_files = usize::from(hit);
+        event(self.out, "end", object(&[
+            ("path", self.path),
+            ("binary_offset", binary.map_or_else(|| "null".into(), |offset| offset.to_string())),
+            ("stats", self.stats.json()),
+        ]));
+        total.add(&self.stats);
+        hit
+    }
+}
+
+/// Offset of the first NUL and the complete records available before its refill.
+pub(super) struct BinaryBoundary {
+    pub offset: usize,
+    pub prefix: usize,
+}
+
+impl BinaryBoundary {
+    fn reported(self, stopped: bool, cursor: usize) -> Option<usize> {
+        (!stopped || cursor > self.prefix).then_some(self.offset)
+    }
+}
+
+impl FileSearch<'_, '_> {
+    pub(super) fn json_events(&mut self, source: &[u8], binary: Option<BinaryBoundary>) -> bool {
+        let q = self.query;
+        let mut events = FileEvents::new(q, self.operand.name, self.out);
+        let term = if q.null_data { 0 } else { b'\n' };
+        let mut scratch = RegexScratch::default();
+        let input = RecordInput::new(q, source, term, &mut scratch);
+        if let Some(full) = input.full.as_ref().filter(|_| !q.invert) {
+            let (cursor, stopped) = events.grouped(q, source, term, full);
+            let binary_offset = binary.and_then(|b| b.reported(stopped, cursor));
+            return events.finish(Some(full.searched(source, q.byte_input, term)), binary_offset, self.stats);
+        }
+        let admission = RecordAdmission::new(q.record_limit(), q.after, q.stop_on_nonmatch);
+        let evidence = Evidence { render: !q.multiline, ..Evidence::default() };
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        let totals = input.visit(&mut scratch, admission, evidence, |row| {
+            let r = row.record;
+            cursor = r.byte_end;
+            events.record(Record {
+                line: r.line, offset: r.byte_start, body: &source[r.byte_start..r.byte_end],
+            }, 1, row.source_ranges(q.byte_input, &mut ranges), row.hit);
+        });
+        let binary_offset = binary.and_then(|b| b.reported(totals.stopped, cursor));
+        // An inverted multiline query searched the whole input before visiting rows.
+        events.finish(q.multiline.then_some(source.len()), binary_offset, self.stats)
+    }
+}
+
+impl<'a> FileEvents<'a, '_> {
+    /// Positive multiline events present each covered block as one match.
+    fn grouped(&mut self, q: &Lines<'_>, source: &'a [u8], term: u8, full: &FullText<'_>) -> (usize, bool) {
+        let spans = &full.selection.spans;
+        let mut groups = full.selection.blocks(&full.view, char::from(term)).peekable();
+        let mut original = super::offsets::cursor(source, &full.view, q.byte_input);
+        let scan_end = full.original_offset(source, q.byte_input, full.selection.end);
+        let mut admission = RecordAdmission::new(q.record_limit(), q.after, q.stop_on_nonmatch);
+        let mut ranges = Vec::new();
+        let mut cursor = 0;
+        let mut line = 0;
+        while cursor < scan_end {
+            let offset = cursor;
+            ranges.clear();
+            let block = groups.next_if(|block| original(block.start) == offset);
+            let range = block.map(|block| project_block(block, spans, &mut original, (offset, &mut ranges)));
+            let (end, count) = grouped_record(source, term, offset, range);
+            let hit = !ranges.is_empty();
+            self.record(Record { line: line + 1, offset, body: &source[offset..end] }, count, &ranges, hit);
+            line += count;
+            cursor = end;
+            if admission.observe(hit, line, count) {
+                return (cursor, true);
+            }
+        }
+        (cursor, false)
+    }
+}
+
+fn project_block(
+    block: super::multiline::Block,
+    spans: &[Range<usize>],
+    original: &mut impl FnMut(usize) -> usize,
+    (offset, ranges): (usize, &mut Vec<Range<usize>>),
+) -> Range<usize> {
+    ranges.extend(spans[block.hits].iter().map(|r| original(r.start) - offset..original(r.end) - offset));
+    offset..original(block.end)
+}
+
+fn grouped_record(source: &[u8], term: u8, offset: usize, block: Option<Range<usize>>) -> (usize, usize) {
+    if let Some(block) = block {
+        let end = block.end;
+        let matched = &source[block];
+        let count = matched.iter().filter(|&&b| b == term).count()
+            + usize::from(!matched.ends_with(&[term]));
+        return (end, count);
+    }
+    let end = source[offset..].iter().position(|&b| b == term)
+        .map_or(source.len(), |i| offset + i + 1);
+    (end, 1)
 }

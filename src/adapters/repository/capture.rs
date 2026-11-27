@@ -22,6 +22,14 @@ unsafe extern "C" {
     fn openat(fd: c_int, path: *const c_char, options: c_int, ...) -> c_int;
 }
 
+fn open_at(parent: &File, name: &CString, flags: c_int) -> io::Result<File> {
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags, 0 as c_int) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 fn open_relative(root: &File, path: &Path) -> io::Result<File> {
     #[cfg(target_os = "macos")]
     {
@@ -29,51 +37,38 @@ fn open_relative(root: &File, path: &Path) -> io::Result<File> {
         const NOFOLLOW_ANY: i32 = 0x20000000;
         let name = CString::new(path.as_os_str().as_bytes()).map_err(invalid)?;
         let (_, _, cloexec, nonblock) = FLAGS;
-        let fd = unsafe {
-            openat(
-                root.as_raw_fd(),
-                name.as_ptr(),
-                NOFOLLOW_ANY | cloexec | nonblock,
-                0 as c_int,
-            )
-        };
-        if fd >= 0 {
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::InvalidInput {
-            return Err(error);
+        match open_at(root, &name, NOFOLLOW_ANY | cloexec | nonblock) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+            result => return result,
         }
     }
     open_components(root, path)
 }
 
 fn open_components(root: &File, path: &Path) -> io::Result<File> {
-    let (nofollow, directory, cloexec, nonblock) = FLAGS;
     let mut file = None::<File>;
     let mut parts = path.components().peekable();
     while let Some(component) = parts.next() {
-        let Component::Normal(name) = component else {
-            return Err(invalid("unsafe repository path"));
-        };
-        let name = CString::new(name.as_bytes()).map_err(invalid)?;
-        let options = nofollow
-            | cloexec
-            | if parts.peek().is_some() {
-                directory
-            } else {
-                nonblock
-            };
+        let name = component_name(component)?;
         // Each component is relative to the already-open directory and rejects symlinks.
         let parent = file.as_ref().unwrap_or(root);
-        let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), options, 0 as c_int) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        file = Some(unsafe { File::from_raw_fd(fd) });
+        file = Some(open_at(parent, &name, component_flags(parts.peek().is_some()))?);
     }
     file.ok_or_else(|| invalid("empty path"))
 }
+fn component_flags(has_child: bool) -> i32 {
+    let (nofollow, directory, cloexec, nonblock) = FLAGS;
+    let mode = if has_child { directory } else { nonblock };
+    nofollow | cloexec | mode
+}
+
+fn component_name(component: Component<'_>) -> io::Result<CString> {
+    match component {
+        Component::Normal(name) => CString::new(name.as_bytes()).map_err(invalid),
+        _ => Err(invalid("unsafe repository path")),
+    }
+}
+
 pub(super) fn stamp(m: &Metadata) -> [u64; 7] {
     [
         m.dev(),
@@ -87,36 +82,60 @@ pub(super) fn stamp(m: &Metadata) -> [u64; 7] {
 }
 const BLOCK: usize = 64 * 1024;
 
-fn read_text(mut input: impl Read, len: u64) -> io::Result<Option<String>> {
-    // Read into the allocation retained by the snapshot builder. Take caps
-    // each read before a binary prefix can reserve an entire large file.
-    // Leave space for read_to_end's final EOF check on short regular files.
-    let mut all = Vec::with_capacity((len.min(BLOCK as u64) as usize) + 1);
-    let mut good = 0;
-    loop {
-        let previous = all.len();
-        let n = input.by_ref().take(BLOCK as u64).read_to_end(&mut all)?;
-        if all[previous..].contains(&0) {
+struct TextRead {
+    all: Vec<u8>,
+    good: usize,
+    reservation: usize,
+}
+
+impl TextRead {
+    fn new(len: u64) -> Self {
+        // Extra capacity lets read_to_end check EOF without growing short files.
+        Self {
+            all: Vec::with_capacity((len.min(BLOCK as u64) as usize) + 1),
+            good: 0,
+            reservation: len.min(8 * 1024 * 1024) as usize,
+        }
+    }
+
+    fn read(&mut self, input: &mut impl Read) -> io::Result<Option<usize>> {
+        let previous = self.all.len();
+        let n = input.take(BLOCK as u64).read_to_end(&mut self.all)?;
+        if self.all[previous..].contains(&0) {
             return Ok(None);
         }
-        match std::str::from_utf8(&all[good..]) {
-            Ok(_) => good = all.len(),
-            Err(e) if e.error_len().is_none() => good += e.valid_up_to(),
+        match std::str::from_utf8(&self.all[self.good..]) {
+            Ok(_) => self.good = self.all.len(),
+            Err(error) if error.error_len().is_none() => self.good += error.valid_up_to(),
             Err(_) => return Ok(None),
         }
+        Ok(Some(n))
+    }
+
+    fn reserve(&mut self) {
+        if self.good > 0 && self.all.capacity() < self.reservation {
+            self.all.reserve(self.reservation - self.all.len());
+        }
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.good != self.all.len() {
+            return None;
+        }
+        // The incremental checks validated the entire contiguous buffer.
+        Some(unsafe { String::from_utf8_unchecked(self.all) })
+    }
+}
+
+fn read_text(mut input: impl Read, len: u64) -> io::Result<Option<String>> {
+    let mut text = TextRead::new(len);
+    while let Some(n) = text.read(&mut input)? {
         if n < BLOCK {
-            break;
+            return Ok(text.finish());
         }
-        let reservation = len.min(8 * 1024 * 1024) as usize;
-        if good > 0 && all.capacity() < reservation {
-            all.reserve(reservation - all.len());
-        }
+        text.reserve();
     }
-    if good != all.len() {
-        return Ok(None);
-    }
-    // The incremental checks validated the entire contiguous buffer.
-    Ok(Some(unsafe { String::from_utf8_unchecked(all) }))
+    Ok(None)
 }
 
 fn checked_path(path: &str) -> io::Result<&Path> {
@@ -130,39 +149,56 @@ fn checked_path(path: &str) -> io::Result<&Path> {
     }
     Ok(relative)
 }
-fn stable_read<T>(
-    root: &Path,
-    path: &Path,
+struct FileObservation<'a> {
+    root: &'a Path,
+    path: &'a Path,
     expected: [u64; 7],
-    read: impl FnOnce(&File) -> io::Result<T>,
-) -> io::Result<T> {
-    let file = open_relative(&File::open(root)?, path)?;
-    stable_read_open(root, path, expected, &file, read)
 }
 
-fn stable_read_open<T>(
-    root: &Path,
-    path: &Path,
-    expected: [u64; 7],
-    file: &File,
-    read: impl FnOnce(&File) -> io::Result<T>,
-) -> io::Result<T> {
-    let changed = || io::Error::other("repository file changed during capture");
-    let opened = file.metadata()?;
-    if !opened.is_file() || stamp(&opened) != expected {
-        return Err(changed());
+impl FileObservation<'_> {
+    fn read<T>(&self, decode: impl FnOnce(&File) -> io::Result<T>) -> io::Result<T> {
+        let file = open_relative(&File::open(self.root)?, self.path)?;
+        self.read_open(&file, decode)
     }
-    let result = read(file)?;
-    if stamp(&file.metadata()?) != expected
-        || stamp(&std::fs::symlink_metadata(root.join(path))?) != expected
-    {
-        return Err(changed());
+
+    fn read_open<T>(&self, file: &File, decode: impl FnOnce(&File) -> io::Result<T>) -> io::Result<T> {
+        let opened = file.metadata()?;
+        if !opened.is_file() || !self.matches(&opened) {
+            return Err(capture_changed());
+        }
+        let result = decode(file)?;
+        if !self.matches(&file.metadata()?) || !self.matches(&self.at_path()?) {
+            return Err(capture_changed());
+        }
+        Ok(result)
     }
-    Ok(result)
+
+    fn at_path(&self) -> io::Result<Metadata> {
+        std::fs::symlink_metadata(self.root.join(self.path))
+    }
+
+    fn matches(&self, metadata: &Metadata) -> bool {
+        stamp(metadata) == self.expected
+    }
+
+    fn absent_source<T>(&self, error: io::Error) -> io::Result<Option<T>> {
+        // Observed symlinks intentionally have path rows but no source.
+        let current = self.at_path()?;
+        if current.is_symlink() && self.matches(&current) {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+fn capture_changed() -> io::Error {
+    io::Error::other("repository file changed during capture")
 }
 
 pub(super) fn read_control(root: &Path, path: &Path, metadata: &Metadata) -> io::Result<Vec<u8>> {
-    stable_read(root, path, stamp(metadata), |mut file| {
+    let observation = FileObservation { root, path, expected: stamp(metadata) };
+    observation.read(|mut file| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -193,19 +229,17 @@ impl<'a> CaptureRoot<'a> {
         })
     }
 
-    fn read<T>(&self, path: &str, expected: [u64; 7], reader: impl FnOnce(&File) -> io::Result<Option<T>>) -> io::Result<Option<T>> {
+    fn read<T>(
+        &self,
+        path: &str,
+        expected: [u64; 7],
+        reader: impl FnOnce(&File) -> io::Result<Option<T>>,
+    ) -> io::Result<Option<T>> {
         let path = checked_path(path)?;
+        let observation = FileObservation { root: self.root, path, expected };
         match open_relative(&self.dir, path) {
-            Ok(file) => stable_read_open(self.root, path, expected, &file, reader),
-            Err(error) => {
-                // Observed symlinks intentionally have path rows but no source.
-                let current = std::fs::symlink_metadata(self.root.join(path))?;
-                if current.is_symlink() && stamp(&current) == expected {
-                    Ok(None)
-                } else {
-                    Err(error)
-                }
-            }
+            Ok(file) => observation.read_open(&file, reader),
+            Err(error) => observation.absent_source(error),
         }
     }
 }
@@ -219,7 +253,7 @@ pub fn capture_observed(root: &Path, path: &str, expected: [u64; 7]) -> io::Resu
     if !before.is_file() {
         return Ok(None);
     }
-    stable_read(root, path, expected, |file| read_text(file, before.len()))
+    FileObservation { root, path, expected }.read(|file| read_text(file, before.len()))
 }
 pub fn capture(root: &Path, path: &str) -> io::Result<Option<String>> {
     let path = checked_path(path)?;
@@ -227,9 +261,8 @@ pub fn capture(root: &Path, path: &str) -> io::Result<Option<String>> {
     if !before.is_file() {
         return Ok(None);
     }
-    stable_read(root, path, stamp(&before), |file| {
-        read_text(file, before.len())
-    })
+    FileObservation { root, path, expected: stamp(&before) }
+        .read(|file| read_text(file, before.len()))
 }
 
 #[cfg(test)]

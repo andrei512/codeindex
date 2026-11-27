@@ -9,17 +9,29 @@ const parserConsumers = {
   direct: ['shell', 'proto']
 };
 
-// Use the same registry as the conformance runner, including languages missing fixtures.
-exports.createNodesV2 = ['Cargo.toml', (files, options, context) => {
-  const registry = readFileSync(join(context.workspaceRoot, 'src/domain/code/mod.rs'), 'utf8');
-  const variants = registry.match(/pub enum Language\s*\{([^}]+)\}/)[1];
+const registryFile = 'src/domain/code/analyzer.rs';
+
+// Read the same registry rows as the Python conformance driver, including
+// languages whose fixture directories have yet to be added.
+function registryProfiles(root) {
+  const source = readFileSync(join(root, registryFile), 'utf8');
+  const registry = source.match(/^registry! \{([^]*?)^\}/m);
+  if (!registry) throw new Error('missing language registry definition');
+  const profiles = Array.from(registry[1].matchAll(/^\s*([A-Za-z][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?=>/gm),
+    match => match[1].toLowerCase());
+  if (!profiles.length) throw new Error('empty language registry');
+  if (new Set(profiles).size !== profiles.length) throw new Error('duplicate language registry entries');
+  return profiles;
+}
+
+exports.createNodesV2 = [registryFile, (files, options, context) => {
+  const profiles = registryProfiles(context.workspaceRoot);
   const projects = { src: { root: 'src', name: 'cx-core' } };
   for (const parser of Object.keys(parserConsumers)) {
     const root = 'src/domain/code/' + parser;
     projects[root] = { root, name: 'parser-' + parser };
   }
-  for (const variant of variants.split(',').map(s => s.trim()).filter(Boolean)) {
-    const language = variant.toLowerCase();
+  for (const language of profiles) {
     const root = 'tests/fixtures/languages/' + language;
     const report = 'target/conformance/' + language + '.json';
     projects[root] = {
@@ -33,8 +45,9 @@ exports.createNodesV2 = ['Cargo.toml', (files, options, context) => {
           command: 'python3 tests/language_conformance.py --language ' + language + ' --report ' + report,
           dependsOn: [{ projects: ['codeindex-workspace'], target: 'build-cx' }],
           inputs: ['^default', '{projectRoot}/**/*', ...[
-            'Cargo.toml', 'Cargo.lock', 'build.rs',
-            'tests/language_conformance.py', 'tools/conformance.cjs', 'nx.json',
+            'Cargo.toml', 'Cargo.lock', 'build.rs', registryFile,
+            'tests/language_conformance.py', 'tests/language_response.py',
+            'tests/language_fixture_positions.py', 'tools/conformance.cjs', 'nx.json',
             'package.json', 'package-lock.json'
           ].map(path => '{workspaceRoot}/' + path)],
           outputs: ['{workspaceRoot}/' + report]

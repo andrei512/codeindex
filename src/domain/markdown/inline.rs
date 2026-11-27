@@ -1,383 +1,569 @@
+mod code_span;
+use code_span::{Backticks, append_code};
+mod emphasis;
+mod html;
 use super::entities;
-use std::collections::{HashMap, HashSet};
+use emphasis::Emphasis;
+use html::InlineHtml;
+use std::collections::HashMap;
 
-pub(super) fn key(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-        .to_uppercase()
-        .to_lowercase()
+enum Escape<'a> {
+    Text(&'a str),
+    Scalar(char),
 }
 
-fn entity(s: &str) -> Option<(usize, String)> {
+impl Escape<'_> {
+    fn append(self, out: &mut String) {
+        match self {
+            Self::Text(text) => out.push_str(text),
+            Self::Scalar(scalar) => out.push(scalar),
+        }
+    }
+}
+
+fn entity(s: &str) -> Option<(usize, Escape<'_>)> {
     let stop = s.as_bytes().iter().take(34).position(|&c| c == b';')?;
     let name = s.get(1..stop)?;
-    let decoded = if let Some(value) = name.strip_prefix('#') {
-        let code = if let Some(hex) = value.strip_prefix(['x', 'X']) {
-            if hex.len() > 6 {
-                return None;
-            }
-            u32::from_str_radix(hex, 16).ok()?
-        } else {
-            if value.len() > 7 || !value.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            value.parse().ok()?
-        };
-        char::from_u32(code)
-            .filter(|&c| c != '\0')
-            .unwrap_or('\u{fffd}')
-            .to_string()
-    } else {
-        entities::entity(name)?.to_owned()
+    let decoded = match name.strip_prefix('#') {
+        Some(value) => Escape::Scalar(numeric_entity(value)?),
+        None => Escape::Text(entities::entity(name)?),
     };
     Some((stop + 1, decoded))
 }
 
-pub(super) fn unescape(s: &str) -> String {
-    if !s.contains(['\\', '&']) {
-        return s.to_owned();
+fn numeric_entity(value: &str) -> Option<char> {
+    let code = match value.strip_prefix(['x', 'X']) {
+        Some(hex) if hex.len() <= 6 => u32::from_str_radix(hex, 16).ok()?,
+        Some(_) => return None,
+        None => decimal_entity(value)?,
+    };
+    Some(
+        char::from_u32(code)
+            .filter(|&c| c != '\0')
+            .unwrap_or('\u{fffd}'),
+    )
+}
+
+fn decimal_entity(value: &str) -> Option<u32> {
+    if !(1..=7).contains(&value.len()) {
+        return None;
     }
+    value.bytes().try_fold(0, |number, byte| {
+        let digit = byte.wrapping_sub(b'0');
+        (digit < 10).then_some(number * 10 + u32::from(digit))
+    })
+}
+
+fn escaped_punctuation(bytes: &[u8], slash: usize) -> bool {
+    bytes.get(slash + 1).is_some_and(u8::is_ascii_punctuation)
+}
+
+fn escape_at(s: &str) -> Option<(usize, Escape<'_>)> {
+    match s.as_bytes()[0] {
+        b'&' => entity(s),
+        b'\\' if escaped_punctuation(s.as_bytes(), 0) => Some((2, Escape::Text(&s[1..2]))),
+        _ => None,
+    }
+}
+
+pub(super) fn unescape(s: &str) -> std::borrow::Cow<'_, str> {
     let mut result = String::new();
-    let mut pos = 0;
-    while pos < s.len() {
-        if s.as_bytes()[pos] == b'&' {
-            if let Some((n, text)) = entity(&s[pos..]) {
-                result.push_str(&text);
-                pos += n;
-                continue;
-            }
-        }
-        if s.as_bytes()[pos] == b'\\'
-            && s.as_bytes()
-                .get(pos + 1)
-                .is_some_and(u8::is_ascii_punctuation)
-        {
-            pos += 1;
-        }
-        let c = s[pos..].chars().next().unwrap();
-        result.push(c);
-        pos += c.len_utf8();
+    let mut tail = s;
+    while let Some((pos, len, replacement)) = tail_escape(tail) {
+        result.push_str(&tail[..pos]);
+        replacement.append(&mut result);
+        tail = &tail[pos + len..];
     }
-    result
+    if tail.len() == s.len() {
+        return s.into();
+    }
+    result.push_str(tail);
+    result.into()
+}
+
+fn tail_escape(tail: &str) -> Option<(usize, usize, Escape<'_>)> {
+    tail.match_indices(['\\', '&']).find_map(|(pos, _)| {
+        escape_at(&tail[pos..]).map(|(len, replacement)| (pos, len, replacement))
+    })
 }
 
 fn run(b: &[u8], pos: usize) -> usize {
     b[pos..].iter().take_while(|&&x| x == b[pos]).count()
 }
-fn code_end(b: &[u8], mut p: usize, n: usize) -> Option<usize> {
-    while p < b.len() {
-        p += b[p..].iter().position(|&x| x == b'`')?;
-        let run = run(b, p);
-        if run == n {
-            return Some(p);
-        }
-        p += run;
-    }
-    None
+/// A Markdown link component may be separated by horizontal space and
+/// at most one physical line ending. Other Unicode whitespace is text.
+fn after_link_space(source: &str) -> &str {
+    let row = source.trim_start_matches([' ', '\t']);
+    let next = row
+        .strip_prefix("\r\n")
+        .or_else(|| row.strip_prefix(['\r', '\n']));
+    next.map_or(row, |rest| rest.trim_start_matches([' ', '\t']))
 }
 
-// Returns the destination and its exclusive end, before any optional title.
-pub(super) fn destination(s: &str) -> Option<(&str, usize)> {
-    let b = s.as_bytes();
-    let angle = b.first() == Some(&b'<');
-    let start = usize::from(angle);
-    let mut p = start;
-    let mut depth = 0;
-    while p < b.len() {
-        match b[p] {
-            b'\\' if b.get(p + 1).is_some_and(u8::is_ascii_punctuation) => p += 2,
-            b'>' if angle => return Some((&s[start..p], p + 1)),
-            b'<' | b'\n' if angle => return None,
-            c if !angle && c.is_ascii_whitespace() => break,
-            b'(' if !angle => {
-                depth += 1;
-                p += 1;
-            }
-            b')' if !angle && depth == 0 => break,
-            b')' if !angle => {
-                depth -= 1;
-                p += 1;
-            }
-            _ => p += 1,
-        }
-    }
-    (!angle && depth == 0).then_some((&s[start..p], p))
+pub(super) struct LinkTarget<'a> {
+    url: &'a str,
+    tail: &'a str,
+    separated: bool,
+    written: bool,
 }
 
-fn inline_destination(s: &str) -> Option<(String, usize)> {
-    let trimmed = s.strip_prefix('(')?.trim_start_matches(char::is_whitespace);
-    let (url, n) = destination(trimmed)?;
-    let rest = trimmed[n..].trim_start_matches(char::is_whitespace);
-    let rest = if trimmed[n..].len() > rest.len() && rest.starts_with(['"', '\'', '(']) {
-        let closer = match rest.as_bytes()[0] {
-            b'(' => b')',
-            c => c,
+impl<'a> LinkTarget<'a> {
+    fn read(source: &'a str) -> Option<Self> {
+        let source = after_link_space(source);
+        let (url, raw_tail) = if let Some(inner) = source.strip_prefix('<') {
+            let end = angle_end(inner.as_bytes())?;
+            (&inner[..end], &inner[end + 1..])
+        } else {
+            let end = bare_end(source.as_bytes())?;
+            source.split_at(end)
         };
-        let mut p = 1;
-        while p < rest.len() && rest.as_bytes()[p] != closer {
-            if rest.as_bytes()[p] == b'\\'
-                && rest
-                    .as_bytes()
-                    .get(p + 1)
-                    .is_some_and(u8::is_ascii_punctuation)
+        let tail = after_link_space(raw_tail);
+        Some(Self {
+            url,
+            tail,
+            separated: raw_tail.len() != tail.len(),
+            written: source.len() != raw_tail.len(),
+        })
+    }
+    pub(super) fn definition(source: &'a str) -> Option<(&'a str, &'a str)> {
+        let target = Self::read(source)?;
+        (target.written && (target.tail.is_empty() || target.separated))
+            .then_some((target.url, target.tail.trim_end_matches([' ', '\t'])))
+    }
+    fn inline_tail(self) -> Option<(&'a str, &'a str)> {
+        let rest = if self.separated && self.tail.starts_with(['"', '\'', '(']) {
+            after_link_space(after_link_title(self.tail)?)
+        } else {
+            self.tail
+        };
+        Some((self.url, rest.strip_prefix(')')?))
+    }
+}
+
+/// Escaped ASCII punctuation is literal in each part of a link target.
+/// Return original byte offsets so the parser can borrow the source slice.
+fn unescaped_bytes(bytes: &[u8]) -> impl Iterator<Item = (usize, u8)> {
+    let mut bytes = bytes.iter().copied().enumerate().peekable();
+    std::iter::from_fn(move || {
+        loop {
+            let (i, byte) = bytes.next()?;
+            if byte == b'\\'
+                && bytes
+                    .next_if(|(_, next)| next.is_ascii_punctuation())
+                    .is_some()
             {
-                p += 1;
+                continue;
             }
-            p += 1;
+            return Some((i, byte));
         }
-        rest.get(p + 1..)?.trim_start_matches(char::is_whitespace)
-    } else {
-        rest
-    };
-    rest.starts_with(')')
-        .then(|| (unescape(url), s.len() - rest.len() + 1))
+    })
 }
 
-fn tag_end(s: &str) -> Option<usize> {
-    if s.starts_with("<!--") {
-        return s.find("-->").map(|i| i + 3);
-    }
-    let n = s.find('>')?;
-    let body = &s[1..n];
-    let tag = body.trim_start_matches('/');
-    let id = tag.split_ascii_whitespace().next()?.trim_end_matches('/');
-    if !tag.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        return None;
-    }
-    (id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        || (!body.contains(char::is_whitespace) && body.contains([':', '@'])))
-    .then_some(n + 1)
+fn angle_end(bytes: &[u8]) -> Option<usize> {
+    let (at, delimiter) =
+        unescaped_bytes(bytes).find(|(_, byte)| matches!(byte, b'<' | b'>' | b'\r' | b'\n'))?;
+    (delimiter == b'>').then_some(at)
 }
 
-fn paired_brackets(s: &str) -> HashMap<usize, usize> {
-    let b = s.as_bytes();
-    let mut stack = Vec::new();
-    let mut pairs = HashMap::new();
-    let mut p = 0;
-    while p < b.len() {
-        match b[p] {
-            b'\\' if b.get(p + 1).is_some_and(u8::is_ascii_punctuation) => p += 2,
-            b'`' => {
-                let n = run(b, p);
-                p = code_end(b, p + n, n).map_or(p + n, |end| end + n);
+fn bare_end(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0;
+    let mut end = bytes.len();
+    for (at, byte) in unescaped_bytes(bytes) {
+        match byte {
+            b'(' => depth += 1,
+            b')' if depth > 0 => depth -= 1,
+            b')' | 0..=b' ' | 0x7f => {
+                end = at;
+                break;
             }
-            b'<' => p += tag_end(&s[p..]).unwrap_or(1),
-            b'[' => {
-                stack.push(p);
-                p += 1;
-            }
-            b']' => {
-                if let Some(open) = stack.pop() {
-                    pairs.insert(open, p);
-                }
-                p += 1;
-            }
-            _ => p += 1,
+            _ => {}
         }
     }
-    pairs
+    (depth == 0).then_some(end)
 }
 
-fn label<'a>(
-    s: &'a str,
-    p: usize,
-    close: usize,
-    pairs: &HashMap<usize, usize>,
+#[derive(Clone, Copy)]
+pub(super) struct LinkTitle(u8);
+
+impl LinkTitle {
+    pub(super) fn open(source: &str) -> Option<(Self, &str)> {
+        let closer = match source.as_bytes().first()? {
+            b'(' => b')',
+            quote @ (b'\'' | b'"') => *quote,
+            _ => return None,
+        };
+        Some((Self(closer), &source[1..]))
+    }
+
+    /// A valid unfinished title can continue on the next paragraph row.
+    pub(super) fn end<'a>(self, content: &'a str) -> Result<Option<&'a str>, ()> {
+        match unescaped_bytes(content.as_bytes())
+            .find(|(_, byte)| *byte == self.0 || (self.0 == b')' && *byte == b'('))
+        {
+            Some((at, byte)) if byte == self.0 => Ok(Some(&content[at + 1..])),
+            Some(_) => Err(()),
+            None => Ok(None),
+        }
+    }
+}
+
+pub(super) fn after_link_title(rest: &str) -> Option<&str> {
+    let (title, content) = LinkTitle::open(rest)?;
+    title.end(content).ok().flatten()
+}
+
+fn inline_destination(s: &str) -> Option<(&str, usize)> {
+    let (url, after) = LinkTarget::read(s.strip_prefix('(')?)?.inline_tail()?;
+    Some((url, s.len() - after.len()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkState {
+    Candidate,
+    Inline,
+    Reference,
+    NoDestination,
+    ContainsLink,
+}
+
+#[derive(Clone, Copy)]
+struct Label {
+    open: usize,
+    close: usize, // zero until the closing bracket is seen
+    slot: usize,  // parent while open; result index after a nested link resolves
+    state: LinkState,
+    image: bool,
+    contains_label: bool,
+}
+
+impl Label {
+    /// Closed labels inside an earlier destination or reference suffix are skipped.
+    fn visible_after(self, skip: usize) -> bool {
+        self.close != 0 && self.open >= skip
+    }
+}
+
+/// A label token begins at '['; an image token begins one byte before it.
+fn label_open(bytes: &[u8], token: usize) -> Option<usize> {
+    let open = token + usize::from(bytes[token] == b'!');
+    (bytes.get(open) == Some(&b'[')).then_some(open)
+}
+
+// Reference definitions are decoded when collected. Inline targets are
+// decoded only when the caller actually indexes the link.
+#[derive(Clone, Copy)]
+pub(super) enum Destination<'a> {
+    Inline(&'a str),
+    Reference(&'a str),
+}
+impl Destination<'_> {
+    pub(super) fn local_address(self) -> Option<(String, String)> {
+        match self {
+            Self::Inline(url) => super::target::local_address(&unescape(url)),
+            Self::Reference(url) => super::target::local_address(url),
+        }
+    }
+}
+
+struct Labels<'a> {
+    text: &'a str,
     defs: &'a HashMap<String, String>,
-) -> Option<(String, usize)> {
-    let next = close + 1;
-    if let Some((url, len)) = inline_destination(&s[next..]) {
-        return Some((url, next + len));
-    }
-    let mut id = &s[p + 1..close];
-    let mut end = next;
-    if let Some(&stop) = pairs.get(&next) {
-        if stop != next + 1 {
-            id = &s[next + 1..stop];
+    pairs: Vec<Label>,
+    resolved: Vec<(&'a str, usize)>,
+}
+
+impl<'a> Labels<'a> {
+    fn new(text: &'a str, defs: &'a HashMap<String, String>) -> Self {
+        Self {
+            text,
+            defs,
+            pairs: Vec::new(),
+            resolved: Vec::new(),
         }
-        end = stop + 1;
     }
-    if id.is_empty() || id.starts_with('^') || id.len() > 4000 {
-        return None;
+
+    fn scan(&mut self, ticks: &mut Backticks) {
+        let source = self.text;
+        let bytes = source.as_bytes();
+        let mut top = usize::MAX;
+        let mut html = InlineHtml::default();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            pos = match bytes[pos] {
+                b'\\' => pos + 1 + usize::from(escaped_punctuation(bytes, pos)),
+                b'`' => ticks.span(source, pos).end,
+                b'<' => html.end(source, pos, None).unwrap_or(pos + 1),
+                b'!' | b'[' => self.open(&mut top, bytes, pos),
+                b']' => self.close_label(&mut top, pos),
+                _ => pos + 1,
+            };
+        }
     }
-    Some((defs.get(&key(id))?.clone(), end))
+
+    fn open(&mut self, top: &mut usize, bytes: &[u8], token: usize) -> usize {
+        let Some(open) = label_open(bytes, token) else {
+            return token + 1;
+        };
+        let index = self.pairs.len();
+        self.pairs.push(Label {
+            open,
+            close: 0,
+            slot: *top,
+            state: LinkState::Candidate,
+            image: open != token,
+            contains_label: false,
+        });
+        *top = index;
+        open + 1
+    }
+
+    fn close_label(&mut self, top: &mut usize, close: usize) -> usize {
+        if *top == usize::MAX { close + 1 } else { self.close(top, close) }
+    }
+
+    fn close(&mut self, top: &mut usize, close: usize) -> usize {
+        let index = *top;
+        let contains_label = self.pairs.len() > index + 1;
+        let pair = &mut self.pairs[index];
+        *top = pair.slot;
+        pair.close = close;
+        pair.contains_label = contains_label;
+        if *top == usize::MAX && !contains_label {
+            // A flat label needs no cached decision. Its consumer resolves it once.
+            return close + 1;
+        }
+        let pair = *pair;
+        let has_link = pair.state == LinkState::ContainsLink;
+        let mut end = close + 1;
+        let passes_link = if has_link && !pair.image {
+            true
+        } else if let Some((dest, stop)) = self.parse_destination(pair) {
+            self.remember(index, dest, stop);
+            end = stop;
+            !pair.image
+        } else {
+            self.pairs[index].state = LinkState::NoDestination;
+            has_link
+        };
+        if passes_link && let Some(parent) = self.pairs.get_mut(*top) {
+            parent.state = LinkState::ContainsLink;
+        }
+        end
+    }
+
+    fn remember(&mut self, index: usize, dest: Destination<'a>, end: usize) {
+        let pair = &mut self.pairs[index];
+        let (state, url) = match dest {
+            Destination::Inline(url) => (LinkState::Inline, url),
+            Destination::Reference(url) => (LinkState::Reference, url),
+        };
+        pair.state = state;
+        pair.slot = self.resolved.len();
+        self.resolved.push((url, end));
+    }
+
+    fn footnote(&self, pair: Label) -> Option<&'a str> {
+        let id = &self.text[pair.open + 1..pair.close];
+        let name = id.strip_prefix('^')?;
+        self.defs
+            .contains_key(super::reference::key(id).as_ref())
+            .then_some(name)
+    }
+
+    fn visit_destination(
+        &self,
+        pair: Label,
+        emit: &mut impl FnMut(usize, Destination),
+    ) -> Option<usize> {
+        let (destination, end) = self.destination(pair)?;
+        if !pair.image {
+            emit(pair.open, destination);
+        }
+        Some(end)
+    }
+
+    fn links(&self, mut emit: impl FnMut(usize, Destination)) {
+        let mut skip = 0;
+        for &pair in &self.pairs {
+            if pair.visible_after(skip) {
+                skip = self.visit_destination(pair, &mut emit)
+                    .filter(|_| !pair.contains_label)
+                    .unwrap_or(skip);
+            }
+        }
+    }
+
+    fn destination(&self, pair: Label) -> Option<(Destination<'a>, usize)> {
+        match pair.state {
+            LinkState::Candidate => self.parse_destination(pair),
+            LinkState::Inline | LinkState::Reference => {
+                let (url, end) = self.resolved[pair.slot];
+                let dest = match pair.state {
+                    LinkState::Inline => Destination::Inline(url),
+                    _ => Destination::Reference(url),
+                };
+                Some((dest, end))
+            }
+            LinkState::NoDestination | LinkState::ContainsLink => None,
+        }
+    }
+
+    fn parse_destination(&self, pair: Label) -> Option<(Destination<'a>, usize)> {
+        let next = pair.close + 1;
+        if let Some((url, len)) = inline_destination(&self.text[next..]) {
+            return Some((Destination::Inline(url), next + len));
+        }
+        if self.defs.is_empty() {
+            return None;
+        }
+        let (url, len) = super::reference::lookup(
+            &self.text[pair.open + 1..pair.close],
+            &self.text[next..],
+            self.defs,
+        )?;
+        Some((Destination::Reference(url), next + len))
+    }
+}
+
+#[derive(Default)]
+struct Title {
+    text: String,
+    emphasis: Emphasis,
+}
+
+impl Title {
+    fn character(&mut self, source: &str, pos: usize) -> usize {
+        let c = source[pos..].chars().next().unwrap();
+        if c == '\n' {
+            self.text.push(' ');
+            return pos + 1;
+        }
+        // Words and spaces after a literal character have no inline syntax.
+        let next = pos + c.len_utf8();
+        let ordinary = source.as_bytes()[next..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b' ')
+            .count();
+        let end = next + ordinary;
+        self.text.push_str(&source[pos..end]);
+        end
+    }
+}
+
+struct Inline<'a> {
+    labels: Labels<'a>,
+    next_label: usize,
+    ticks: Backticks,
+    html: InlineHtml,
+    title: Title,
+    // Traverse a label in place, then jump over the destination.
+    ends: Vec<(usize, usize, usize)>,
+}
+
+impl Inline<'_> {
+    fn link(
+        &mut self,
+        open: usize,
+        emit: &mut impl FnMut(usize, Destination),
+    ) -> Option<usize> {
+        let labels = &self.labels;
+        // Source and label positions both advance monotonically.
+        while labels.pairs.get(self.next_label).is_some_and(|pair| pair.open < open) {
+            self.next_label += 1;
+        }
+        let pair = *labels.pairs.get(self.next_label).filter(|pair| pair.open == open)?;
+        let close = pair.close;
+        if close == 0 || pair.state == LinkState::ContainsLink {
+            return None;
+        }
+        if let Some(end) = labels.visit_destination(pair, emit) {
+            self.ends.push((close, end, self.title.emphasis.boundary()));
+            return Some(open + 1);
+        }
+        self.title.text.push_str(labels.footnote(pair)?);
+        Some(close + 1)
+    }
+
+    fn code(&mut self, pos: usize) -> usize {
+        let source = self.labels.text;
+        let span = self.ticks.span(source, pos);
+        if let Some(body) = span.body {
+            append_code(&mut self.title.text, body);
+        } else {
+            self.title.text.push_str(&source[pos..span.end]);
+        }
+        span.end
+    }
+
+    fn escape(&mut self, source: &str, pos: usize) -> Option<usize> {
+        let (len, replacement) = escape_at(&source[pos..])?;
+        replacement.append(&mut self.title.text);
+        Some(pos + len)
+    }
+
+    fn emphasis(&mut self, pos: usize) -> usize {
+        let base = self.ends.last().map_or(0, |&(_, _, base)| base);
+        self.title.emphasis.delimiter(&mut self.title.text, self.labels.text, pos, base)
+    }
+
+    fn close_label(&mut self, pos: usize) -> Option<usize> {
+        let (_, end, base) = self.ends.pop_if(|(close, _, _)| *close == pos)?;
+        self.title.emphasis.end_label(base);
+        Some(end)
+    }
+
+    fn title_markup(&mut self, pos: usize) -> Option<usize> {
+        let source = self.labels.text;
+        match source.as_bytes()[pos] {
+            b'\\' | b'&' => self.escape(source, pos),
+            b'`' => Some(self.code(pos)),
+            b'<' => self.html.end(source, pos, Some(&mut self.title.text)),
+            b'*' | b'_' | b'~' => Some(self.emphasis(pos)),
+            _ => None,
+        }
+    }
+
+    fn advance(&mut self, pos: usize, emit: &mut impl FnMut(usize, Destination)) -> usize {
+        let source = self.labels.text;
+        let bytes = source.as_bytes();
+        let next = match bytes[pos] {
+            b']' => self.close_label(pos),
+            b'!' | b'[' => label_open(bytes, pos).and_then(|open| self.link(open, emit)),
+            _ => self.title_markup(pos),
+        };
+        next.unwrap_or_else(|| self.title.character(source, pos))
+    }
 }
 
 pub(super) fn scan(
-    s: &str,
+    source: &str,
     defs: &HashMap<String, String>,
     render: bool,
-    mut emit: impl FnMut(usize, &str),
+    mut emit: impl FnMut(usize, Destination),
 ) -> String {
-    if !render && !s.contains('[') {
+    let mut ticks = Backticks::new();
+    let mut labels = Labels::new(source, defs);
+    if source
+        .split_once('[')
+        .is_some_and(|(_, rest)| rest.contains(']'))
+    {
+        labels.scan(&mut ticks);
+    }
+    if !render {
+        labels.links(emit);
         return String::new();
     }
-    let pairs = if s.contains('[') {
-        paired_brackets(s)
-    } else {
-        HashMap::new()
+    let mut inline = Inline {
+        labels,
+        next_label: 0,
+        ticks,
+        html: InlineHtml::default(),
+        title: Title::default(),
+        ends: Vec::new(),
     };
-    // An inner link deactivates enclosing link openers. Images can still
-    // contain links in their description. Compute that decision in closing order.
-    let mut inactive = HashSet::new();
-    if pairs.len() > 1 {
-        let mut order: Vec<_> = pairs.iter().collect();
-        order.sort_unstable_by_key(|(_, close)| **close);
-        let mut inner = None;
-        for (&open, &close) in order {
-            if open > 0 && matches!(s.as_bytes()[open - 1], b'!' | b']') {
-                continue;
-            }
-            if inner.is_some_and(|last| last > open) {
-                inactive.insert(open);
-                continue;
-            }
-            if label(s, open, close, &pairs, defs).is_some() {
-                inner = Some(open);
-            }
-        }
-    }
-    let b = s.as_bytes();
-    let mut title = String::new();
     let mut pos = 0;
-    // On rendering a link, consume its label in place, then skip the destination.
-    let mut ends: Vec<(usize, usize)> = Vec::new();
-    let mut styles: Vec<(u8, usize)> = Vec::new();
-    while pos < b.len() {
-        if let Some(&(end, resume)) = ends.last() {
-            if end == pos {
-                ends.pop();
-                pos = resume;
-                continue;
-            }
-        }
-        if b[pos] == b'\\' && b.get(pos + 1).is_some_and(u8::is_ascii_punctuation) {
-            pos += 1;
-            if render {
-                title.push(char::from(b[pos]));
-            }
-            pos += 1;
-            continue;
-        }
-        if b[pos] == b'`' {
-            let n = run(b, pos);
-            if let Some(end) = code_end(b, pos + n, n) {
-                if render {
-                    let code = s[pos + n..end].replace('\n', " ");
-                    let stripped = if code.starts_with(' ')
-                        && code.ends_with(' ')
-                        && code.trim_matches(' ').len() > 0
-                    {
-                        &code[1..code.len() - 1]
-                    } else {
-                        &code
-                    };
-                    title.push_str(stripped);
-                }
-                pos = end + n;
-                continue;
-            }
-            if render {
-                title.push_str(&s[pos..pos + n]);
-            }
-            pos += n;
-            continue;
-        }
-        let image = b[pos] == b'!' && b.get(pos + 1) == Some(&b'[');
-        let open = pos + usize::from(image);
-        if let Some(&close) = pairs.get(&open).filter(|_| !inactive.contains(&open)) {
-            if let Some((url, end)) = label(s, open, close, &pairs, defs) {
-                if !image {
-                    emit(open, &url);
-                }
-                if render || image {
-                    ends.push((close, end));
-                    pos = open + 1;
-                } else {
-                    pos = end;
-                }
-                continue;
-            }
-            if render
-                && s[open + 1..close].starts_with('^')
-                && defs.contains_key(&key(&s[open + 1..close]))
-            {
-                title.push_str(&s[open + 2..close]);
-                pos = close + 1;
-                continue;
-            }
-        }
-        if s.as_bytes()[pos..].starts_with(b"<!--")
-            && let Some(n) = s[pos..].find("-->")
-        {
-            pos += n + 3;
-            continue;
-        }
-        if b[pos] == b'<' {
-            if let Some(n) = s[pos..].find('>') {
-                let inside = &s[pos + 1..pos + n];
-                let tag = inside.trim_start_matches('/');
-                if tag.starts_with(|c: char| c.is_ascii_alphabetic())
-                    && (tag.split_ascii_whitespace().next().is_some_and(|name| {
-                        name.trim_end_matches('/')
-                            .bytes()
-                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                    }) || inside.contains([':', '@']))
-                {
-                    if render
-                        && inside.contains([':', '@'])
-                        && !inside.contains(char::is_whitespace)
-                    {
-                        title.push_str(inside);
-                    }
-                    pos += n + 1;
-                    continue;
-                }
-            }
-        }
-        if !render {
-            pos += 1;
-            continue;
-        }
-        if b[pos] == b'&' {
-            if let Some((n, text)) = entity(&s[pos..]) {
-                title.push_str(&text);
-                pos += n;
-                continue;
-            }
-        }
-        if matches!(b[pos], b'*' | b'_' | b'~') {
-            let n = run(b, pos);
-            let prev = s[..pos].chars().next_back();
-            let next = s[pos + n..].chars().next();
-            let intraword = b[pos] == b'_'
-                && prev.is_some_and(char::is_alphanumeric)
-                && next.is_some_and(char::is_alphanumeric);
-            if !intraword
-                && prev.is_some_and(|c| !c.is_whitespace())
-                && styles.last() == Some(&(b[pos], n))
-            {
-                styles.pop();
-                pos += n;
-                continue;
-            }
-            if !intraword
-                && next.is_some_and(|c| !c.is_whitespace())
-                && s[pos + n..].contains(&s[pos..pos + n])
-            {
-                styles.push((b[pos], n));
-                pos += n;
-                continue;
-            }
-            title.push_str(&s[pos..pos + n]);
-            pos += n;
-            continue;
-        }
-        let c = s[pos..].chars().next().unwrap();
-        title.push(if c == '\n' { ' ' } else { c });
-        pos += c.len_utf8();
+    while pos < source.len() {
+        pos = inline.advance(pos, &mut emit);
     }
-    title
+    inline.title.emphasis.finish(inline.title.text)
 }

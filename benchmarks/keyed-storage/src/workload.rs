@@ -18,21 +18,22 @@ fn sources(repo: &Path) -> Result<Sources> {
         return Err("git ls-files failed".into());
     }
     let mut inputs = Sources::new();
-    for name in files.stdout.split(|b| *b == 0).filter(|x| !x.is_empty()) {
-        let Ok(name) = std::str::from_utf8(name) else {
-            continue;
-        };
-        let path = repo.join(name);
-        let meta = fs::symlink_metadata(&path)?;
-        if !meta.is_file() {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(path) {
+    let names = files.stdout.split(|b| *b == 0).filter(|x| !x.is_empty())
+        .filter_map(|name| std::str::from_utf8(name).ok());
+    for name in names {
+        if let Some(text) = regular_utf8_source(&repo.join(name))? {
             inputs.insert(name.into(), text);
         }
     }
     Ok(inputs)
 }
+fn regular_utf8_source(path: &Path) -> Result<Option<String>> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    Ok(fs::read_to_string(path).ok())
+}
+
 fn key(kind: u8, parts: &[&str], slot: usize) -> Vec<u8> {
     let mut key = vec![kind];
     for part in parts {
@@ -71,39 +72,53 @@ fn project(inputs: &Sources) -> Rows {
     let bindings = Names::build(&units);
     let mut rows = Rows::new();
     for unit in &units {
-        for (slot, d) in unit.analysis.declarations.iter().enumerate() {
-            let name = if d.kind == "source_file" {
-                unit.path.rsplit('/').next().unwrap()
-            } else {
-                &unit.text[d.span.clone()]
-            };
-            rows.insert(
-                key(b'D', &[unit.path], slot),
-                location(d.span.start, d.span.end),
-            );
-            if d.searchable() {
-                rows.insert(
-                    key(b'N', &[name, unit.path], slot),
-                    d.kind.as_bytes().to_vec(),
-                );
-            }
-        }
-        if markdown::is_markdown(unit.path) {
-            let doc = markdown::Parsed::parse(unit.path, unit.text);
-            for (slot, h) in doc.sections.iter().enumerate() {
-                rows.insert(
-                    key(b'H', &[unit.path, &h.anchor], slot),
-                    location(h.start, h.end),
-                );
-            }
-            for (slot, l) in doc.links.iter().enumerate() {
-                rows.insert(
-                    key(b'L', &[&l.target, &l.anchor, unit.path], slot),
-                    location(l.offset, l.section),
-                );
-            }
-        }
+        project_declarations(unit, &mut rows);
+        project_markdown(unit, &mut rows);
     }
+    project_references(&units, bindings, &mut rows);
+    rows
+}
+
+fn project_declarations(unit: &Unit<'_>, rows: &mut Rows) {
+    for (slot, declaration) in unit.analysis.declarations.iter().enumerate() {
+        rows.insert(
+            key(b'D', &[unit.path], slot),
+            location(declaration.span.start, declaration.span.end),
+        );
+    }
+    for (slot, declaration) in unit.analysis.declarations.iter().enumerate().filter(|(_, d)| d.searchable()) {
+        let name = declaration_name(unit, declaration);
+        rows.insert(key(b'N', &[name, unit.path], slot), declaration.kind.as_bytes().to_vec());
+    }
+}
+
+fn declaration_name<'a>(unit: &Unit<'a>, declaration: &code::Declaration) -> &'a str {
+    if declaration.kind == "source_file" {
+        return unit.path.rsplit('/').next().unwrap();
+    }
+    &unit.text[declaration.span.clone()]
+}
+
+fn project_markdown(unit: &Unit<'_>, rows: &mut Rows) {
+    if !markdown::is_markdown(unit.path) {
+        return;
+    }
+    let doc = markdown::Parsed::parse(unit.path, unit.text);
+    for (slot, heading) in doc.sections.iter().enumerate() {
+        rows.insert(
+            key(b'H', &[unit.path, &heading.anchor], slot),
+            location(heading.start, heading.end),
+        );
+    }
+    for (slot, link) in doc.links.iter().enumerate() {
+        rows.insert(
+            key(b'L', &[&link.target, &link.anchor, unit.path], slot),
+            location(link.offset, link.section),
+        );
+    }
+}
+
+fn project_references(units: &[Unit<'_>], bindings: Names, rows: &mut Rows) {
     for (target, uses) in bindings.incoming {
         for site in uses {
             let source = &units[site.file];
@@ -113,7 +128,6 @@ fn project(inputs: &Sources) -> Rows {
             rows.insert(k, location(call.span.start, call.span.end));
         }
     }
-    rows
 }
 pub struct Trace {
     pub initial: Rows,
@@ -150,13 +164,7 @@ pub fn trace(repo: &Path) -> Result<Trace> {
         .unwrap()
         .push_str("\n## Details\n\n[Another link](guide.md#second)\n");
     let after = project(&files);
-    let (mut edits, mut undo) = (Edits::new(), Edits::new());
-    for k in initial.keys().chain(after.keys()) {
-        if initial.get(k) != after.get(k) {
-            edits.insert(k.clone(), after.get(k).cloned());
-            undo.insert(k.clone(), initial.get(k).cloned());
-        }
-    }
+    let (edits, undo) = row_changes(&initial, &after);
     assert!(
         [b'R', b'D', b'N', b'L', b'H']
             .iter()
@@ -167,4 +175,17 @@ pub fn trace(repo: &Path) -> Result<Trace> {
         edits,
         undo,
     })
+}
+
+fn row_changes(initial: &Rows, after: &Rows) -> (Edits, Edits) {
+    let changed = initial.keys().chain(after.keys()).filter_map(|key| {
+        let (old, new) = (initial.get(key), after.get(key));
+        (old != new).then_some((key, old, new))
+    });
+    let (mut edits, mut undo) = (Edits::new(), Edits::new());
+    for (key, old, new) in changed {
+        edits.insert(key.clone(), new.cloned());
+        undo.insert(key.clone(), old.cloned());
+    }
+    (edits, undo)
 }

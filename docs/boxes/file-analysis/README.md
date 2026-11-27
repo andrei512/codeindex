@@ -17,8 +17,13 @@ Markdown takes a different route through the same boundary. One heading tree sup
 
 ## Topics
 
+### Working on language support
+
+- [Migrate language ownership](language-migration.md) traces the existing entry points, migration order and acceptance cases for every registered language.
+
 ### Design
 
+- [Language ownership contracts](language-ownership.md) defines the owners of analysis, project inputs, binding and edit proofs, and explains which work a build can reuse.
 - [Extraction contract](extraction.md) — Specifies analyzer inputs, emitted evidence, scratch lifetime and coverage.
 
 ### Reference

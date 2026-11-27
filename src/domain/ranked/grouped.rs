@@ -5,6 +5,31 @@ use super::{
 };
 use std::io::{self, Read, Write};
 
+/// Row records are sorted by file. Fill boundaries for skipped files from
+/// the preceding token end, including empty files after the final row.
+pub(super) struct FileBases {
+    values: Vec<usize>,
+    count: usize,
+}
+impl FileBases {
+    pub fn new(files: usize) -> io::Result<Self> {
+        let count = files.checked_add(1).ok_or_else(invalid)?;
+        Ok(Self {
+            values: Vec::with_capacity(count),
+            count,
+        })
+    }
+    pub fn observe(&mut self, file: usize, previous_end: usize) {
+        if self.values.len() <= file {
+            self.values.resize(file + 1, previous_end);
+        }
+    }
+    pub fn finish(mut self, tokens: usize) -> Vec<usize> {
+        self.values.resize(self.count, tokens);
+        self.values
+    }
+}
+
 impl RankedIndex {
     pub(super) fn file_bases(&self) -> io::Result<Vec<usize>> {
         let mut bases = Vec::with_capacity(self.files.len() + 1);
@@ -46,11 +71,7 @@ pub(super) fn write_term(
     put(out, t.positions.len())?;
     let mut positions = t.positions.as_slice();
     while let Some(&first) = positions.first() {
-        let mut file = *hints.get(first / 256).ok_or_else(invalid)?;
-        while bases.get(file + 1).is_some_and(|&end| end <= first) {
-            file += 1;
-        }
-        let end = *bases.get(file + 1).ok_or_else(invalid)?;
+        let (file, end) = posting_owner(first, hints, bases)?;
         let n = positions.iter().take_while(|&&p| p < end).count();
         put(out, file)?;
         put(out, n)?;
@@ -63,12 +84,16 @@ pub(super) fn write_term(
     }
     Ok(())
 }
-pub(super) fn read_term(input: &mut impl Read, rows: usize, bases: &[usize]) -> io::Result<Term> {
-    let df = get(input)?;
-    let count = get(input)?;
-    if df == 0 || df > rows || df > count || count > *bases.last().ok_or_else(invalid)? {
-        return Err(invalid());
+fn posting_owner(position: usize, hints: &[usize], bases: &[usize]) -> io::Result<(usize, usize)> {
+    let mut file = *hints.get(position / 256).ok_or_else(invalid)?;
+    while bases.get(file + 1).is_some_and(|&end| end <= position) {
+        file += 1;
     }
+    Ok((file, *bases.get(file + 1).ok_or_else(invalid)?))
+}
+
+pub(super) fn read_term(input: &mut impl Read, rows: usize, bases: &[usize]) -> io::Result<Term> {
+    let (df, count) = super::storage::term_counts(input, rows, *bases.last().ok_or_else(invalid)?)?;
     let mut positions = Vec::new();
     let mut previous = None;
     while positions.len() < count {
@@ -81,15 +106,7 @@ pub(super) fn read_term(input: &mut impl Read, rows: usize, bases: &[usize]) -> 
         {
             return Err(invalid());
         }
-        let mut last = bases[file];
-        for i in 0..n {
-            let delta = get(input)?;
-            last = last.checked_add(delta).ok_or_else(invalid)?;
-            if last >= bases[file + 1] || i > 0 && delta == 0 {
-                return Err(invalid());
-            }
-            positions.push(last)
-        }
+        super::storage::read_positions(input, bases[file]..bases[file + 1], n, &mut positions)?;
         previous = Some(file);
     }
     Ok(Term {

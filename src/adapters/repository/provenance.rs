@@ -1,9 +1,8 @@
 //! The commit tree supplies candidate identities. Working bytes are captured separately.
 use super::{
     config, digest, git_dirs,
-    index::take,
     invalid,
-    sparse::{ObjectKind, Objects},
+    sparse::{ObjectKind, Objects, TreeEntry, TreeFraming},
 };
 use std::{
     collections::HashMap,
@@ -14,15 +13,6 @@ use std::{
 pub use crate::domain::BlobId;
 
 impl BlobId {
-    fn from_raw(raw: &[u8]) -> Self {
-        let mut bytes = [0; 32];
-        bytes[..raw.len()].copy_from_slice(raw);
-        Self {
-            bytes,
-            len: raw.len() as u8,
-        }
-    }
-
     fn from_hex(raw: &[u8]) -> io::Result<Self> {
         if !matches!(raw.len(), 40 | 64) {
             return Err(invalid("invalid Git object ID length"));
@@ -61,11 +51,59 @@ enum Entry {
     Regular(BlobId),
 }
 
+impl Entry {
+    fn regular(self) -> Option<BlobId> {
+        if let Self::Regular(id) = self { Some(id) } else { None }
+    }
+    fn directory(self) -> Option<BlobId> {
+        if let Self::Directory(id) = self { Some(id) } else { None }
+    }
+}
+
+#[derive(Default)]
+struct TreeChanges {
+    files: HashMap<String, Option<BlobId>>,
+    pending: Vec<(String, Option<BlobId>, Option<BlobId>)>,
+}
+
+impl TreeChanges {
+    fn compare(&mut self, prefix: &str, old: Option<&Directory>, new: Option<&Directory>) {
+        let before = old.into_iter().flatten();
+        for (name, &entry) in before {
+            self.record(prefix, name, Some(entry), new.and_then(|d| d.get(name)).copied());
+        }
+        let added = new.into_iter().flatten().filter(|(name, _)| old.is_none_or(|d| !d.contains_key(*name)));
+        for (name, &entry) in added {
+            self.record(prefix, name, None, Some(entry));
+        }
+    }
+
+    fn record(&mut self, prefix: &str, name: &[u8], old: Option<Entry>, new: Option<Entry>) {
+        if old == new { return; }
+        let Ok(name) = std::str::from_utf8(name) else { return };
+        let path = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
+        let before = old.and_then(Entry::directory);
+        let after = new.and_then(Entry::directory);
+        let blob = new.and_then(Entry::regular);
+        // Only a file/directory replacement needs the path in both collections.
+        if before == after {
+            self.files.insert(path, blob);
+        } else {
+            if old.and_then(Entry::regular) != blob {
+                self.files.insert(path.clone(), blob);
+            }
+            self.pending.push((path, before, after));
+        }
+    }
+}
+
+type Directory = HashMap<Box<[u8]>, Entry>;
+
 pub struct CommitTree {
     last_directory: Option<(String, Option<BlobId>)>,
     objects: Objects,
     root: BlobId,
-    directories: HashMap<BlobId, HashMap<Box<[u8]>, Entry>>,
+    directories: HashMap<BlobId, Directory>,
 }
 
 fn commit_root(objects: &Objects, commit: BlobId) -> io::Result<BlobId> {
@@ -121,58 +159,41 @@ impl CommitTree {
             return Err(invalid("Git object format changed"));
         }
         let old_root = commit_root(&self.objects, previous)?;
-        let mut result = HashMap::new();
-        let mut pending = vec![(String::new(), Some(old_root), Some(self.root))];
-        while let Some((prefix, old, new)) = pending.pop() {
+        let mut changes = TreeChanges::default();
+        changes.pending.push((String::new(), Some(old_root), Some(self.root)));
+        while let Some((prefix, old, new)) = changes.pending.pop() {
             if old == new {
                 continue;
             }
-            for id in [old, new].into_iter().flatten() {
-                self.load(id)?;
-            }
+            self.load_roots([old, new])?;
             let old = old.and_then(|id| self.directories.get(&id));
             let new = new.and_then(|id| self.directories.get(&id));
-            let mut compare = |name: &[u8], old: Option<Entry>, new: Option<Entry>| {
-                if old == new {
-                    return;
-                }
-                let Ok(name) = std::str::from_utf8(name) else {
-                    return;
-                };
-                let path = if prefix.is_empty() {
-                    name.to_owned()
-                } else {
-                    format!("{prefix}/{name}")
-                };
-                let blob = |entry| match entry {
-                    Some(Entry::Regular(id)) => Some(id),
-                    _ => None,
-                };
-                let dir = |entry| match entry {
-                    Some(Entry::Directory(id)) => Some(id),
-                    _ => None,
-                };
-                if blob(old) != blob(new) {
-                    result.insert(path.clone(), blob(new));
-                }
-                if dir(old) != dir(new) {
-                    pending.push((path, dir(old), dir(new)));
-                }
-            };
-            if let Some(before) = old {
-                for (name, entry) in before {
-                    compare(name, Some(*entry), new.and_then(|d| d.get(name)).copied());
-                }
-            }
-            if let Some(after) = new {
-                for (name, entry) in after {
-                    if old.is_none_or(|d| !d.contains_key(name)) {
-                        compare(name, None, Some(*entry));
-                    }
-                }
+            changes.compare(&prefix, old, new);
+        }
+        Ok(changes.files)
+    }
+
+    fn load_roots(&mut self, roots: [Option<BlobId>; 2]) -> io::Result<()> {
+        roots.into_iter().flatten().try_for_each(|id| self.load(id))
+    }
+
+    fn parent_tree(&mut self, parent: &str) -> io::Result<Option<BlobId>> {
+        if let Some((_, id)) = self.last_directory.as_ref().filter(|(p, _)| p == parent) {
+            return Ok(*id);
+        }
+        let mut tree = Some(self.root);
+        if !parent.is_empty() {
+            for component in parent.split('/') {
+                let Some(id) = tree else { break };
+                self.load(id)?;
+                tree = self.directories[&id].get(component.as_bytes()).copied().and_then(Entry::directory);
             }
         }
-        Ok(result)
+        let (last, id) = self.last_directory.get_or_insert_with(Default::default);
+        last.clear();
+        last.push_str(parent);
+        *id = tree;
+        Ok(tree)
     }
 
     pub fn blob(&mut self, path: &str) -> io::Result<Option<BlobId>> {
@@ -180,63 +201,37 @@ impl CommitTree {
             return Ok(None);
         }
         let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
-        let cached = self.last_directory.as_ref().filter(|(p, _)| p == parent);
-        let tree = if let Some((_, tree)) = cached {
-            *tree
-        } else {
-            let mut tree = Some(self.root);
-            if !parent.is_empty() {
-                for component in parent.split('/') {
-                    let Some(id) = tree else { break };
-                    self.load(id)?;
-                    tree = match self.directories[&id].get(component.as_bytes()) {
-                        Some(Entry::Directory(child)) => Some(*child),
-                        _ => None,
-                    };
-                }
-            }
-            let (last, id) = self.last_directory.get_or_insert_with(Default::default);
-            last.clear();
-            last.push_str(parent);
-            *id = tree;
-            tree
-        };
+        let tree = self.parent_tree(parent)?;
         let Some(tree) = tree else { return Ok(None) };
         self.load(tree)?;
-        Ok(match self.directories[&tree].get(leaf.as_bytes()) {
-            Some(Entry::Regular(id)) => Some(*id),
-            _ => None,
-        })
+        Ok(self.directories[&tree].get(leaf.as_bytes()).copied().and_then(Entry::regular))
     }
 }
 
-fn directory(mut bytes: &[u8], hash: usize) -> io::Result<HashMap<Box<[u8]>, Entry>> {
+fn directory(mut bytes: &[u8], hash: usize) -> io::Result<Directory> {
     let mut entries = HashMap::new();
     while !bytes.is_empty() {
-        let space = bytes
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or_else(|| invalid("missing Git tree mode"))?;
-        let mode = take(&mut bytes, space + 1)?;
-        let nul = bytes
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| invalid("missing Git tree filename"))?;
-        let name = take(&mut bytes, nul)?;
-        if matches!(name, b"" | b"." | b"..") || name.contains(&b'/') {
-            return Err(invalid("unsafe Git tree entry"));
-        }
-        take(&mut bytes, 1)?;
-        let id = BlobId::from_raw(take(&mut bytes, hash)?);
-        let entry = match mode {
-            b"40000 " => Entry::Directory(id),
-            b"100644 " | b"100755 " => Entry::Regular(id),
-            b"120000 " | b"160000 " => continue,
-            _ => return Err(invalid("invalid Git tree mode")),
-        };
-        if entries.insert(name.into(), entry).is_some() {
-            return Err(invalid("duplicate Git tree filename"));
-        }
+        let TreeEntry { mode, name, oid } = TreeEntry::read(&mut bytes, hash, TreeFraming::Provenance)?;
+        insert_entry(&mut entries, name, provenance_entry(mode, oid)?)?;
     }
     Ok(entries)
+}
+
+
+fn insert_entry(entries: &mut Directory, name: &[u8], entry: Option<Entry>) -> io::Result<()> {
+    let Some(entry) = entry else { return Ok(()) };
+    if entries.insert(name.into(), entry).is_some() {
+        return Err(invalid("duplicate Git tree filename"));
+    }
+    Ok(())
+}
+
+fn provenance_entry(mode: &[u8], oid: &[u8]) -> io::Result<Option<Entry>> {
+    let id = BlobId::from_raw(oid);
+    match mode {
+        b"40000 " => Ok(Some(Entry::Directory(id))),
+        b"100644 " | b"100755 " => Ok(Some(Entry::Regular(id))),
+        b"120000 " | b"160000 " => Ok(None),
+        _ => Err(invalid("invalid Git tree mode")),
+    }
 }

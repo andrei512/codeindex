@@ -3,421 +3,529 @@ use super::Language;
 use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     Word,
     String,
     Punct,
 }
 
-pub(super) struct Token<'a> {
+#[derive(Clone)]
+pub(crate) struct Token<'a> {
     pub text: &'a str,
     pub span: Range<usize>,
     pub line: usize,
     pub kind: Kind,
 }
 
-// At the start of an expression ECMAScript reads a regexp literal. Keep its
-// pattern opaque so words and parentheses inside it never become declarations.
-fn regex_end(bytes: &[u8], mut pos: usize) -> Option<usize> {
-    let mut class = false;
-    while let Some(&c) = bytes.get(pos) {
-        match c {
-            b'\n' | b'\r' => return None,
-            b'\\' => {
-                if matches!(bytes.get(pos + 1), None | Some(b'\n' | b'\r')) {
-                    return None;
-                }
-                pos += 1;
-            }
-            b'[' => class = true,
-            b']' => class = false,
-            b'/' if !class => {
-                pos += 1;
-                while bytes.get(pos).is_some_and(u8::is_ascii_alphabetic) {
-                    pos += 1;
-                }
-                return Some(pos);
-            }
-            _ => {}
+mod grammar;
+mod literals;
+pub(super) use literals::{bracket_literal, cpp_raw_body, dollar_content, sql_dollar_string_len};
+
+#[derive(Clone, Copy)]
+pub(super) enum LineComments {
+    None,
+    Slash,
+    Hash,
+    Dash,
+    SlashOrHash,
+}
+impl LineComments {
+    pub(super) fn starts(self, tail: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Slash => tail.starts_with("//"),
+            Self::Hash => tail.starts_with('#'),
+            Self::Dash => tail.starts_with("--"),
+            Self::SlashOrHash => tail.starts_with("//") || tail.starts_with('#'),
         }
-        pos += 1;
     }
-    None
+}
+#[derive(Clone, Copy)]
+struct Comments {
+    line: LineComments,
+    block: bool,
 }
 
-// PostgreSQL dollar quotes use matching case-sensitive tags. An unfinished
-// literal consumes the rest of the file, including during an editor update.
-pub(super) fn sql_dollar_string_len(text: &str) -> Option<usize> {
-    let tail = text.strip_prefix('$')?;
-    let tag_len = if tail.starts_with('$') {
-        0
-    } else {
-        if !tail.starts_with(|c: char| c == '_' || c.is_alphabetic()) {
-            return None;
+impl Comments {
+    fn for_language(lang: Language) -> Self {
+        Self {
+            line: lang.comment_style(),
+            block: lang.block_comments(),
         }
-        tail.find(|c: char| c != '_' && !c.is_alphanumeric())?
-    };
-    if tail.as_bytes().get(tag_len) != Some(&b'$') {
-        return None;
     }
-    let delimiter = &text[..tag_len + 2];
-    Some(
-        text[delimiter.len()..]
-            .find(delimiter)
-            .map_or(text.len(), |n| n + delimiter.len() * 2),
-    )
-}
 
-fn delimited_literal(lang: Language, tail: &str) -> Option<usize> {
-    let (body, closing, suffix) = match lang {
-        Language::Cpp => {
-            let raw = ["R\"", "u8R\"", "uR\"", "UR\"", "LR\""]
-                .iter()
-                .find_map(|prefix| tail.strip_prefix(prefix))?;
-            let end = raw.bytes().take(17).position(|b| b == b'(')?;
-            let delimiter = &raw[..end];
-            let body = &raw[end + 1..];
-            if delimiter
-                .bytes()
-                .any(|b| b <= b' ' || matches!(b, b')' | b'\\'))
-            {
-                return None;
-            }
-            let offset = tail.len() - body.len();
-            return Some(
-                body.match_indices(')')
-                    .find_map(|(i, _)| {
-                        let end = i + 1 + delimiter.len();
-                        (body[i + 1..].starts_with(delimiter)
-                            && body.as_bytes().get(end) == Some(&b'"'))
-                        .then_some(offset + end + 1)
-                    })
-                    .unwrap_or(tail.len()),
-            );
-        }
-        Language::Swift => {
-            let hashes = tail.bytes().take_while(|b| *b == b'#').count();
-            let raw = &tail[hashes..];
-            let quotes = if raw.starts_with("\"\"\"") {
-                3
-            } else if hashes > 0 && raw.starts_with('"') {
-                1
-            } else {
-                return None;
-            };
-            let closing = &raw[..quotes];
-            let marker = &tail[..hashes];
-            let mut at = hashes + quotes;
-            while let Some(offset) = tail[at..].find(['\\', '"']) {
-                at += offset;
-                let rest = &tail[at..];
-                if let Some(escaped) = rest.strip_prefix('\\').and_then(|s| s.strip_prefix(marker))
-                    && let Some(next) = escaped.chars().next()
-                {
-                    at += 1 + hashes + next.len_utf8();
-                    continue;
-                }
-                if rest
-                    .strip_prefix(closing)
-                    .is_some_and(|s| s.starts_with(marker))
-                {
-                    return Some(at + quotes + hashes);
-                }
-                at += 1;
-            }
-            return Some(tail.len());
-        }
-        Language::Csharp => {
-            let quotes = tail.bytes().take_while(|b| *b == b'"').count();
-            if quotes < 3 {
-                return None;
-            }
-            (&tail[quotes..], &tail[..quotes], "")
-        }
-        _ => return None,
-    };
-    let offset = tail.len() - body.len();
-    Some(
-        body.match_indices(closing)
-            .find_map(|(i, _)| {
-                let end = i + closing.len();
-                body[end..]
-                    .starts_with(suffix)
-                    .then_some(offset + end + suffix.len())
-            })
-            .unwrap_or(tail.len()),
-    )
-}
-
-pub(super) fn cmake_bracket(s: &str) -> Option<(usize, usize)> {
-    let tail = s.strip_prefix('[')?;
-    let equals = tail.bytes().take_while(|&c| c == b'=').count();
-    if tail.as_bytes().get(equals) != Some(&b'[') {
-        return None;
-    }
-    let open = equals + 2;
-    let close = format!("]{}]", "=".repeat(equals));
-    let end = s[open..]
-        .find(&close)
-        .map_or(s.len(), |i| open + i + close.len());
-    Some((open, end))
-}
-
-pub(super) fn tokens(source: &str, lang: Language) -> Vec<Token<'_>> {
-    let bytes = source.as_bytes();
-    let mut result: Vec<Token> = Vec::new();
-    let mut i = 0;
-    let mut line = 1;
-    while i < bytes.len() {
-        let start = i;
-        let start_line = line;
+    fn consume<G: grammar::Grammar>(
+        self,
+        source: &str,
+        start: usize,
+        comment: &mut impl FnMut(usize),
+        newline: impl FnMut(usize),
+    ) -> Option<usize> {
         let tail = &source[start..];
-        let c = tail.chars().next().unwrap();
-        i += c.len_utf8();
-        if c.is_whitespace() {
-            line += usize::from(c == '\n');
-            continue;
+        if self.line.starts(tail) {
+            comment(start);
+            return Some(start + G::line_comment_width(tail));
         }
-        if lang == Language::Powershell
-            && c == '@'
-            && matches!(bytes.get(i), Some(b'\'' | b'"'))
-            && let Some((header, body)) = tail.split_once('\n')
-            && header[2..].trim().is_empty()
-        {
-            let quote = bytes[i];
-            let mut end = header.len() + 1;
-            for body_line in body.split_inclusive('\n') {
-                if body_line.as_bytes().starts_with(&[quote, b'@']) {
-                    end += 2;
-                    break;
-                }
-                end += body_line.len();
-            }
-            i = start + end;
-            line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-            result.push(Token {
-                text: &source[start..i],
-                span: start..i,
-                line: start_line,
-                kind: Kind::String,
-            });
-            continue;
+        if self.block && tail.starts_with("/*") {
+            comment(start);
+            return Some(block_comment_end(
+                source.as_bytes(),
+                start,
+                G::NESTED_COMMENTS,
+                newline,
+            ));
         }
-        if lang == Language::Powershell && tail.starts_with("<#") {
-            i = tail.find("#>").map_or(bytes.len(), |end| start + end + 2);
-            line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-            continue;
+        None
+    }
+}
+/// Compile-command-dependent token boundaries. Header buffers can be shared
+/// exactly when both their language and preprocessing number grammar agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Mode {
+    pub(super) language: Language,
+    pub(super) digit_separators: bool,
+}
+impl Mode {
+    pub(super) fn written(language: Language) -> Self {
+        Self {
+            language,
+            digit_separators: language == Language::Cpp,
         }
-        if lang == Language::CMake && matches!(c, '#' | '[') {
-            let input = tail.strip_prefix('#').unwrap_or(tail);
-            if let Some((_, end)) = cmake_bracket(input) {
-                i = start + usize::from(c == '#') + end;
-                line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-                if c != '#' {
-                    result.push(Token {
-                        text: &source[start..i],
-                        span: start..i,
-                        line: start_line,
-                        kind: Kind::String,
-                    });
-                }
+    }
+    pub(super) fn tokens(self, source: &str) -> Vec<Token<'_>> {
+        self.scan(source, |_| {})
+    }
+    fn scan(self, source: &str, mut comment: impl FnMut(usize)) -> Vec<Token<'_>> {
+        let mut state = ScanState::new(self);
+        state.advance(source, source.len(), &mut comment, &mut |_| {});
+        state.tokens
+    }
+}
+pub(super) fn tokens(source: &str, lang: Language) -> Vec<Token<'_>> {
+    Mode::written(lang).tokens(source)
+}
+pub(super) fn tokens_with_comments(
+    source: &str,
+    lang: Language,
+    comment: impl FnMut(usize),
+) -> Vec<Token<'_>> {
+    Mode::written(lang).scan(source, comment)
+}
+impl From<Language> for Mode {
+    fn from(lang: Language) -> Self {
+        Self::written(lang)
+    }
+}
+impl<'a> ScanState<'a> {
+    pub(crate) fn advance(
+        &mut self,
+        source: &'a str,
+        bytes: usize,
+        comment: &mut impl FnMut(usize),
+        newline: &mut impl FnMut(usize),
+    ) -> bool {
+        let mode = self.mode;
+        let end = self.offset.saturating_add(bytes);
+        use Language::*;
+        match (mode.language, mode.digit_separators) {
+            (C, true) => self.resume::<grammar::C23>(source, end, comment, newline),
+            (C, false) => self.resume::<grammar::C>(source, end, comment, newline),
+            (Cpp, true) => self.resume::<grammar::Cpp>(source, end, comment, newline),
+            (Cpp, false) => self.resume::<grammar::CppLegacy>(source, end, comment, newline),
+            (Rust, _) => self.resume::<grammar::Rust>(source, end, comment, newline),
+            (Swift, _) => self.resume::<grammar::Swift>(source, end, comment, newline),
+            _ => self.resume_other(source, end, comment, newline),
+        }
+    }
+
+    #[inline(always)]
+    fn resume_other(
+        &mut self,
+        source: &'a str,
+        end: usize,
+        comment: &mut impl FnMut(usize),
+        newline: &mut impl FnMut(usize),
+    ) -> bool {
+        use Language::*;
+        match self.mode.language {
+            Powershell => self.resume::<grammar::Powershell>(source, end, comment, newline),
+            CMake => self.resume::<grammar::CMake>(source, end, comment, newline),
+            Csharp => self.resume::<grammar::Csharp>(source, end, comment, newline),
+            Python => self.resume::<grammar::Python>(source, end, comment, newline),
+            Js => self.resume::<grammar::Javascript>(source, end, comment, newline),
+            _ => self.resume_document(source, end, comment, newline),
+        }
+    }
+
+    #[inline(always)]
+    fn resume_document(
+        &mut self,
+        source: &'a str,
+        end: usize,
+        comment: &mut impl FnMut(usize),
+        newline: &mut impl FnMut(usize),
+    ) -> bool {
+        use Language::*;
+        match self.mode.language {
+            Html => self.resume::<grammar::Html>(source, end, comment, newline),
+            Css => self.resume::<grammar::Css>(source, end, comment, newline),
+            Sql => self.resume::<grammar::Sql>(source, end, comment, newline),
+            _ => self.resume::<grammar::Ordinary>(source, end, comment, newline),
+        }
+    }
+}
+
+pub(crate) struct ScanState<'a> {
+    mode: Mode,
+    comments: Comments,
+    offset: usize,
+    line: usize,
+    pub(super) tokens: Vec<Token<'a>>,
+}
+
+impl ScanState<'_> {
+    pub(crate) fn new(mode: impl Into<Mode>) -> Self {
+        let mode = mode.into();
+        Self {
+            mode,
+            comments: Comments::for_language(mode.language),
+            offset: 0,
+            line: 1,
+            tokens: Vec::new(),
+        }
+    }
+}
+
+impl<'a> ScanState<'a> {
+    /// Stops only between lexemes. A literal, escaped line, or nested block
+    /// comment is consumed atomically even if it crosses the soft byte limit.
+    fn resume<G: grammar::Grammar>(
+        &mut self,
+        source: &'a str,
+        limit: usize,
+        comment: &mut impl FnMut(usize),
+        newline: &mut impl FnMut(usize),
+    ) -> bool {
+        let bytes = source.as_bytes();
+        let mut i = self.offset;
+        let mut line = self.line;
+        let result = &mut self.tokens;
+        let stop = limit.min(bytes.len());
+        while i < stop {
+            let start = i;
+            let start_line = line;
+            let mut next_line = |at| {
+                line += 1;
+                newline(at);
+            };
+            let tail = &source[start..];
+            let c = tail.chars().next().unwrap();
+            i += c.len_utf8();
+            if whitespace(c, i, &mut next_line) {
                 continue;
             }
+            let lexeme = LexemeStart {
+                source,
+                start,
+                first: c,
+                previous: result.last().map(|token| token.text),
+            };
+            let (end, kind) = self.comments.lexeme::<G>(lexeme, comment, next_line);
+            i = end;
+            push_token(result, source, start..i, (start_line, kind));
         }
-        if lang.line_comment(tail) {
-            i = source[start..]
-                .find('\n')
-                .map_or(bytes.len(), |n| start + n);
-            continue;
-        }
-        if lang.block_comments() && tail.starts_with("/*") {
-            i = start + 2;
-            let mut depth = 1usize;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i..].starts_with(b"*/") {
-                    depth -= 1;
-                    i += 2;
-                } else if matches!(lang, Language::Rust | Language::Swift)
-                    && bytes[i..].starts_with(b"/*")
-                {
-                    depth += 1;
-                    i += 2;
-                } else {
-                    line += usize::from(bytes[i] == b'\n');
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        if lang == Language::Html && tail.starts_with("<!--") {
-            i = tail.find("-->").map_or(bytes.len(), |end| start + end + 3);
-            line += bytes[start..i].iter().filter(|b| **b == b'\n').count();
-            continue;
-        }
-        if lang == Language::Rust {
-            if let Some(end) = rust_literal_end(tail) {
-                i = start + end;
-                line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-                result.push(Token {
-                    text: &source[start..i],
-                    span: start..i,
-                    line: start_line,
-                    kind: Kind::String,
-                });
-                continue;
-            }
-            if let Some(raw) = tail
-                .strip_prefix("r#")
-                .filter(|r| r.starts_with(|c: char| c == '_' || c.is_alphabetic()))
-            {
-                let length = raw
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(raw.len());
-                i = start + 2 + length;
-                result.push(Token {
-                    text: &source[start..i],
-                    span: start..i,
-                    line: start_line,
-                    kind: Kind::Word,
-                });
-                continue;
-            }
-        }
-        let mut kind = Kind::Punct;
-        if matches!(
-            (lang, c),
-            (Language::Swift, '#' | '"')
-                | (Language::Csharp, '"')
-                | (Language::Cpp, 'R' | 'u' | 'U' | 'L')
-        ) && let Some(end) = delimited_literal(lang, tail)
-        {
-            kind = Kind::String;
-            i = start + end;
-            line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-        } else if lang == Language::Js
-            && c == '/'
-            && result.last().is_none_or(|t| {
-                matches!(
-                    t.text,
-                    "=" | "("
-                        | "{"
-                        | "["
-                        | ","
-                        | ";"
-                        | ":"
-                        | "!"
-                        | "&"
-                        | "|"
-                        | "?"
-                        | "return"
-                        | "throw"
-                        | "case"
-                        | "yield"
-                )
-            })
-            && let Some(stop) = regex_end(bytes, i)
-        {
-            kind = Kind::String;
-            i = stop;
-        } else if c == '$'
-            && lang == Language::Sql
-            && let Some(width) = sql_dollar_string_len(tail)
-        {
-            kind = Kind::String;
-            i = start + width;
-            line += bytes[start..i].iter().filter(|&&b| b == b'\n').count();
-        } else if matches!(c, '\'' | '"' | '`')
-            && !(lang == Language::Rust && c == '\'' && tail.chars().nth(2) != Some('\''))
-        {
-            kind = Kind::String;
-            let q = c as u8;
-            let triple = lang == Language::Python && bytes[start..].starts_with(&[q, q, q]);
-            if triple {
-                i += 2;
-            }
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    line += usize::from(bytes[i + 1] == b'\n');
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == q && (!triple || bytes[i..].starts_with(&[q, q, q])) {
-                    i += if triple { 3 } else { 1 };
-                    break;
-                }
-                line += usize::from(bytes[i] == b'\n');
-                i += 1;
-            }
-        } else if c.is_alphanumeric() || c == '_' || c == '$' {
-            kind = Kind::Word;
-            for n in source[i..].chars() {
-                if n.is_alphanumeric()
-                    || n == '_'
-                    || n == '$'
-                    || n == '\''
-                        && lang == Language::Cpp
-                        && c.is_ascii_digit()
-                        && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
-                    || n == '-' && matches!(lang, Language::Powershell | Language::Css)
-                {
-                    i += n.len_utf8();
-                } else {
-                    break;
-                }
-            }
-        }
-        result.push(Token {
-            text: &source[start..i],
-            span: start..i,
-            line: start_line,
+        self.offset = i;
+        self.line = line;
+        i == source.len()
+    }
+}
+
+#[inline]
+fn push_token<'a>(
+    out: &mut Vec<Token<'a>>,
+    source: &'a str,
+    span: Range<usize>,
+    (line, kind): (usize, Option<Kind>),
+) {
+    if let Some(kind) = kind {
+        out.push(Token {
+            text: &source[span.clone()],
+            span,
+            line,
             kind,
         });
     }
-    result
 }
 
-fn rust_literal_end(text: &str) -> Option<usize> {
-    let raw = text
-        .strip_prefix("br")
-        .or_else(|| text.strip_prefix("cr"))
-        .or_else(|| text.strip_prefix('r'));
-    if let Some(raw) = raw {
-        let hashes = raw.bytes().take_while(|&c| c == b'#').count();
-        if raw.as_bytes().get(hashes) == Some(&b'"') {
-            let start = text.len() - raw.len() + hashes + 1;
-            for (offset, _) in text[start..].match_indices('"') {
-                let after = start + offset + 1;
-                if text.as_bytes()[after..].starts_with(&raw.as_bytes()[..hashes]) {
-                    return Some(after + hashes);
-                }
-            }
-            return Some(text.len());
+struct LexemeStart<'a> {
+    source: &'a str,
+    start: usize,
+    first: char,
+    previous: Option<&'a str>,
+}
+
+impl Comments {
+    #[inline]
+    fn lexeme<G: grammar::Grammar>(
+        self,
+        token: LexemeStart<'_>,
+        comment: &mut impl FnMut(usize),
+        mut newline: impl FnMut(usize),
+    ) -> (usize, Option<Kind>) {
+        let LexemeStart {
+            source,
+            start,
+            first,
+            previous,
+        } = token;
+        let tail = &source[start..];
+        if let Some((width, lexeme)) = G::prefix(tail, first, previous) {
+            let kind = lexeme.observe(&tail[..width], start, comment, newline);
+            return (start + width, kind);
         }
+        if let Some(end) = self.consume::<G>(source, start, comment, &mut newline) {
+            return (end, None);
+        }
+        let (end, kind) = ordinary_token::<G>(source, start, first, newline);
+        (end, Some(kind))
     }
-    let quoted = text
-        .strip_prefix('b')
-        .or_else(|| text.strip_prefix('c'))
-        .unwrap_or(text);
-    let prefix = text.len() - quoted.len();
-    let bytes = quoted.as_bytes();
-    let q = *bytes.first()?;
-    if q != b'"' && q != b'\'' {
-        return None;
+}
+
+#[inline]
+fn whitespace(c: char, end: usize, newline: &mut impl FnMut(usize)) -> bool {
+    if c == '\n' {
+        newline(end);
+        return true;
     }
-    // A lifetime consumes no quoted token. Its first scalar would have to be
-    // immediately followed by a quote to be an ordinary character literal.
-    if q == b'\'' && bytes.get(1) != Some(&b'\\') {
-        let first = quoted[1..].chars().next()?;
-        let end = 1 + first.len_utf8();
-        return (bytes.get(end) == Some(&q)).then_some(prefix + end + 1);
+    c.is_whitespace()
+}
+
+fn observe_newline(is_newline: bool, pos: usize, mut newline: impl FnMut(usize)) {
+    if is_newline {
+        newline(pos);
     }
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            c if c == q => return Some(prefix + i + 1),
+}
+
+fn ordinary_token<G: grammar::Grammar>(
+    source: &str,
+    start: usize,
+    first: char,
+    newline: impl FnMut(usize),
+) -> (usize, Kind) {
+    let next = start + first.len_utf8();
+    let tail = &source[start..];
+    if let Some(prefix) = G::quote_start(first, tail) {
+        let at = start + prefix;
+        let bytes = source.as_bytes();
+        (quoted_end::<G>(bytes, at, newline), Kind::String)
+    } else if word_char(first) {
+        (word_end::<G>(source, next, first), Kind::Word)
+    } else {
+        (next, Kind::Punct)
+    }
+}
+
+#[inline]
+fn quoted_end<G: grammar::Grammar>(
+    bytes: &[u8],
+    at: usize,
+    mut newline: impl FnMut(usize),
+) -> usize {
+    if G::C_LINE_ENDINGS {
+        return native_quoted_end(bytes, at, newline);
+    }
+    at + quoted_len(&bytes[at..], G::TRIPLE_QUOTES, false, |end| {
+        newline(at + end)
+    })
+}
+
+fn word_end<G: grammar::Grammar>(source: &str, start: usize, first: char) -> usize {
+    let numeric = G::DIGIT_SEPARATOR && first.is_ascii_digit();
+    let mut at = start;
+    for ch in source[start..].chars() {
+        if !word_continues::<G>(source, at, ch, numeric) {
+            break;
+        }
+        at += ch.len_utf8();
+    }
+    at
+}
+
+#[inline]
+fn word_continues<G: grammar::Grammar>(source: &str, at: usize, next: char, numeric: bool) -> bool {
+    match next {
+        // C-family preprocessing numbers admit an identifier character
+        // after an apostrophe. The native integer reader checks its radix.
+        '\'' if numeric => source[at + 1..].starts_with(word_char),
+        '-' => G::DASH_IN_WORD,
+        _ => word_char(next),
+    }
+}
+
+pub(super) fn word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '$')
+}
+
+pub(super) fn block_comment_end(
+    bytes: &[u8],
+    start: usize,
+    nested: bool,
+    mut newline: impl FnMut(usize),
+) -> usize {
+    let mut i = start + 2;
+    let mut depth = 1;
+    while depth > 0 && i < bytes.len() {
+        match &bytes[i..] {
+            [b'*', b'/', ..] => {
+                depth -= 1;
+                i += 2;
+            }
+            [b'/', b'*', ..] if nested => {
+                depth += 1;
+                i += 2;
+            }
+            [b'\n', ..] => {
+                i += 1;
+                newline(i);
+            }
             _ => i += 1,
         }
     }
-    Some(text.len())
+    i
+}
+
+pub(super) fn quoted_len(
+    bytes: &[u8],
+    allow_triple: bool,
+    raw: bool,
+    newline: impl FnMut(usize),
+) -> usize {
+    if allow_triple && bytes.starts_with(&[bytes[0]; 3]) {
+        quote_body::<3>(bytes, raw, newline)
+    } else {
+        quote_body::<1>(bytes, raw, newline)
+    }
+}
+fn quote_body<const WIDTH: usize>(
+    bytes: &[u8],
+    raw: bool,
+    mut newline: impl FnMut(usize),
+) -> usize {
+    let delimiter = [bytes[0]; WIDTH];
+    let mut pos = WIDTH;
+    while let Some(&byte) = bytes.get(pos) {
+        if bytes[pos..].starts_with(&delimiter) {
+            return pos + WIDTH;
+        }
+        pos += usize::from(byte == b'\\' && !raw);
+        observe_newline(bytes.get(pos) == Some(&b'\n'), pos + 1, &mut newline);
+        pos += 1;
+    }
+    bytes.len()
+}
+
+// Translation removes a physical continuation before the C grammar
+// interprets escapes, including the last slash in an even-length run.
+fn native_quoted_end(bytes: &[u8], start: usize, mut newline: impl FnMut(usize)) -> usize {
+    let quote = bytes[start];
+    let mut escaped = false;
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        match native_quote_byte(bytes, pos, (quote, escaped), &mut newline) {
+            QuoteByte::End(end) => return end,
+            QuoteByte::Splice(end) => pos = end,
+            QuoteByte::Ordinary(next_escaped) => {
+                escaped = next_escaped;
+                pos += 1;
+            }
+        }
+    }
+    pos
+}
+enum QuoteByte {
+    End(usize),
+    Splice(usize),
+    Ordinary(bool),
+}
+
+#[inline]
+fn native_quote_byte(
+    bytes: &[u8],
+    pos: usize,
+    (quote, escaped): (u8, bool),
+    newline: &mut impl FnMut(usize),
+) -> QuoteByte {
+    let byte = bytes[pos];
+    match byte {
+        b'\r' | b'\n' => QuoteByte::End(pos),
+        byte if byte == quote && !escaped => QuoteByte::End(pos + 1),
+        b'\\' => splice_end(bytes, pos + 1, newline)
+            .map_or(QuoteByte::Ordinary(!escaped), QuoteByte::Splice),
+        _ => QuoteByte::Ordinary(false),
+    }
+}
+
+fn splice_end(bytes: &[u8], mut pos: usize, newline: &mut impl FnMut(usize)) -> Option<usize> {
+    while matches!(bytes.get(pos), Some(b' ' | b'\t')) {
+        pos += 1;
+    }
+    if bytes.get(pos) == Some(&b'\r') {
+        pos += 1;
+        if bytes.get(pos) != Some(&b'\n') {
+            return Some(pos);
+        }
+    } else if bytes.get(pos) != Some(&b'\n') {
+        return None;
+    }
+    newline(pos + 1);
+    Some(pos + 1)
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn c_physical_splices_precede_escape_pairing_in_a_string() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for count in 1..=4 {
+                let literal = format!("\"prefix{}{}n\"", "\\".repeat(count), newline);
+                let text = format!("{literal} next");
+                let t = tokens(&text, Language::C);
+                assert_eq!(
+                    t.iter().map(|t| t.text).collect::<Vec<_>>(),
+                    [literal.as_str(), "next"]
+                );
+                assert_eq!(t[1].line, 1 + usize::from(newline.ends_with('\n')));
+            }
+        }
+    }
+
+    #[test]
+    fn resumption_preserves_offsets_comments_and_js_regex_context() {
+        let text = "let π = /a\\//g; /* one\n two */ x / 2;\n// e\nconst y='🙂';";
+        let mut comments = Vec::new();
+        let all = tokens_with_comments(text, Language::Js, |at| comments.push(at));
+        for chunk in 1..=text.len() {
+            let mut state = ScanState::new(Language::Js);
+            let mut actual = Vec::new();
+            while !state.resume::<grammar::Javascript>(
+                text,
+                state.offset + chunk,
+                &mut |at| actual.push(at),
+                &mut |_| {},
+            ) {}
+            assert_eq!(actual, comments);
+            assert_tokens_equal(&state.tokens, &all);
+        }
+    }
+
+    fn assert_tokens_equal(actual: &[Token], expected: &[Token]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert!(a.kind == b.kind);
+            assert_eq!((&a.span, a.line, a.text), (&b.span, b.line, b.text));
+        }
+    }
+
 }

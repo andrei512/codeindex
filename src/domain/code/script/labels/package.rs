@@ -32,17 +32,7 @@ impl<'a> Cursor<'a> {
                     self.0 = &s[i + 1..];
                     return Some(&s[..i]);
                 }
-                b'\\' => match bytes.next()?.1 {
-                    b'u' => {
-                        for _ in 0..4 {
-                            if !bytes.next()?.1.is_ascii_hexdigit() {
-                                return None;
-                            }
-                        }
-                    }
-                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-                    _ => return None,
-                },
+                b'\\' => skip_escape(&mut bytes)?,
                 0..=31 => return None,
                 _ => {}
             }
@@ -73,6 +63,21 @@ impl<'a> Cursor<'a> {
         Some(())
     }
 
+    // Both the root object and nested containers require separators between
+    // entries. Consuming a comma commits the caller to parsing one more entry.
+    fn entries(&mut self, close: u8, mut entry: impl FnMut(&mut Self) -> Option<()>) -> Option<()> {
+        if self.byte()? != close {
+            loop {
+                entry(self)?;
+                if self.byte()? == close {
+                    break;
+                }
+                self.take(b',')?;
+            }
+        }
+        self.take(close)
+    }
+
     fn value(&mut self, depth: usize) -> Option<Option<&'a str>> {
         if depth > 128 {
             return None;
@@ -80,22 +85,7 @@ impl<'a> Cursor<'a> {
         match self.byte()? {
             b'"' => return self.string().map(Some),
             open @ (b'{' | b'[') => {
-                let close = if open == b'{' { b'}' } else { b']' };
-                self.take(open)?;
-                if self.byte()? != close {
-                    loop {
-                        if open == b'{' {
-                            self.string()?;
-                            self.take(b':')?;
-                        }
-                        self.value(depth + 1)?;
-                        if self.byte()? == close {
-                            break;
-                        }
-                        self.take(b',')?;
-                    }
-                }
-                self.take(close)?;
+                self.container(open, depth + 1)?;
             }
             b'-' | b'0'..=b'9' => self.number()?,
             _ => {
@@ -105,6 +95,34 @@ impl<'a> Cursor<'a> {
             }
         }
         Some(None)
+    }
+
+    fn container(&mut self, open: u8, depth: usize) -> Option<()> {
+        let object = open == b'{';
+        let close = if object { b'}' } else { b']' };
+        self.take(open)?;
+        self.entries(close, |cursor| {
+            if object {
+                cursor.string()?;
+                cursor.take(b':')?;
+            }
+            cursor.value(depth).map(|_| ())
+        })
+    }
+}
+
+fn skip_escape(bytes: &mut impl Iterator<Item = (usize, u8)>) -> Option<()> {
+    match bytes.next()?.1 {
+        b'u' => {
+            for _ in 0..4 {
+                if !bytes.next()?.1.is_ascii_hexdigit() {
+                    return None;
+                }
+            }
+            Some(())
+        }
+        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => Some(()),
+        _ => None,
     }
 }
 
@@ -121,26 +139,20 @@ fn fields(text: &str) -> Option<Manifest<'_>> {
     cursor.take(b'{')?;
     let mut name = None;
     let mut version = None;
-    if cursor.byte()? != b'}' {
-        loop {
-            let key = cursor.string()?;
-            if key.contains('\\') {
-                return None;
-            }
-            cursor.take(b':')?;
-            let value = cursor.value(0)?;
-            match key {
-                "name" => name = value,
-                "version" => version = value,
-                _ => {}
-            }
-            if cursor.byte()? == b'}' {
-                break;
-            }
-            cursor.take(b',')?;
+    cursor.entries(b'}', |cursor| {
+        let key = cursor.string()?;
+        if key.contains('\\') {
+            return None;
         }
-    }
-    cursor.take(b'}')?;
+        cursor.take(b':')?;
+        let value = cursor.value(0)?;
+        match key {
+            "name" => name = value,
+            "version" => version = value,
+            _ => {}
+        }
+        Some(())
+    })?;
     if cursor.byte().is_some() {
         return None;
     }

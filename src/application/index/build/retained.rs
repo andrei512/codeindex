@@ -1,7 +1,7 @@
 //! Copy runs of immutable bytes in one read, including across adjacent files.
 use super::{Local, Previous};
 use crate::application::index::{Entry, layout::ExtentSink};
-use crate::domain::code::Language;
+use crate::domain::code::{Analysis, Language};
 use std::{io, ops::Range};
 
 pub(super) fn range(
@@ -51,13 +51,7 @@ impl<'a, W: ExtentSink> Run<'a, W> {
 
     /// Keep the equal prefix and suffix even when a variable-length record grows.
     pub(super) fn replacement(&mut self, base: u64, old: &[u8], new: &[u8]) -> io::Result<()> {
-        let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
-        let suffix = old[prefix..]
-            .iter()
-            .rev()
-            .zip(new[prefix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
+        let (prefix, suffix) = crate::domain::matching_edges(old, new);
         self.borrow(base..base + prefix as u64)?;
         if prefix < new.len() - suffix {
             self.bytes(&new[prefix..new.len() - suffix])?;
@@ -81,47 +75,74 @@ impl<'a, W: ExtentSink> Run<'a, W> {
     }
 }
 
-pub(super) fn evidence(
-    sink: &mut impl ExtentSink,
-    prior: Option<&dyn Previous>,
-    reuse: &[Option<usize>],
-    locals: &[Local],
-    files: &[Entry],
-) -> io::Result<Vec<u64>> {
-    let capacity = files
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("evidence table too large"))?;
-    let mut offsets = Vec::new();
-    offsets
-        .try_reserve_exact(capacity)
-        .map_err(io::Error::other)?;
-    append_evidence(sink, prior, reuse, locals, files, &mut offsets)?;
-    offsets.push(sink.offset());
-    Ok(offsets)
+pub(super) enum Evidence<'a> {
+    Retained(usize),
+    Encoded(&'a Analysis),
+    Absent,
 }
 
-pub(super) fn append_evidence(
-    sink: &mut impl ExtentSink,
-    prior: Option<&dyn Previous>,
-    reuse: &[Option<usize>],
-    locals: &[Local],
-    files: &[Entry],
-    offsets: &mut Vec<u64>,
-) -> io::Result<()> {
-    let mut run = Run::new(prior, sink);
-    let mut scratch = Vec::new();
-    for ((local, file), &old) in locals.iter().zip(files).zip(reuse) {
-        offsets.push(run.offset());
+impl<'a> Evidence<'a> {
+    pub fn classify(path: &str, source: bool, code: &'a Analysis, old: Option<usize>) -> Self {
         if let Some(id) = old {
-            run.borrow(prior.unwrap().entries()[id].evidence.clone())?;
-        } else if file.bytes.is_some() && (Language::for_path(file.path()).is_some() || super::c_project::database(file.path())) {
-            scratch.clear();
-            local.code.encode(&mut scratch);
-            run.bytes(&scratch)?;
+            Self::Retained(id)
+        } else if source && (Language::for_path(path).is_some() || super::c_project::database(path)) {
+            Self::Encoded(code)
+        } else {
+            Self::Absent
         }
     }
-    run.flush()
+}
+
+pub(super) struct EvidenceRows<'a> {
+    pub prior: Option<&'a dyn Previous>,
+    pub reuse: &'a [Option<usize>],
+    pub locals: &'a [Local],
+    pub files: &'a [Entry],
+}
+
+impl EvidenceRows<'_> {
+    pub fn offsets(&self) -> io::Result<Vec<u64>> {
+        let capacity = self.files.len().checked_add(1)
+            .ok_or_else(|| io::Error::other("evidence table too large"))?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(capacity).map_err(io::Error::other)?;
+        Ok(offsets)
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        Self {
+            prior: self.prior,
+            reuse: &self.reuse[range.clone()],
+            locals: &self.locals[range.clone()],
+            files: &self.files[range],
+        }
+    }
+
+    pub fn write(&self, sink: &mut impl ExtentSink) -> io::Result<Vec<u64>> {
+        let mut offsets = self.offsets()?;
+        self.append(sink, &mut offsets)?;
+        offsets.push(sink.offset());
+        Ok(offsets)
+    }
+
+    pub fn append(&self, sink: &mut impl ExtentSink, offsets: &mut Vec<u64>) -> io::Result<()> {
+        let mut run = Run::new(self.prior, sink);
+        let mut scratch = Vec::new();
+        for ((local, file), &old) in self.locals.iter().zip(self.files).zip(self.reuse) {
+            let evidence = Evidence::classify(file.path(), file.bytes.is_some(), &local.code, old);
+            offsets.push(run.offset());
+            match evidence {
+                Evidence::Retained(id) => run.borrow(self.prior.unwrap().entries()[id].evidence.clone())?,
+                Evidence::Encoded(code) => {
+                    scratch.clear();
+                    code.encode(&mut scratch);
+                    run.bytes(&scratch)?;
+                }
+                Evidence::Absent => {}
+            }
+        }
+        run.flush()
+    }
 }
 
 impl<W: ExtentSink> std::io::Write for Run<'_, W> {

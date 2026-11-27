@@ -12,8 +12,7 @@ fn frozen_rank_and_excerpt_survive_reopen() {
     for (path, body) in ["a", "b", "c", "foo"].into_iter().zip(bodies) {
         index.add_file(path, body, &chunk_ranges(body, &[]));
     }
-    let mut wire = Vec::new();
-    index.write_to(&mut wire).unwrap();
+    let wire = encoded(&index);
     let restored = RankedIndex::read_from(wire.as_slice()).unwrap();
     for (query, mult) in [("foo-bar", 1.), ("foo-bar foo-bar", 2.)] {
         let (hits, overflow) = restored.search(query, |id| bodies[id]).unwrap();
@@ -119,6 +118,24 @@ fn cross_index_markdown_release_witness() {
     assert_eq!(hit.score.to_bits(), (-0.8104588229790644f64).to_bits());
 }
 
+struct CountedExtent<'a> {
+    wire: &'a [u8],
+    reads: &'a mut usize,
+}
+
+impl crate::domain::content_lookup::ExtentRead for CountedExtent<'_> {
+    fn length(&self) -> u64 {
+        self.wire.len() as u64
+    }
+
+    fn read(&mut self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let start = offset as usize;
+        out.copy_from_slice(&self.wire[start..start + out.len()]);
+        *self.reads += out.len();
+        Ok(())
+    }
+}
+
 #[test]
 fn selective_reads_preserve_score_bits_and_skip_cold_spans() {
     let mut index = RankedIndex::default();
@@ -131,8 +148,7 @@ fn selective_reads_preserve_score_bits_and_skip_cold_spans() {
     for (p, body) in paths.iter().zip(&bodies) {
         index.add_file(p, body, &chunk_ranges(body, &[]));
     }
-    let mut wire = vec![];
-    index.write_to(&mut wire).unwrap();
+    let wire = encoded(&index);
     for q in [
         "needle",
         "foo-bar foo-bar café",
@@ -143,19 +159,18 @@ fn selective_reads_preserve_score_bits_and_skip_cold_spans() {
         let mut reads = 0;
         let mut source_ranges = vec![];
         let args = RankedIndex::search_extent(
-            wire.len() as u64,
-            |at, out| {
-                let i = at as usize;
-                out.copy_from_slice(&wire[i..i + out.len()]);
-                reads += out.len();
-                Ok(())
+            CountedExtent {
+                wire: &wire,
+                reads: &mut reads,
             },
-            3,
-            |f| paths[f],
-            |f, r| {
-                assert_ne!(f, 2);
-                source_ranges.push((f, r.clone()));
-                Ok(bodies[f][r.start as usize..r.end as usize].into())
+            ExtentCatalog {
+                count: paths.len(),
+                path: |f| paths[f],
+                source: |f: usize, r: Range<u64>| {
+                    assert_ne!(f, 2);
+                    source_ranges.push((f, r.clone()));
+                    Ok(bodies[f][r.start as usize..r.end as usize].into())
+                },
             },
             q,
         )
@@ -184,6 +199,12 @@ fn selective_reads_preserve_score_bits_and_skip_cold_spans() {
 
 #[test]
 fn refresh_matches_fresh_wire_with_shifted_rows_and_document_frequencies() {
+    for seed in 0..16 {
+        compare_refreshed_documents(seed);
+    }
+}
+
+fn compare_refreshed_documents(seed: usize) {
     fn body(i: usize, salt: usize) -> String {
         ("\n".repeat(i % 3) + &format!("SharedKey group{} value-{} café shared\n", i % 4, salt))
             .repeat(match i % 5 {
@@ -198,44 +219,64 @@ fn refresh_matches_fresh_wire_with_shifted_rows_and_document_frequencies() {
     };
     // Drop, insert, change and retain documents at all positions, including
     // tokenless files and overlapping multi-chunk documents.
-    for seed in 0..16 {
-        let mut old = RankedIndex::default();
-        let prior_ids: Vec<_> = (0..22).filter(|i| (i + seed) % 5 != 1).collect();
-        for &i in &prior_ids {
-            add(&mut old, i, i);
-        }
-        let ids: Vec<_> = (0..22).filter(|i| (i + seed) % 7 != 1).collect();
-        let salt = |i| if (i + seed) % 5 == 2 { 104 } else { i };
-        let reuse: Vec<_> = ids
-            .iter()
-            .map(|&i| {
-                (salt(i) == i)
-                    .then(|| prior_ids.binary_search(&i).ok())
-                    .flatten()
-            })
-            .collect();
-        let mut generated = Vec::new();
-        let updated = RankedIndex::refresh(old, &reuse, |r, new| {
-            generated.push(new);
-            add(r, ids[new], salt(ids[new]));
-        })
-        .unwrap();
-        assert_eq!(
-            generated,
-            (0..ids.len())
-                .filter(|&i| reuse[i].is_none())
-                .collect::<Vec<_>>()
-        );
-        let mut fresh = RankedIndex::default();
-        for &i in &ids {
-            add(&mut fresh, i, salt(i));
-        }
-        let mut actual = Vec::new();
-        let mut expected = Vec::new();
-        updated.write_to(&mut actual).unwrap();
-        fresh.write_to(&mut expected).unwrap();
-        assert_eq!(actual, expected, "seed {seed}");
+    let mut old = RankedIndex::default();
+    let prior_ids: Vec<_> = (0..22).filter(|i| (i + seed) % 5 != 1).collect();
+    for &i in &prior_ids {
+        add(&mut old, i, i);
     }
+    let ids: Vec<_> = (0..22).filter(|i| (i + seed) % 7 != 1).collect();
+    let salt = |i| if (i + seed) % 5 == 2 { 104 } else { i };
+    let reuse: Vec<_> = ids
+        .iter()
+        .map(|&i| {
+            (salt(i) == i)
+                .then(|| prior_ids.binary_search(&i).ok())
+                .flatten()
+        })
+        .collect();
+    let mut generated = Vec::new();
+    let updated = RankedIndex::refresh(old, &reuse, |r, new| {
+        generated.push(new);
+        add(r, ids[new], salt(ids[new]));
+    })
+    .unwrap();
+    assert_eq!(
+        generated,
+        (0..ids.len())
+            .filter(|&i| reuse[i].is_none())
+            .collect::<Vec<_>>()
+    );
+    let mut fresh = RankedIndex::default();
+    for &i in &ids {
+        add(&mut fresh, i, salt(i));
+    }
+    assert_eq!(encoded(&updated), encoded(&fresh), "seed {seed}");
+}
+
+fn apply_patch(bytes: &[u8], edits: &[patch::Edit<'_>]) -> Vec<u8> {
+    let plan = patch::patch(
+        bytes.len() as u64,
+        |r| Ok(bytes[r.start as usize..r.end as usize].to_vec()),
+        edits,
+    )
+    .unwrap()
+    .unwrap();
+    let mut actual = vec![];
+    for piece in plan.pieces {
+        match piece {
+            patch::Piece::Bytes(b) => actual.extend(b),
+            patch::Piece::Borrow(r) => {
+                actual.extend_from_slice(&bytes[r.start as usize..r.end as usize])
+            }
+        }
+    }
+    actual
+}
+
+fn encoded(index: &RankedIndex) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    index.write_to(&mut bytes).unwrap();
+    bytes
 }
 
 #[test]
@@ -267,9 +308,7 @@ fn grouped_rank_patch_preserves_exact_wire_after_repeated_edits() {
         for (name, body) in names.iter().zip(texts) {
             rank.add_file(name, body, &chunks(body));
         }
-        let mut bytes = vec![];
-        rank.write_to(&mut bytes).unwrap();
-        bytes
+        encoded(&rank)
     };
     let mut texts = initial;
     let mut bytes = encode(&texts);
@@ -293,26 +332,23 @@ fn grouped_rank_patch_preserves_exact_wire_after_repeated_edits() {
                 chunks: chunks(&next[id]),
             })
             .collect::<Vec<_>>();
-        let plan = patch::patch(
-            bytes.len() as u64,
-            |r| Ok(bytes[r.start as usize..r.end as usize].to_vec()),
-            &edits,
-        )
-        .unwrap()
-        .unwrap();
-        let mut actual = vec![];
-        for piece in plan.pieces {
-            match piece {
-                patch::Piece::Bytes(b) => actual.extend(b),
-                patch::Piece::Borrow(r) => {
-                    actual.extend_from_slice(&bytes[r.start as usize..r.end as usize])
-                }
-            }
-        }
+        let actual = apply_patch(&bytes, &edits);
         assert_eq!(actual, encode(&next));
         texts = next;
         bytes = actual;
     }
+}
+
+fn assert_token_streams_match(text: &str) {
+    let mut words=vec![];
+    let mut parts=vec![];
+    super::token::tokenize(text, |k,s| words.push((k.to_vec(),s)));
+    super::token::identifier_parts(text, |base,p| super::token::tokenize(p, |k,s| parts.push((k.to_vec(),base+s.start..base+s.end))));
+    let mut got_words=vec![];
+    let mut got_parts=vec![];
+    super::token::ranked_words(text, |part,k,s| if part {got_parts.push((k.to_vec(),s))} else {got_words.push((k.to_vec(),s))});
+    assert_eq!(words,got_words);
+    assert_eq!(parts,got_parts);
 }
 
 #[test]
@@ -328,15 +364,7 @@ fn fused_rank_words_and_packed_groups_match_reference() {
     }
     let long_key = format!("abc{}_{}{}", "Z".repeat(40000), "α".repeat(30000), "XYZ");
     for (i,text) in ["", "_hHTTPServer abcNew\n\n___TTT_", &large, &long_key].into_iter().enumerate() {
-        let mut words=vec![];
-        let mut parts=vec![];
-        super::token::tokenize(text, |k,s| words.push((k.to_vec(),s)));
-        super::token::identifier_parts(text, |base,p| super::token::tokenize(p, |k,s| parts.push((k.to_vec(),base+s.start..base+s.end))));
-        let mut got_words=vec![];
-        let mut got_parts=vec![];
-        super::token::ranked_words(text, |part,k,s| if part {got_parts.push((k.to_vec(),s))} else {got_words.push((k.to_vec(),s))});
-        assert_eq!(words,got_words);
-        assert_eq!(parts,got_parts);
+        assert_token_streams_match(text);
         let path=format!("src/HTTP_File_{i}.rs");
         let chunks=chunk_ranges(text,&[]);
         rank.add_file(&path,text,&chunks);
@@ -370,4 +398,50 @@ fn joined_packed_groups_keep_global_file_order_and_rank_bytes() {
     merged.write_to(&mut got).unwrap();
     assert_eq!(expected.len(),got.len());
     assert!(expected==got);
+}
+
+#[test]
+fn legacy_grouped_directory_validates_file_bases_separately_from_offsets() {
+    let mut bytes = b"CIRANK03".to_vec();
+    bytes.extend([0, 0, 0]); // Empty file, row and term tables.
+    for value in [9u64, 11] {
+        bytes.extend(value.to_le_bytes());
+    }
+    let base_at = bytes.len();
+    bytes.extend(0u64.to_le_bytes());
+    bytes.extend_from_slice(b"RANKDIR3");
+    for value in [0u64, 0, 11, 10, 0, 0] {
+        bytes.extend(value.to_le_bytes());
+    }
+    assert!(RankedIndex::read_from(bytes.as_slice()).is_ok());
+    bytes[base_at] = 1;
+    assert!(RankedIndex::read_from(bytes.as_slice()).is_err());
+}
+
+#[test]
+fn ranked_row_block_rejects_order_totals_and_trailing_data() {
+    let mut dir = cursor::Directory {
+        format: storage::Format::Tree,
+        files: 2,
+        terms: 0,
+        offset: 42,
+        rows_end: 40,
+        tokens: 2,
+        rows: 2,
+    };
+    let mut rows = vec![2, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0];
+    let mut offsets = Vec::new();
+    dir.row_block(&rows)
+        .unwrap()
+        .visit(|at, start, _| offsets.push((at, start)))
+        .unwrap();
+    assert_eq!(offsets, [(22, 0), (31, 1)]);
+    rows.swap(1, 10);
+    assert!(dir.row_block(&rows).unwrap().visit(|_, _, _| {}).is_err());
+    rows.swap(1, 10);
+    rows.push(0);
+    assert!(dir.row_block(&rows).unwrap().visit(|_, _, _| {}).is_err());
+    rows.pop();
+    dir.tokens = 3;
+    assert!(dir.row_block(&rows).unwrap().visit(|_, _, _| {}).is_err());
 }

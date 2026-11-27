@@ -1,8 +1,7 @@
 //! The lifetime of the cache is the lifetime of an immutable generation pin.
 //! Directory probes frequently revisit the same verified pages across queries.
-use super::Envelope;
+use super::{Envelope, envelope::BLOCK};
 use std::{io, ops::Range, sync::Mutex};
-const BLOCK: u64 = 4096;
 const SLOTS: usize = 256;
 struct Page {
     file: u64,
@@ -45,11 +44,7 @@ impl ReadCache {
                 .is_none_or(|p| p.file != file || p.block != block)
             {
                 let mut bytes = slot.take().map_or_else(Vec::new, |p| p.bytes);
-                bytes.clear();
-                envelope.visit(begin..end, |part| {
-                    bytes.extend_from_slice(part);
-                    Ok(())
-                })?;
+                envelope.read_block(block, &mut bytes)?;
                 *slot = Some(Page { file, block, bytes });
             }
             let stop = r.end.min(end);

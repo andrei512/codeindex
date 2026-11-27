@@ -1,41 +1,17 @@
 //! Prioritized Thompson automaton shared by content regex and byte-oriented path glob queries.
+mod captures;
 mod glob;
 mod parse;
-mod captures;
+pub(crate) use captures::{CaptureScratch, CaptureSpan};
 mod sets;
 mod unicode;
+pub(crate) use glob::BasenameGlob;
 pub use glob::Glob;
 use std::ops::Range;
-pub(crate) use unicode::letter_mark_or_number;
+pub(crate) use unicode::{letter_mark_or_number, punctuation_or_symbol};
 
-#[derive(Clone, Debug)]
-enum Member {
-    Range(char, char),
-    Word(bool),
-    Digit(bool),
-    Space(bool),
-    Set(sets::Set),
-}
-#[derive(Clone, Debug)]
-struct Class {
-    members: std::sync::Arc<[Member]>,
-    negated: bool,
-    fold: bool,
-}
-impl Class {
-    fn accepts(&self, ch: char) -> bool {
-        let inside = |ch| {
-            self.members.iter().any(|m| match m {
-                Member::Set(set) => set.contains(ch),
-                Member::Range(a, b) => (*a..=*b).contains(&ch),
-                Member::Word(yes) => unicode::word(ch) == *yes,
-                Member::Digit(yes) => unicode::decimal(ch) == *yes,
-                Member::Space(yes) => unicode::space(ch) == *yes,
-            })
-        };
-        (inside(ch) || self.fold && unicode::folded(ch).iter().copied().any(inside)) != self.negated
-    }
-}
+mod class;
+use class::{Class, Member};
 #[derive(Clone, Copy, Debug)]
 enum Boundary {
     Either(bool),
@@ -45,98 +21,295 @@ enum Boundary {
     EndHalf,
 }
 #[derive(Clone, Copy, Debug)]
+enum Anchor {
+    Text,
+    Line,
+    Crlf,
+}
+
+impl Anchor {
+    fn line_pair(crlf: bool) -> (Assertion, Assertion) {
+        let line = if crlf { Self::Crlf } else { Self::Line };
+        (Assertion::Start(line), Assertion::End(line))
+    }
+
+    /// The empty edge is the beginning or end of the input. Neither side of
+    /// a line can begin or end between the two bytes of a CRLF terminator.
+    fn accepts(self, edge: Option<char>, between_crlf: bool) -> bool {
+        match self {
+            Self::Text => edge.is_none(),
+            Self::Line => matches!(edge, None | Some('\n')),
+            Self::Crlf => !between_crlf && matches!(edge, None | Some('\r' | '\n')),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum Assertion {
-    Start(bool),
-    End(bool),
-    StartCrlf,
-    EndCrlf,
+    Start(Anchor),
+    End(Anchor),
     Word(Boundary, bool),
 }
 impl Assertion {
     fn accepts(self, prev: Option<char>, next: Option<char>) -> bool {
+        let between_crlf = (prev, next) == (Some('\r'), Some('\n'));
         match self {
-            Self::Start(lines) => prev.is_none() || lines && prev == Some('\n'),
-            Self::End(lines) => next.is_none() || lines && next == Some('\n'),
-            Self::StartCrlf => {
-                prev.is_none() || prev == Some('\n') || prev == Some('\r') && next != Some('\n')
-            }
-            Self::EndCrlf => {
-                next.is_none() || next == Some('\r') || next == Some('\n') && prev != Some('\r')
-            }
-            Self::Word(kind, ascii) => {
-                let word = |c: char| {
-                    if ascii {
-                        c.is_ascii_alphanumeric() || c == '_'
-                    } else {
-                        unicode::word(c)
-                    }
-                };
-                let (a, b) = (prev.is_some_and(word), next.is_some_and(word));
-                match kind {
-                    Boundary::Either(yes) => (a != b) == yes,
-                    Boundary::Start => !a && b,
-                    Boundary::End => a && !b,
-                    Boundary::StartHalf => !a,
-                    Boundary::EndHalf => !b,
-                }
-            }
+            Self::Start(anchor) => anchor.accepts(prev, between_crlf),
+            Self::End(anchor) => anchor.accepts(next, between_crlf),
+            Self::Word(kind, ascii) => kind.accepts(prev, next, ascii),
         }
+    }
+}
+/// Adjacent invalid bytes delimit valid UTF-8 runs. They occupy input but cannot
+/// satisfy a Unicode scalar predicate or certify a Unicode non-word boundary.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ChunkEdges {
+    pub left_invalid: bool,
+    pub right_invalid: bool,
+}
+
+impl ChunkEdges {
+    fn at(self, prev: Option<char>, next: Option<char>) -> Self {
+        Self {
+            left_invalid: self.left_invalid && prev.is_none(),
+            right_invalid: self.right_invalid && next.is_none(),
+        }
+    }
+
+    fn permits(self, assertion: Assertion) -> bool {
+        match assertion {
+            Assertion::Word(Boundary::Either(false), false) => {
+                !(self.left_invalid || self.right_invalid)
+            }
+            Assertion::Word(Boundary::StartHalf, false) => !self.left_invalid,
+            Assertion::Word(Boundary::EndHalf, false) => !self.right_invalid,
+            _ => true,
+        }
+    }
+}
+
+impl Boundary {
+    fn accepts(self, prev: Option<char>, next: Option<char>, ascii: bool) -> bool {
+        // Bits cover neither, right only, left only, and both in that order.
+        let table = match self {
+            Self::Either(true) => 0b0110,
+            Self::Either(false) => 0b1001,
+            Self::Start => 0b0010,
+            Self::End => 0b0100,
+            Self::StartHalf => 0b0011,
+            Self::EndHalf => 0b0101,
+        };
+        let left = prev.is_some_and(|c| unicode::word(c, ascii));
+        let right = next.is_some_and(|c| unicode::word(c, ascii));
+        let index = 2 * u8::from(left) + u8::from(right);
+        table & (1 << index) != 0
     }
 }
 #[derive(Debug)]
 enum Expr {
-    Capture(usize,Box<Expr>),
-    Empty,
+    Capture(Option<usize>, Box<Expr>),
+    Scalar(char),
     Class(Class),
     Assert(Assertion),
     Sequence(Vec<Expr>),
     Alternatives(Vec<Expr>),
-    Repeat {
-        body: Box<Expr>,
-        min: usize,
-        max: Option<usize>,
-        greedy: bool,
-    },
+    Repeat(Repetition),
 }
-// A required case-sensitive literal can discard files before NFA verification.
-// Only concatenate adjacent singleton classes. Unknown constructs break runs.
-fn required_literal(expr: &Expr, best: &mut String) {
-    let keep = |run: &str, best: &mut String| {
-        if run.len() > best.len() {
-            best.clear();
-            best.push_str(run);
-        }
-    };
-    match expr {
-        Expr::Sequence(items) => {
-            let mut run = String::new();
-            for item in items {
-                if let Expr::Class(c) = item
-                    && !c.negated
-                    && !c.fold
-                    && let [Member::Range(a, b)] = c.members.as_ref()
-                    && a == b
-                {
-                    run.push(*a);
-                } else {
-                    keep(&run, best);
-                    run.clear();
-                    required_literal(item, best);
-                }
+
+#[derive(Debug)]
+struct Repetition {
+    body: Box<Expr>,
+    min: usize,
+    max: Option<usize>,
+    greedy: bool,
+}
+// Bare literals in an alternation can form a character class. A capture
+// preserves the boundary between that class and a compound branch.
+enum LinePolicy {
+    Literal(char),
+    Compound { newline: bool },
+}
+
+impl LinePolicy {
+    fn prohibits_lf(self) -> bool {
+        matches!(self, Self::Literal('\n') | Self::Compound { newline: true })
+    }
+
+    fn alternatives(items: &[Expr]) -> bool {
+        let mut lf = false;
+        let mut other = false;
+        let mut compound = false;
+        for item in items {
+            match item.line_policy() {
+                Self::Literal('\n') => lf = true,
+                Self::Literal(_) => other = true,
+                Self::Compound { newline: true } => return true,
+                Self::Compound { newline: false } => compound = true,
             }
-            keep(&run, best);
         }
-        Expr::Repeat { body, min, .. } if *min > 0 => required_literal(body, best),
-        _ => {}
+        lf && (compound || !other)
+    }
+}
+
+impl Expr {
+    fn empty() -> Self {
+        Self::Sequence(Vec::new())
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Sequence(items) if items.is_empty())
+    }
+
+    fn line_policy(&self) -> LinePolicy {
+        if let Some(c) = self.singleton_class() {
+            return LinePolicy::Literal(c);
+        }
+        let newline = match self {
+            Self::Capture(_, body) => body.line_policy().prohibits_lf(),
+            Self::Sequence(items) => items.iter().any(|item| item.line_policy().prohibits_lf()),
+            Self::Alternatives(items) => LinePolicy::alternatives(items),
+            Self::Repeat(repeat) => {
+                repeat.max != Some(0) && repeat.body.line_policy().prohibits_lf()
+            }
+            _ => false,
+        };
+        LinePolicy::Compound { newline }
+    }
+
+    fn singleton_class(&self) -> Option<char> {
+        match self {
+            Self::Class(class) => class.singleton(),
+            Self::Scalar(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    fn capture_body(&self) -> &Self {
+        let mut expr = self;
+        while let Self::Capture(_, body) = expr { expr = body; }
+        expr
+    }
+
+}
+
+#[derive(Default)]
+struct RequiredLiteral<'a> {
+    items: &'a [Expr],
+    bytes: usize,
+}
+
+impl<'a> RequiredLiteral<'a> {
+    fn keep(&mut self, items: &'a [Expr], bytes: usize) {
+        if bytes > self.bytes {
+            self.items = items;
+            self.bytes = bytes;
+        }
+    }
+
+    fn visit(&mut self, items: &'a [Expr]) {
+        let mut start = 0;
+        let mut bytes = 0;
+        for (i, item) in items.iter().enumerate() {
+            let body = item.capture_body();
+            if let Some(c) = body.singleton_class() {
+                bytes += c.len_utf8();
+                continue;
+            }
+            self.keep(&items[start..i], bytes);
+            self.visit_required_children(body);
+            start = i + 1;
+            bytes = 0;
+        }
+        self.keep(&items[start..], bytes);
+    }
+
+    fn visit_required_children(&mut self, body: &'a Expr) {
+        match body {
+            Expr::Sequence(parts) => self.visit(parts),
+            Expr::Repeat(repeat) if repeat.min > 0 => self.visit(std::slice::from_ref(repeat.body.as_ref())),
+            _ => {}
+        }
+    }
+
+    fn text(expr: &'a Expr) -> String {
+        let mut best = Self::default();
+        best.visit(std::slice::from_ref(expr));
+        let mut text = String::with_capacity(best.bytes);
+        text.extend(best.items.iter().filter_map(|expr| expr.capture_body().singleton_class()));
+        text
     }
 }
 #[derive(Debug)]
 enum Inst {
-    Save(usize,usize),
+    Save(usize, usize),
     Accept,
     Consume(Class, usize),
     Assert(Assertion, usize),
     Fork(usize, usize),
+}
+
+/// One transition at an input boundary. Register and thread storage belong to each runner.
+enum Transition {
+    Accept,
+    Save(usize, usize),
+    Fork(usize, usize),
+    Follow(usize),
+    Consume(usize),
+    Dead,
+}
+
+impl Transition {
+    #[inline]
+    fn admit(self, valid: bool) -> Self {
+        if valid { self } else { Self::Dead }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InputBoundary {
+    prev: Option<char>,
+    next: Option<char>,
+    edges: ChunkEdges,
+    can_consume: bool,
+}
+
+impl InputBoundary {
+    fn search(prev: Option<char>, next: Option<char>, edges: ChunkEdges) -> Self {
+        let edges = edges.at(prev, next);
+        // Invalid bytes occupy a non-word, non-line position but cannot be consumed.
+        Self {
+            prev: prev.or(edges.left_invalid.then_some('!')),
+            next: next.or(edges.right_invalid.then_some('!')),
+            edges,
+            can_consume: !edges.right_invalid,
+        }
+    }
+
+    fn replay(prev: Option<char>, next: Option<char>, edges: ChunkEdges, can_consume: bool) -> Self {
+        Self { prev, next, edges, can_consume }
+    }
+}
+
+impl Inst {
+    #[inline]
+    fn transition(&self, input: InputBoundary) -> Transition {
+        self.transition_when(
+            |assertion| input.edges.permits(assertion) && assertion.accepts(input.prev, input.next),
+            |class| input.can_consume && input.next.is_some_and(|c| class.accepts(c)),
+        )
+    }
+
+    #[inline]
+    fn transition_when(&self, assertion_holds: impl FnOnce(Assertion) -> bool,
+                       matches_class: impl FnOnce(&Class) -> bool) -> Transition {
+        match self {
+            Self::Accept => Transition::Accept,
+            Self::Save(slot, next) => Transition::Save(*slot, *next),
+            Self::Fork(first, alternative) => Transition::Fork(*first, *alternative),
+            Self::Assert(assertion, next) => Transition::Follow(*next).admit(assertion_holds(*assertion)),
+            Self::Consume(class, next) => Transition::Consume(*next).admit(matches_class(class)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +317,7 @@ enum Starts {
     Anywhere,
     Absolute,
     Line,
+    LiteralAscii(u8),
     // Non-ASCII bytes always fall back to the Unicode VM.
     Ascii([bool; 128]),
 }
@@ -156,8 +330,55 @@ pub struct Regex {
     required: String,
     starts: Starts,
 }
-pub(crate) fn word_char(c: char) -> bool { unicode::word(c) }
+#[derive(Clone, Copy)]
+pub(crate) enum EmptyPosition {
+    InsideScalar,
+    AfterCarriageReturn { followed_by_lf: bool },
+}
+
+impl EmptyPosition {
+    fn accepts(self, assertion: Assertion) -> bool {
+        match self {
+            Self::InsideScalar => matches!(assertion, Assertion::Word(kind, true)
+                if kind.accepts(Some('!'), Some('!'), true)),
+            Self::AfterCarriageReturn { followed_by_lf } =>
+                assertion.accepts(Some('\r'), followed_by_lf.then_some('\n')),
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchScope {
+    #[default]
+    Anywhere,
+    Word,
+    Line,
+}
+
+impl MatchScope {
+    fn anchors(self, ascii: bool, crlf: bool) -> Option<(Assertion, Assertion)> {
+        match self {
+            Self::Anywhere => None,
+            Self::Word => Some((
+                Assertion::Word(Boundary::StartHalf, ascii),
+                Assertion::Word(Boundary::EndHalf, ascii),
+            )),
+            Self::Line => Some(Anchor::line_pair(crlf)),
+        }
+    }
+}
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CompileOptions {
+    pub fold: bool,
+    pub capture: bool,
+    pub exclude_newline: bool,
+    pub scope: MatchScope,
+    pub ascii: bool,
+    pub crlf: bool,
+}
+
 impl Regex {
+    pub(crate) const MAX_INSTRUCTIONS: usize = 65_536;
     pub(crate) fn instruction_bytes(&self) -> usize {
         std::mem::size_of_val(self.program.as_slice())
     }
@@ -165,242 +386,298 @@ impl Regex {
         Self::with_case_folding(pattern, false)
     }
     pub(crate) fn with_case_folding(pattern: &str, fold: bool) -> Result<Self, String> {
-        Self::compile(parse::parse(pattern, fold)?)
+        Self::parse_pattern(
+            pattern,
+            CompileOptions {
+                fold,
+                ..Default::default()
+            },
+            None,
+        )
     }
-    pub(crate) fn folded_literal(text: &str) -> Result<Self, String> {
+    pub(crate) fn literal(text: &str, options: CompileOptions) -> Result<Self, String> {
         if text.len() > 128 * 1024 {
             return Err("pattern too long".into());
         }
-        let chars = text.chars().map(|c| Expr::Class(Class {
-            members: [Member::Range(c, c)].into(),
-            negated: false,
-            fold: true,
-        })).collect();
-        Self::compile(Expr::Sequence(chars))
-    }
-    fn compile(expr: Expr) -> Result<Self, String> {
-        let mut program = vec![Inst::Accept];
-        let start = emit(&expr, 0, &mut program)?;
-        let mut required = String::new();
-        required_literal(&expr, &mut required);
-        let starts = match &program[start] {
-            Inst::Assert(Assertion::Start(false), _) => Starts::Absolute,
-            Inst::Assert(Assertion::Start(true), _) => Starts::Line,
-            Inst::Consume(class, _) => {
-                Starts::Ascii(std::array::from_fn(|i| class.accepts(i as u8 as char)))
-            }
-            _ => Starts::Anywhere,
-        };
-        Ok(Self {
-            starts,
-            start,
-            program,
-            required,
-            names: Vec::new(),
+        Self::compile(options, Vec::new(), false, |builder, exit| {
+            Ok((builder.fixed(text, options.fold, exit)?, String::new()))
         })
     }
-    pub(crate) fn byte_input(pattern:&str,fold:bool,groups:bool)->Result<Self,String> {
-        let(expr,names)=parse::parse_groups(pattern,fold,groups,true)?;
-        let mut re=Self::compile(expr)?;re.names=names;Ok(re)
+
+    fn compile(
+        options: CompileOptions,
+        names: Vec<Option<String>>,
+        byte_input: bool,
+        emit: impl FnOnce(&mut ProgramBuilder, usize) -> Result<(usize, String), String>,
+    ) -> Result<Self, String> {
+        let mut builder = ProgramBuilder { instructions: vec![Inst::Accept], byte_input };
+        let (start, required) = match options.scope.anchors(options.ascii, options.crlf) {
+            None => emit(&mut builder, 0)?,
+            Some((left, right)) => {
+                let exit = builder.push(Inst::Assert(right, 0))?;
+                let (entry, required) = emit(&mut builder, exit)?;
+                (builder.push(Inst::Assert(left, entry))?, required)
+            }
+        };
+        let program = builder.instructions;
+        let starts = Starts::for_program(&program, start);
+        Ok(Self { starts, start, program, required, names })
     }
-    pub(crate) fn capturing(pattern:&str,fold:bool)->Result<Self,String>{
-        let (expr,names)=parse::parse_groups(pattern,fold,true,false)?;
-        let mut re=Self::compile(expr)?;
-        re.names=names;
-        Ok(re)
+    // Indexed regex and glob queries consume the literal as a candidate filter.
+    pub(crate) fn parse_pattern(
+        pattern: &str,
+        options: CompileOptions,
+        detect_byte_input: Option<&mut bool>,
+    ) -> Result<Self, String> {
+        Self::compile_pattern(pattern, options, detect_byte_input, true)
     }
-    pub(crate) fn capture_id(&self,name:&str)->Option<usize>{
-        name.parse().ok().or_else(||self.names.iter().position(|v|v.as_deref()==Some(name)).map(|i|i+1))
+
+    // Line matching uses the literal only for the record-separator diagnostic.
+    pub(crate) fn for_lines(
+        pattern: &str,
+        options: CompileOptions,
+        byte_input: &mut bool,
+    ) -> Result<Self, String> {
+        Self::compile_pattern(pattern, options, Some(byte_input), options.exclude_newline)
     }
-    pub(crate) fn groups(&self,text:&str,range:Range<usize>)->Option<Vec<Option<Range<usize>>>>{
-        captures::groups(self,text,range)
+
+    fn compile_pattern(
+        pattern: &str,
+        options: CompileOptions,
+        mut detect_byte_input: Option<&mut bool>,
+        need_literal: bool,
+    ) -> Result<Self, String> {
+        let (expr, names) =
+            parse::parse_groups(pattern, &options, detect_byte_input.as_deref_mut())?;
+        Self::compile(
+            options,
+            names,
+            detect_byte_input.is_some_and(|flag| *flag),
+            |builder, exit| {
+                let entry = builder.emit(&expr, exit)?;
+                let required = if need_literal {
+                    RequiredLiteral::text(&expr)
+                } else {
+                    String::new()
+                };
+                Ok((entry, required))
+            },
+        )
+    }
+
+    pub(crate) const LITERAL_NEWLINE_ERROR: &'static str = "the literal \"\\n\" is not allowed in a regex\n\nConsider enabling multiline mode with the --multiline flag (or -U for short).\nWhen multiline mode is enabled, new line characters can be matched.";
+    pub(crate) fn capture_id(&self, name: &str) -> Option<usize> {
+        name.parse().ok().or_else(|| {
+            self.names
+                .iter()
+                .position(|v| v.as_deref() == Some(name))
+                .map(|i| i + 1)
+        })
+    }
+    /// A record-local matcher can inspect surrounding word characters but
+    /// cannot consume the separator or distinguish file anchors from line anchors.
+    pub(crate) fn needs_full_text(&self, separator: char) -> bool {
+        self.program.iter().any(|instruction| match instruction {
+            Inst::Consume(class, _) => class.accepts(separator),
+            Inst::Assert(Assertion::Word(..), _) => false,
+            Inst::Assert(..) => true,
+            _ => false,
+        })
     }
     pub fn required_literal(&self) -> &str {
         &self.required
     }
     pub fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
-        let mut scratch = Scratch::new(self.program.len());
-        let mut cursor = 0;
-        let mut last = None;
+        self.matches_using(
+            text,
+            Scratch::new(self.program.len()),
+            ChunkEdges::default(),
+        )
+    }
+
+    pub(crate) fn matches_with<'a>(
+        &'a self,
+        text: &'a str,
+        scratch: &'a mut Scratch,
+    ) -> impl Iterator<Item = Range<usize>> + 'a {
+        scratch.prepare(self.program.len());
+        self.matches_using(text, scratch, ChunkEdges::default())
+    }
+
+    pub(crate) fn matches_in_chunk<'a>(
+        &'a self,
+        text: &'a str,
+        scratch: &'a mut Scratch,
+        left_invalid: bool,
+        right_invalid: bool,
+    ) -> impl Iterator<Item = Range<usize>> + 'a {
+        scratch.prepare(self.program.len());
+        self.matches_using(
+            text,
+            scratch,
+            ChunkEdges {
+                left_invalid,
+                right_invalid,
+            },
+        )
+    }
+
+    fn matches_using<'a>(
+        &'a self,
+        text: &'a str,
+        mut scratch: impl std::borrow::BorrowMut<Scratch> + 'a,
+        edges: ChunkEdges,
+    ) -> impl Iterator<Item = Range<usize>> + 'a {
+        let mut cursor = MatchCursor::new(0);
         std::iter::from_fn(move || {
-            loop {
-                if cursor > text.len() {
-                    return None;
-                }
-                let hit = scratch.find(self, text, cursor, false)?;
-                let duplicate = hit.is_empty() && last == Some(hit.end);
-                cursor = if hit.is_empty() {
-                    hit.end + text[hit.end..].chars().next().map_or(1, char::len_utf8)
-                } else {
-                    hit.end
-                };
-                last = Some(hit.end);
-                if !duplicate {
+            while cursor.offset <= text.len() {
+                let hit = scratch.borrow_mut().find_with_edges::<false>(self, text, cursor.offset, edges)?;
+                if cursor.consume(text, hit.start, hit.end) {
                     return Some(hit);
                 }
             }
+            None
         })
     }
 }
-fn push(p: &mut Vec<Inst>, inst: Inst) -> Result<usize, String> {
-    if p.len() >= 65_536 {
-        return Err("compiled pattern exceeds instruction limit".into());
-    }
-    let i = p.len();
-    p.push(inst);
-    Ok(i)
+/// Both regex engines advance empty matches by one scalar and suppress
+/// an empty match immediately following a match at the same position.
+pub(crate) struct MatchCursor {
+    pub(crate) offset: usize,
+    previous_end: Option<usize>,
 }
-fn emit(e: &Expr, next: usize, p: &mut Vec<Inst>) -> Result<usize, String> {
-    match e {
-        Expr::Capture(i,body)=> { let end=push(p,Inst::Save(i*2+1,next))?; let start=emit(body,end,p)?; push(p,Inst::Save(i*2,start)) },
-        Expr::Empty => Ok(next),
-        Expr::Class(c) => push(p, Inst::Consume(c.clone(), next)),
-        Expr::Assert(a) => push(p, Inst::Assert(*a, next)),
-        Expr::Sequence(items) => items
-            .iter()
-            .rev()
-            .try_fold(next, |n, item| emit(item, n, p)),
-        Expr::Alternatives(items) => {
-            let mut items = items.iter().rev();
-            let mut start = emit(items.next().unwrap(), next, p)?;
-            for item in items {
-                let alt = emit(item, next, p)?;
-                start = push(p, Inst::Fork(alt, start))?
-            }
-            Ok(start)
+
+impl MatchCursor {
+    pub(crate) fn new(offset: usize) -> Self {
+        Self { offset, previous_end: None }
+    }
+
+    pub(crate) fn consume(&mut self, text: &str, start: usize, end: usize) -> bool {
+        let previous = self.previous_end.replace(end);
+        self.offset = end;
+        if start != end {
+            return true;
         }
-        Expr::Repeat {
-            body,
-            min,
-            max,
-            greedy,
-        } => {
-            let fork = |a, b| {
-                if *greedy {
-                    Inst::Fork(a, b)
-                } else {
-                    Inst::Fork(b, a)
-                }
+        self.offset += text[end..].chars().next().map_or(1, char::len_utf8);
+        previous != Some(end)
+    }
+}
+
+struct ProgramBuilder {
+    instructions: Vec<Inst>,
+    byte_input: bool,
+}
+
+impl ProgramBuilder {
+    fn push(&mut self, instruction: Inst) -> Result<usize, String> {
+        let pc = self.instructions.len();
+        if pc >= Regex::MAX_INSTRUCTIONS {
+            return Err("compiled pattern exceeds instruction limit".into());
+        }
+        self.instructions.push(instruction);
+        Ok(pc)
+    }
+
+    /// Prepend a fixed string to its continuation in matching order.
+    fn fixed(&mut self, text: &str, fold: bool, mut next: usize) -> Result<usize, String> {
+        for c in text.chars().rev() {
+            let class = Class::Range {
+                start: c,
+                end: c,
+                fold,
             };
-            let mut start = next;
-            let mut required = *min;
-            if let Some(max) = max {
-                for _ in *min..*max {
-                    let e = emit(body, start, p)?;
-                    start = push(p, fork(e, start))?
-                }
-            } else {
-                let split = push(p, Inst::Accept)?;
-                let e = emit(body, split, p)?;
-                p[split] = fork(e, next);
-                if required == 0 {
-                    // Enter through a distinct choice. When the body can match empty,
-                    // reaching the loop fork must still honor its higher-priority exit.
-                    start = push(p, fork(e, next))?;
-                } else {
-                    start = e;
-                    required -= 1;
-                }
-            }
-            for _ in 0..required {
-                start = emit(body, start, p)?
-            }
-            Ok(start)
+            next = self.push(Inst::Consume(class, next))?;
+        }
+        Ok(next)
+    }
+
+    fn literal(&mut self, c: char, next: usize) -> Result<usize, String> {
+        let class = Class::Range { start: c, end: c, fold: false };
+        self.push(Inst::Consume(class, next))
+    }
+
+    fn scalar(&mut self, c: char, next: usize) -> Result<usize, String> {
+        if !self.byte_input {
+            return self.literal(c, next);
+        }
+        c.encode_utf8(&mut [0; 4]).bytes().rev()
+            .try_fold(next, |next, byte| self.literal(char::from(byte), next))
+    }
+
+    fn emit(&mut self, expr: &Expr, next: usize) -> Result<usize, String> {
+        match expr {
+            Expr::Capture(id, body) => self.capture(*id, body, next),
+            Expr::Scalar(c) => self.scalar(*c, next),
+            Expr::Class(c) => self.push(Inst::Consume(c.clone(), next)),
+            Expr::Assert(a) => self.push(Inst::Assert(*a, next)),
+            Expr::Sequence(items) => self.sequence(items, next),
+            Expr::Alternatives(items) => self.alternatives(items, next),
+            Expr::Repeat(repeat) => repeat.emit(next, self),
         }
     }
-}
-type Thread = (usize, usize); // instruction and leftmost byte start
-struct Scratch {
-    current: Vec<Thread>,
-    next: Vec<Thread>,
-    stack: Vec<Thread>,
-    seen: Vec<usize>,
-}
-impl Scratch {
-    fn new(n: usize) -> Self {
-        Self {
-            current: Vec::new(),
-            next: Vec::new(),
-            stack: Vec::new(),
-            seen: vec![0; n],
-        }
+
+    fn capture(&mut self, id: Option<usize>, body: &Expr, next: usize) -> Result<usize, String> {
+        let Some(id) = id else { return self.emit(body, next) };
+        let end = self.push(Inst::Save(id * 2 + 1, next))?;
+        let start = self.emit(body, end)?;
+        self.push(Inst::Save(id * 2, start))
     }
-    fn find(&mut self, re: &Regex, text: &str, from: usize, bytes: bool) -> Option<Range<usize>> {
-        let mut prev = if bytes {
-            from.checked_sub(1).map(|i| char::from(text.as_bytes()[i]))
+
+    fn sequence(&mut self, items: &[Expr], next: usize) -> Result<usize, String> {
+        items.iter().rev().try_fold(next, |next, item| self.emit(item, next))
+    }
+
+    fn alternatives(&mut self, items: &[Expr], next: usize) -> Result<usize, String> {
+        let mut items = items.iter().rev();
+        let mut start = self.emit(items.next().expect("nonempty alternatives"), next)?;
+        for item in items {
+            let alt = self.emit(item, next)?;
+            start = self.push(Inst::Fork(alt, start))?;
+        }
+        Ok(start)
+    }
+}
+
+impl Repetition {
+    fn fork(&self, body: usize, exit: usize) -> Inst {
+        if self.greedy {
+            Inst::Fork(body, exit)
         } else {
-            text[..from].chars().next_back()
+            Inst::Fork(exit, body)
+        }
+    }
+
+    fn emit(&self, next: usize, program: &mut ProgramBuilder) -> Result<usize, String> {
+        let (mut start, required) = match self.max {
+            Some(max) => {
+                let exit = (self.min..max).try_fold(next, |exit, _| {
+                    let body = program.emit(&self.body, exit)?;
+                    program.push(self.fork(body, exit))
+                })?;
+                (exit, self.min)
+            }
+            None => self.loop_entry(next, program)?,
         };
-        let mut pos = from;
-        let mut best = None;
-        self.current.clear();
-        self.next.clear();
-        self.seen.fill(0);
-        loop {
-            // Seek only while no earlier match is still competing for priority.
-            if self.current.is_empty() && best.is_none() {
-                let tail = &text.as_bytes()[pos..];
-                match &re.starts {
-                    Starts::Absolute if pos != 0 => return None,
-                    Starts::Line if pos != 0 && prev != Some('\n') => {
-                        pos += tail.iter().position(|&byte| byte == b'\n')? + 1;
-                        prev = Some('\n');
-                    }
-                    Starts::Ascii(allowed) => {
-                        let skip = tail
-                            .iter()
-                            .position(|&byte| !byte.is_ascii() || allowed[byte as usize])?;
-                        if skip != 0 {
-                            pos += skip;
-                            prev = Some(char::from(text.as_bytes()[pos - 1]));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let ch = if bytes {
-                text.as_bytes().get(pos).copied().map(char::from)
-            } else {
-                text[pos..].chars().next()
-            };
-            if best.is_none() {
-                self.stack.push((re.start, pos))
-            }
-            // Epsilon closure visits each instruction once per input offset. Earlier
-            // threads win on a shared state, preserving leftmost-first alternation.
-            self.stack.extend(self.current.drain(..).rev());
-            while let Some((pc, start)) = self.stack.pop() {
-                if self.seen[pc] == pos + 1 {
-                    continue;
-                }
-                self.seen[pc] = pos + 1;
-                match &re.program[pc] {
-                    Inst::Accept => {
-                        best = Some(start..pos);
-                        self.stack.clear();
-                        break;
-                    }
-                    Inst::Save(_,next) => self.stack.push((*next,start)),
-                    Inst::Fork(a, b) => {
-                        self.stack.push((*b, start));
-                        self.stack.push((*a, start))
-                    }
-                    Inst::Assert(a, n) if a.accepts(prev, ch) => self.stack.push((*n, start)),
-                    Inst::Consume(c, n) if ch.is_some_and(|v| c.accepts(v)) => {
-                        self.next.push((*n, start))
-                    }
-                    _ => {}
-                }
-            }
-            if ch.is_none() || best.is_some() && self.next.is_empty() {
-                return best;
-            }
-            prev = ch;
-            pos += if bytes { 1 } else { ch.unwrap().len_utf8() };
-            std::mem::swap(&mut self.current, &mut self.next);
+        for _ in 0..required {
+            start = program.emit(&self.body, start)?;
+        }
+        Ok(start)
+    }
+
+    /// Execution returns from the body to the ordered fork. A zero minimum
+    /// also needs a distinct entry fork so an empty body preserves priority.
+    fn loop_entry(&self, exit: usize, program: &mut ProgramBuilder) -> Result<(usize, usize), String> {
+        let repeat = program.push(Inst::Accept)?;
+        let body = program.emit(&self.body, repeat)?;
+        program.instructions[repeat] = self.fork(body, exit);
+        match self.min.checked_sub(1) {
+            Some(rest) => Ok((body, rest)),
+            None => Ok((program.push(self.fork(body, exit))?, 0)),
         }
     }
 }
+mod vm;
+pub(crate) use vm::{EpsilonClosure, Scratch};
 
 #[cfg(test)]
 mod tests {
@@ -408,6 +685,25 @@ mod tests {
     fn spans(pattern: &str, input: &str) -> Vec<Range<usize>> {
         Regex::new(pattern).unwrap().matches(input).collect()
     }
+    #[test]
+    fn capture_syntax_preserves_record_validation_and_required_literals() {
+        for capture in [false, true] {
+            let parse = |pattern| Regex::parse_pattern(
+                pattern, CompileOptions { capture, exclude_newline: true, ..Default::default() }, None
+            );
+            assert!(parse(r"(a)|(\n)").is_err());
+            assert!(parse(r"a|[\n]").is_ok());
+            assert!(parse(r"(?i:\n|0)").is_ok());
+            assert_eq!(parse("(?i:漢123)").unwrap().required_literal(), "漢123");
+            assert!(parse(r"(?i:\n|k)").is_err());
+            assert_eq!(parse("(needle)+").unwrap().required_literal(), "needle");
+            assert_eq!(parse("(needle)?").unwrap().required_literal(), "");
+            assert_eq!(parse("(界)+").unwrap().required_literal(), "界");
+            assert_eq!(parse("([a])?").unwrap().required_literal(), "");
+            assert_eq!(parse("(?i:É)+").unwrap().required_literal(), "");
+        }
+    }
+
     #[test]
     fn archived_queries() {
         let text = "café\nfunction() other CAFÉ";

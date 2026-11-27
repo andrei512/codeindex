@@ -2,7 +2,6 @@
 //! by key range, retaining file-shard order within every posting list.
 use super::{
     bulk::{BulkRank, PackedTerm, varint},
-    directory,
 };
 use std::io::{self, Write};
 
@@ -140,24 +139,16 @@ impl ShardSet {
             pos += part.bytes.len() as u64;
         }
         let mut footer = Vec::new();
-        directory::write(
-            &[
-                directory::Node::from_offsets(&files),
-                directory::Node::from_offsets(&terms),
-            ],
-            &mut footer,
-        )?;
-        footer.extend_from_slice(b"RANKDIR4");
-        for n in [
-            file_count as u64,
-            term_count as u64,
-            pos,
+        super::cursor::Directory {
+            format: super::storage::Format::Tree,
+            files: file_count,
+            terms: term_count,
+            offset: pos,
             rows_end,
-            tokens as u64,
-            row_count as u64,
-        ] {
-            footer.extend_from_slice(&n.to_le_bytes());
+            tokens,
+            rows: row_count,
         }
+        .write_tree(&mut footer, &files, &terms)?;
         out.write_all(&footer)?;
         out.flush()
     }

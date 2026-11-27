@@ -22,6 +22,20 @@ fn run(first: usize, files: &[Unit<'_>]) -> io::Result<(ContentBuilder, ContentB
     Ok((paths, bodies))
 }
 
+fn shard(first: usize, units: &[Unit<'_>]) -> io::Result<(ContentBuilder, Run)> {
+    let mut paths = ContentBuilder::default();
+    let mut bodies = Run::new();
+    for (i, unit) in units.iter().enumerate() {
+        let id = first + i;
+        paths.add(Document {
+            file: FileId(id as u64),
+            text: unit.path,
+        })?;
+        bodies.add(id as u32, unit.text);
+    }
+    Ok((paths, bodies))
+}
+
 pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, Postings)> {
     let bytes: usize = units.iter().map(|u| u.text.len() + u.path.len()).sum();
     let workers = std::thread::available_parallelism()
@@ -41,19 +55,7 @@ pub(super) fn build(units: &[Unit<'_>]) -> io::Result<(ContentBuilder, Postings)
             if size >= target || i + 1 == units.len() {
                 let first = start;
                 let slice = &units[first..=i];
-                jobs.push(scope.spawn(move || -> io::Result<_> {
-                    let mut paths = ContentBuilder::default();
-                    let mut bodies = Run::new();
-                    for (i, unit) in slice.iter().enumerate() {
-                        let id = first + i;
-                        paths.add(Document {
-                            file: FileId(id as u64),
-                            text: unit.path,
-                        })?;
-                        bodies.add(id as u32, unit.text);
-                    }
-                    Ok((paths, bodies))
-                }));
+                jobs.push(scope.spawn(move || shard(first, slice)));
                 start = i + 1;
                 size = 0;
             }

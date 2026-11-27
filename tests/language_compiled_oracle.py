@@ -11,6 +11,7 @@ No checkout is built or executed. An invalid translation unit is unverified.
 """
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -20,44 +21,13 @@ import subprocess
 import sys
 import tempfile
 
-from language_reverse_witness import reverse_witness
+from language_clang_bindings import collect
+from language_reverse_witness import ReverseProbe, reverse_witness
 from clang import cindex
-from language_conformance import ROOT, checkout, check, compare, git
+from language_conformance import ROOT, checkout, QuerySession, expectation, ExpectedLocations, git, symbol_error
 
 
-# Profiles and units chosen before querying cx. Consecutive files are holdouts.
-PROJECTS = {
-    "log": ("https://github.com/rxi/log.c", "f9ea34994bd58ed342d2245cd4110bb5c6790153",
-            ["src/log.c"], []),
-    "nanopb": ("https://github.com/nanopb/nanopb", "2de40e37c89e5bef88f92639e309860f0239ac26",
-               ["pb_common.c", "pb_encode.c", "pb_decode.c"], []),
-    "robin": ("https://github.com/martinus/robin-hood-hashing", "7697343363af4cc3f42cab17be49e6af9ab181e2",
-              ["src/test/app/fmt/mup.cpp", "src/test/app/fmt/streamstate.cpp", "src/test/app/benchmark.cpp"],
-              ["src/test", "src/include"]),
-    "cjson": ("https://github.com/DaveGamble/cJSON.git", "acc76239bee01d8e9c858ae2cab296704e52d916",
-              ["cJSON.c", "cJSON_Utils.c"], []),
-    "kostya": ("https://github.com/kostya/benchmarks.git", "5bc68b3705fddd0fdb16b8748c4f2c73e1032a43",
-               ["primes/primes.cpp", "brainfuck/bf.cpp"], ["common/libnotify"]),
-    "sds": ("https://github.com/antirez/sds.git", "5347739b1581fcba74fd5cab1fc21d2aef317d71",
-            ["sds.c"], []),
-    "zlib": ("https://github.com/madler/zlib.git", "51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf",
-             ["adler32.c", "trees.c", "inftrees.c", "zutil.c"], []),
-    "fmt": ("https://github.com/fmtlib/fmt.git", "40626af88bd7df9a5fb80be7b25ac85b122d6c21",
-            ["src/os.cc"], ["include"]),
-    "tinyexpr": ("https://github.com/codeplea/tinyexpr.git", "ba2e32bbcc2d1e644a7e132d24c2f542821cabe0",
-                 ["tinyexpr.c", "smoke.c"], []),
-    "inih": ("https://github.com/benhoyt/inih.git", "5cc5e2c24642513aaa5b19126aad42d0e4e0923e",
-             ["ini.c", "cpp/INIReader.cpp"], ["cpp"]),
-    "linenoise": ("https://github.com/antirez/linenoise.git", "a473823d74b93eab2ba83480df16ed37617493f2",
-                  ["linenoise.c"], []),
-    "hashmap": ("https://github.com/tidwall/hashmap.c.git", "ad4dfbc9e13ba3beb8863b9cbd511f0f7e517723",
-                ["hashmap.c"], []),
-    "lodepng": ("https://github.com/lvandeve/lodepng.git", "7b2893e35891c0c85bee5595caafaf3c2044b409",
-                ["lodepng.cpp"], []),
-
-    "double-conversion": ("https://github.com/google/double-conversion.git", "ae0dbfeb9744efd216c95b30555049d75d47116a",
-                          ["double-conversion/bignum.cc", "double-conversion/cached-powers.cc", "double-conversion/fast-dtoa.cc"], []),
-}
+from language_compiled_projects import PROJECTS
 
 
 def run(*args, **kwargs):
@@ -82,115 +52,146 @@ def compiler(lang):
     return args
 
 
-def source_sites(unit, location, source, path):
-    """Accept a token only when its spelling matches literal bytes at Clang's offset."""
-    name = unit.spelling
-    if not (location.file and Path(str(location.file)) == path and re.fullmatch(r"[A-Za-z_]\w*", name)):
-        return None
-    offset = location.offset
-    if source[offset:offset + len(name)] != name.encode():
-        return None
-    end = offset + len(name)
-    if re.match(rb"\w", source[end:end + 1]):
-        return None
-    start = source.rfind(b"\n", 0, offset) + 1
-    col = len(source[start:offset].decode().encode("utf-16-le")) // 2 + 1
-    return f"{location.line}:{col}"
-
-
-def collect(path, flags):
-    tu = cindex.Index.create().parse(str(path), args=flags)
-    errors = [str(d) for d in tu.diagnostics if d.severity >= cindex.Diagnostic.Error]
-    if errors:
-        raise RuntimeError("\n".join(errors))
-    k = cindex.CursorKind
-    routines = {k.FUNCTION_DECL, k.CXX_METHOD}
-    source = path.read_bytes()
-    defs, calls = set(), set()
-    stack = list(reversed(list(tu.cursor.get_children())))
-    while stack:
-        node = stack.pop()
-        if not node.location.file or Path(str(node.location.file)) != path:
-            continue
-        children = list(node.get_children())
-        stack.extend(reversed(children))
-        if node.kind in routines and node.is_definition():
-            target = source_sites(node, node.location, source, path)
-            if target:
-                defs.add((node.spelling, target))
-        if node.kind != k.CALL_EXPR or not children:
-            continue
-        # Only descend through the callee expression, never call arguments.
-        target = node.referenced
-        if not target or target.kind not in routines:
-            continue
-        definition = target.get_definition()
-        if not definition or target.location != definition.location:
-            continue
-        decl = source_sites(definition, definition.location, source, path)
-        if not decl:
-            continue
-        for expr in children[0].walk_preorder():
-            if expr.kind not in (k.DECL_REF_EXPR, k.MEMBER_REF_EXPR) or expr.referenced != target:
-                continue
-            site = source_sites(expr, expr.location, source, path)
-            if site:
-                calls.add((expr.spelling, site, decl))
-    return sorted(defs), sorted(calls)
-
-
 def sample(rows, cap=24):
     if len(rows) <= cap:
         return rows
     return [rows[i * (len(rows) - 1) // (cap - 1)] for i in range(cap)]
 
 
-def symbol_probe(binary, repo, home, name, expected, cache):
-    if name not in cache:
-        result = subprocess.run([binary, "--symbol", name, "--json"], cwd=repo, capture_output=True,
-                                text=True, timeout=120, env={**os.environ, "HOME": str(home),
-                                "GIT_CONFIG_GLOBAL": "./.missing-config", "GIT_CONFIG_NOSYSTEM": "1"})
-        if result.returncode not in (0, 1):
-            raise RuntimeError(result.stderr)
-        cache[name] = json.loads(result.stdout)
-    answer = cache[name]
-    diff = compare(answer, "symbol", expected, "", True)
-    if diff and answer.get("truncated"):
-        return {}, "missing from truncated output"
-    return diff, None
+class CertifiedUnit:
+    """Original compiler locations and direct bindings for a specific file and flags."""
+    def __init__(self, path, flags):
+        self.path = path
+        self.flags = tuple(flags)
+        self.sites = collect(path, self.flags)
+
+    def unchanged(self, extra_flags):
+        return collect(self.path, [*self.flags, *extra_flags]) == self.sites
 
 
-def replay_control(repo, path, flags, defs, calls, rows, binary, home, control):
+    def probes(self, binary, repo, home, extra_flags):
+        """Create a new observation scope only after rechecking every Clang anchor."""
+        if self.unchanged(extra_flags):
+            return Probes(binary, repo, home)
+
+
+class Probes:
+    def __init__(self, binary, repo, home):
+        self.binary = binary
+        self.repo = repo
+        self.home = home
+        self.symbols = {}
+        self.run_query = QuerySession(binary, repo, home)
+
+    def recertify(self, unit, extra_flags=()):
+        """A control can reuse gold anchors only after Clang confirms their identities."""
+        return unit.probes(self.binary, self.repo, self.home, extra_flags)
+
+    def check(self, row):
+        subject = row["name"] if row["op"] == "symbol" else row["subject"]
+        return self.request(row["op"], subject, row["expected"], "fresh")
+
+    def request(self, op, subject, expected, phase):
+        if op != "symbol":
+            return self.run_query(expectation(op, subject, expected), phase), None
+        if subject not in self.symbols:
+            result = self.run_query.request("symbol", subject)
+            if result.returncode not in (0, 1):
+                raise RuntimeError(result.stderr)
+            self.symbols[subject] = SymbolAnswer(subject, json.loads(result.stdout), result.returncode)
+        return self.symbols[subject].verdict(expected)
+
+
+class SymbolAnswer:
+    """One certified response in one source version, projected as its expectations require."""
+    def __init__(self, name, answer, status):
+        self.answer = answer
+        self.error = symbol_error(answer, name, status)
+        self.locations = {}
+
+    def verdict(self, expected):
+        if self.error:
+            return self.error, None
+        query = ExpectedLocations.parse(expected)
+        projection = query.with_column, query.with_label
+        if projection not in self.locations:
+            self.locations[projection] = query.observe(self.answer["hits"], "symbol")
+        diff = query.difference_from(self.locations[projection], subset=True)
+        if diff and self.answer["truncated"]:
+            return {}, "missing from truncated output"
+        return diff, None
+
+
+def symbol_verdict(name, expected, answer, status):
+    return SymbolAnswer(name, answer, status).verdict(expected)
+
+
+@contextmanager
+def source_change(path, content):
+    """Apply an intervention for this probe and restore its exact previous bytes."""
+    before = path.read_bytes() if path.exists() else None
+    try:
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+        yield
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(before)
+
+
+def replay_control(probes, unit, rows, control):
     """Compare an isolated source change after Clang confirms all measured sites agree."""
+    path = unit.path
     before = path.read_text()
     if control == "digit_separators":
         after, count = re.subn(r"(?<=\d)'(?=\d)", "", before)
     else:
-        defines = run("clang++", *flags, "-dM", "-E", str(path)).stdout
+        defines = run("clang++", *unit.flags, "-dM", "-E", str(path)).stdout
         known = set(re.findall(r"^#define (LODEPNG_COMPILE_\w+)\b", defines, re.M))
         def replacement(m):
             enabled = (m[2] in known) == (m[1] == "ifdef")
             return "#if " + str(int(enabled))
         after, count = re.subn(r"^[ \t]*#[ \t]*(ifdef|ifndef)[ \t]+(LODEPNG_COMPILE_\w+)\b",
                                replacement, before, flags=re.M)
-    original_refs = set(calls)
-    path.write_text(after)
-    after_defs, after_calls = collect(path, flags)
-    if set(defs) != set(after_defs) or original_refs != set(after_calls):
-        return {"unverified": "Clang declaration or binding locations changed"}
-    cache = {}
-    restored = []
-    unresolved = []
+    if after == before:
+        return {"unverified": "control changed no source"}
+    with source_change(path, after):
+        corrected = probes.recertify(unit)
+        if corrected is None:
+            return {"unverified": "Clang declaration or binding locations changed"}
+        return control_results(corrected, rows, count)
+
+
+def query_key(row):
+    return row["op"], row["subject"], row["expected"]
+
+
+def query_rows(unit, rows):
+    seen = set()
     for row in rows:
-        if not row["diff"] or row["excluded"]:
-            continue
-        if row["op"] == "symbol":
-            diff, excluded = symbol_probe(binary, repo, home, row["name"], row["expected"], cache)
+        key = query_key(row)
+        if key in seen:
+            raise ValueError(f"duplicate compiler oracle query in {unit}: {key}")
+        seen.add(key)
+        yield key, row
+
+
+def control_results(probes, rows, count):
+    restored, unresolved, restored_queries = [], [], []
+    residuals = ((key, row) for key, row in query_rows("intervention", rows) if row["diff"] and not row["excluded"])
+    for key, row in residuals:
+        diff, excluded = probes.check(row)
+        if diff or excluded:
+            unresolved.append(row["subject"])
         else:
-            diff = check(binary, repo, home, "definition", row["subject"], row["expected"], "resolved", False, "fresh")
-            excluded = False
-        (unresolved if diff or excluded else restored).append(row["subject"])
-    return {"changed_tokens_or_guards": count, "recovered": restored, "remaining": unresolved}
+            restored.append(row["subject"])
+            restored_queries.append(key)
+    return {"changed_tokens_or_guards": count, "recovered": restored, "remaining": unresolved,
+            "recovered_queries": restored_queries}
 
 
 def write_compile_commands(repo, commands):
@@ -201,67 +202,94 @@ def write_compile_commands(repo, commands):
     git("add", "--force", "--intent-to-add", "--", path.name, cwd=repo)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", choices=PROJECTS, action="append")
-    parser.add_argument("--report", type=Path, default=ROOT / "target/language-compiled-oracle.json")
-    args = parser.parse_args()
+def check_unit(probes, filename, flags, pin):
+    url, commit = pin
+    binary, repo, home = probes.binary, probes.repo, probes.home
+    path = repo / filename
+    entry = {"url": url, "commit": commit, "rows": []}
+    try:
+        entry["arguments"] = [v.replace(str(repo), "<checkout>") for v in flags]
+        unit = CertifiedUnit(path, flags)
+        defs, calls = unit.sites
+    except (RuntimeError, cindex.TranslationUnitLoadError) as error:
+        entry["unverified"] = str(error)
+        print(filename, "unverified", error, flush=True)
+        return entry
+    entry["eligible"] = {"symbol": len(defs), "definition": len(calls)}
+    queries = [("symbol", n, n, f"{filename}:{loc}") for n, loc in sample(defs)]
+    queries += [("definition", n, f"{filename}:{site}", f"{filename}:{decl}")
+                for n, site, decl in sample(calls)]
+    for op, name, subject, expected in queries:
+        row = dict(op=op, name=name, subject=subject, expected=expected)
+        row["diff"], row["excluded"] = probes.check(row)
+        entry["rows"].append(row)
+    entry["reverse"] = reverse_witness(ReverseProbe(binary, repo, home), filename, calls, entry["rows"])
+    control = {"lodepng.cpp": "compile_guards", "primes/primes.cpp": "digit_separators"}.get(filename)
+    if control:
+        # The intervention needs its own symbol answers for the changed source.
+        entry[control] = replay_control(probes, unit, entry["rows"], control)
+    print(filename, entry["eligible"], Counter(r["op"] for r in entry["rows"] if r["diff"]), flush=True)
+    return entry
+
+
+def configure_clang():
     if sys.platform == "darwin":
         # Match the host SDK headers with the Apple frontend, retaining pinned bindings.
         tool = Path(run("xcrun", "--find", "clang").stdout.strip())
         cindex.Config.set_library_file(str(tool.parent.parent / "lib/libclang.dylib"))
+
+
+def compile_command(repo, filename, flags):
+    driver = "clang" if filename.endswith(".c") else "clang++"
+    return {"directory": str(repo), "file": filename, "arguments": [driver, *flags, "-c", filename]}
+
+
+def configure_units(project, repo, files, includes):
+    flags_by_file = {}
+    commands = []
+    for filename in files:
+        lang = "c" if filename.endswith(".c") else "c++"
+        flags = compiler(lang) + (["-std=c++20"] if project == "kostya" else []) + ["-I" + str(repo / d) for d in includes]
+        flags_by_file[filename] = flags
+        commands.append(compile_command(repo, filename, flags))
+    # Supply exactly the compiler context used for the oracle to cx as well.
+    write_compile_commands(repo, commands)
+    return flags_by_file
+
+
+def check_project(project, binary):
+    url, commit, files, includes = PROJECTS[project]
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, home = Path(tmp) / "repo", Path(tmp) / "home"
+        repo.mkdir()
+        home.mkdir()
+        checkout({"url": url, "commit": commit}, repo, ROOT / "target/conformance-cache")
+        flags_by_file = configure_units(project, repo, files, includes)
+        probes = Probes(binary, repo, home)
+        for filename in files:
+            yield f"{project}/{filename}", check_unit(probes, filename, flags_by_file[filename], (url, commit))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", choices=PROJECTS, action="append")
+    parser.add_argument("--report", type=Path, default=ROOT / "target/language-compiled-oracle.json")
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/cx")
+    args = parser.parse_args()
+    binary = args.binary.resolve(strict=True)
+    configure_clang()
     results = {}
-    binary = ROOT / "target/release/cx"
     for project in args.project or PROJECTS:
-        url, commit, files, includes = PROJECTS[project]
-        with tempfile.TemporaryDirectory() as tmp:
-            repo, home = Path(tmp) / "repo", Path(tmp) / "home"
-            repo.mkdir()
-            home.mkdir()
-            checkout({"url": url, "commit": commit}, repo, ROOT / "target/conformance-cache")
-            flags_by_file = {}
-            commands = []
-            for filename in files:
-                lang = "c" if filename.endswith(".c") else "c++"
-                flags = compiler(lang) + (["-std=c++20"] if project == "kostya" else []) + ["-I" + str(repo / d) for d in includes]
-                flags_by_file[filename] = flags
-                commands.append({"directory": str(repo), "file": filename, "arguments":
-                                 ["clang" if lang == "c" else "clang++", *flags, "-c", filename]})
-            # Supply exactly the compiler context used for the oracle to cx as well.
-            write_compile_commands(repo, commands)
-            symbol_cache = {}
-            for filename in files:
-                path = repo / filename
-                entry = results[f"{project}/{filename}"] = {"url": url, "commit": commit, "rows": []}
-                try:
-                    entry["arguments"] = [v.replace(str(repo), "<checkout>") for v in flags_by_file[filename]]
-                    defs, calls = collect(path, flags_by_file[filename])
-                except (RuntimeError, cindex.TranslationUnitLoadError) as error:
-                    entry["unverified"] = str(error)
-                    print(filename, "unverified", error, flush=True)
-                    continue
-                entry["eligible"] = {"symbol": len(defs), "definition": len(calls)}
-                queries = [("symbol", n, n, f"{filename}:{loc}") for n, loc in sample(defs)]
-                queries += [("definition", n, f"{filename}:{site}", f"{filename}:{decl}")
-                            for n, site, decl in sample(calls)]
-                for op, name, subject, expected in queries:
-                    excluded = None
-                    if op == "symbol":
-                        diff, excluded = symbol_probe(binary, repo, home, name, expected, symbol_cache)
-                    else:
-                        diff = check(binary, repo, home, op, subject, expected, "resolved", False, "fresh")
-                    entry["rows"].append(dict(op=op, name=name, subject=subject, expected=expected, diff=diff, excluded=excluded))
-                entry["reverse"] = reverse_witness(binary, repo, home, filename, calls, entry["rows"])
-                control = {"lodepng.cpp": "compile_guards", "primes/primes.cpp": "digit_separators"}.get(filename)
-                if control:
-                    entry[control] = replay_control(repo, path, flags_by_file[filename], defs, calls,
-                                                    entry["rows"], binary, home, control)
-                print(filename, entry["eligible"], Counter(r["op"] for r in entry["rows"] if r["diff"]), flush=True)
+        results.update(check_project(project, binary))
     args.report.parent.mkdir(exist_ok=True, parents=True)
     args.report.write_text(json.dumps({"driver": run("clang", "--version").stdout.splitlines()[0],
                                       "units": results}, indent=2) + "\n")
-    return int(any(v.get("unverified") or any(r["diff"] for r in v["rows"])
-                   or any(r["wrong"] or r["missing"] for r in v.get("reverse", [])) for v in results.values()))
+    return int(any(unit_failed(unit) for unit in results.values()))
+
+
+def unit_failed(unit):
+    return (unit.get("unverified") or any(row["diff"] for row in unit["rows"])
+            or any(row["wrong"] or row["missing"] for row in unit.get("reverse", [])))
 
 
 if __name__ == "__main__":

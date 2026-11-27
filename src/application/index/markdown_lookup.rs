@@ -1,10 +1,29 @@
 //! Locate a document or a reverse posting list in the pinned Markdown extent.
 use super::{
     binary::bad,
-    offsets::{read_bytes, row, table, text, word},
+    offsets::{read_bytes, row, table, word},
 };
-use crate::domain::{content_lookup::ExtentRead, markdown::Parsed};
+use crate::domain::{content_lookup::ExtentRead, markdown::{Link, Parsed, Section, read_headings, read_selected_links}};
 use std::{io, ops::Range};
+mod postings;
+pub(crate) use postings::BACKLINK_LIMIT;
+
+pub(super) fn document_body(mut data: &[u8]) -> io::Result<Parsed> {
+    let parsed = Parsed::read_from(&mut data)?;
+    if !data.is_empty() {
+        return Err(bad());
+    }
+    Ok(parsed)
+}
+pub(super) fn address(
+    r: &mut impl ExtentRead,
+    record: &mut Range<u64>,
+) -> io::Result<(String, String)> {
+    let path = super::offsets::text(r, &mut record.start, record.end)?;
+    let anchor = super::offsets::text(r, &mut record.start, record.end)?;
+    Ok((path, anchor))
+}
+
 pub struct Lookup {
     docs: Range<u64>,
     destinations: Range<u64>,
@@ -12,11 +31,14 @@ pub struct Lookup {
 }
 impl Lookup {
     pub fn open(mut r: impl ExtentRead) -> io::Result<Self> {
+        Self::read_directory(&mut r)
+    }
+    pub(crate) fn read_directory(r: &mut impl ExtentRead) -> io::Result<Self> {
         let footer = r.length().checked_sub(8).ok_or_else(bad)?;
-        let end = word(&mut r, footer)?;
+        let end = word(r, footer)?;
         let mut at = end;
-        let docs = table(&mut r, &mut at)?;
-        let destinations = table(&mut r, &mut at)?;
+        let docs = table(r, &mut at)?;
+        let destinations = table(r, &mut at)?;
         if at != footer {
             return Err(bad());
         }
@@ -26,25 +48,33 @@ impl Lookup {
             end,
         })
     }
+    fn record<R: ExtentRead>(&self, mut reader: R, id: usize) -> io::Result<Record<R>> {
+        let range = self.document_range(&mut reader, id)?
+            .ok_or_else(|| io::Error::other("not a Markdown document"))?;
+        Ok(Record { reader, remaining: range.start + 8..range.end })
+    }
+
+    pub(crate) fn headings(&self, reader: impl ExtentRead, id: usize) -> io::Result<Vec<Section>> {
+        let (headings, _) = read_headings(self.record(reader, id)?)?;
+        Ok(headings)
+    }
+
+    pub(crate) fn links(&self, reader: impl ExtentRead, id: usize, ordinals: impl Iterator<Item = usize>)
+        -> io::Result<(Vec<Section>, Vec<Link>)> {
+        read_selected_links(self.record(reader, id)?, ordinals)
+    }
+
     pub fn document(&self, mut r: impl ExtentRead, id: usize) -> io::Result<Option<Parsed>> {
         let Some(record) = self.document_range(&mut r, id)? else { return Ok(None) };
         let bytes = read_bytes(&mut r, record.start + 8..record.end)?;
-        let mut data = bytes.as_slice();
-        let doc = Parsed::read_from(&mut data)?;
-        if !data.is_empty() {
-            return Err(bad());
-        }
-        Ok(Some(doc))
+        document_body(&bytes).map(Some)
     }
     pub(crate) fn document_range(&self, r: &mut impl ExtentRead, id: usize) -> io::Result<Option<Range<u64>>> {
         let (mut lo, mut hi) = (0, (self.docs.end - self.docs.start) / 8 - 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let record = row(r, &self.docs, mid, self.end)?;
-            if record.end - record.start < 8 {
-                return Err(bad());
-            }
-            match word(r, record.start)?.cmp(&(id as u64)) {
+            match document_id(r, &record)?.cmp(&(id as u64)) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => return Ok(Some(record)),
@@ -52,68 +82,54 @@ impl Lookup {
         }
         Ok(None)
     }
-    fn key(&self, r: &mut impl ExtentRead, id: u64) -> io::Result<(String, String, Range<u64>)> {
-        let mut record = row(r, &self.destinations, id, self.end)?;
-        let path = text(r, &mut record.start, record.end)?;
-        let anchor = text(r, &mut record.start, record.end)?;
-        let count = word(r, record.start)?;
-        record.start += 8;
-        if count
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(record.start))
-            != Some(record.end)
-        {
-            return Err(bad());
-        }
-        Ok((path, anchor, record))
+
+}
+
+fn document_id(r: &mut impl ExtentRead, record: &Range<u64>) -> io::Result<u64> {
+    if record.end - record.start < 8 {
+        return Err(bad());
     }
-    pub fn backlinks(
-        &self,
-        mut r: impl ExtentRead,
-        path: &str,
-        anchor: Option<&str>,
-    ) -> io::Result<(Vec<(usize, usize)>, bool)> {
-        let count = (self.destinations.end - self.destinations.start) / 8 - 1;
-        let (mut lo, mut hi) = (0, count);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let (p, a, _) = self.key(&mut r, mid)?;
-            if (p.as_str(), a.as_str()) < (path, anchor.unwrap_or("")) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let mut heap = std::collections::BinaryHeap::new();
-        let enqueue = |heap: &mut std::collections::BinaryHeap<_>,
-                       range: Range<u64>,
-                       r: &mut _|
-         -> io::Result<()> {
-            if !range.is_empty() {
-                let f = word(r, range.start)? as usize;
-                let l = word(r, range.start + 8)? as usize;
-                heap.push(std::cmp::Reverse((f, l, range.start + 16, range.end)));
-            }
-            Ok(())
-        };
-        for id in lo..count {
-            let (p, a, range) = self.key(&mut r, id)?;
-            if p != path || anchor.is_some_and(|v| v != a) {
-                break;
-            }
-            enqueue(&mut heap, range, &mut r)?;
-            if anchor.is_some() {
-                break;
-            }
-        }
-        let mut hits = Vec::new();
-        while hits.len() < 50 {
-            let Some(std::cmp::Reverse((f, l, start, end))) = heap.pop() else {
-                break;
-            };
-            hits.push((f, l));
-            enqueue(&mut heap, start..end, &mut r)?;
-        }
-        Ok((hits, !heap.is_empty()))
+    word(r, record.start)
+}
+
+/// Sequential reads from one record share the extent cursor's existing read-ahead.
+struct Record<R> {
+    reader: R,
+    remaining: Range<u64>,
+}
+
+impl<R: ExtentRead> io::Read for Record<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = (self.remaining.end - self.remaining.start).min(buf.len() as u64) as usize;
+        self.reader.read(self.remaining.start, &mut buf[..n])?;
+        self.remaining.start += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn document_and_address_decoders_respect_the_record_boundary() {
+        let doc = Parsed::parse("doc.md", "# Title\n[Next](other.md)\n");
+        let mut wire = Vec::new();
+        doc.write_to(&mut wire).unwrap();
+        assert!(document_body(&wire).is_ok());
+        assert!(document_body(&wire[..wire.len() - 1]).is_err());
+        wire.push(0);
+        assert!(document_body(&wire).is_err());
+        let mut bytes = Vec::new();
+        super::super::binary::string(&mut bytes, "other.md").unwrap();
+        super::super::binary::string(&mut bytes, "anchor").unwrap();
+        let end = bytes.len() as u64;
+        let mut reader = io::Cursor::new(bytes);
+        let mut range = 0..end;
+        assert_eq!(
+            address(&mut reader, &mut range).unwrap(),
+            ("other.md".into(), "anchor".into())
+        );
+        assert_eq!(range.start, end);
+        assert!(address(&mut reader, &mut (0..end - 1)).is_err());
     }
 }

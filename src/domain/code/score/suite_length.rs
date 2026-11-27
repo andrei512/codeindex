@@ -1,132 +1,188 @@
 //! Divide an existing length finding between the registered cases and their owning unit.
-use super::{Finding, Language, Rule, Score, scan};
-use crate::domain::code::{analyze, lexer, roles, script};
+use super::owners::{Opening, OwnerCursor};
+use super::{Finding, Language, Rule, Score};
+use crate::domain::code::roles;
 
-pub(crate) fn candidate(path: &str, score: &Score) -> Option<Language> {
-    let lang = Language::for_path(path)?;
-    if !matches!(
-        lang,
-        Language::Dart | Language::Powershell | Language::Ruby | Language::Sql | Language::PlPgSql
-    ) {
-        return None;
+pub(super) fn supported(lang: Language, test_path: impl FnOnce() -> bool) -> bool {
+    match lang {
+        Language::Ruby | Language::Powershell => test_path(),
+        Language::Dart | Language::Sql | Language::PlPgSql => true,
+        _ => false,
     }
-    if matches!(lang, Language::Ruby | Language::Powershell) && !roles::on_test_path(path, lang) {
-        return None;
-    }
-    score
+}
+
+pub(super) fn adjust(
+    role: &roles::RolePath,
+    score: &Score,
+    syntax: &super::TestSyntax<'_, '_>,
+) -> Option<Score> {
+    let (lang, text) = (syntax.lang, syntax.text);
+    let mut lengths = score
         .findings
         .iter()
-        .any(|f| {
-            f.rule == Rule::Length
-                && (f.unit == "<file>" || lang == Language::Dart && f.unit == "main")
-        })
-        .then_some(lang)
-}
-
-#[derive(Default)]
-struct Lines {
-    last: usize,
-    count: usize,
-}
-impl Lines {
-    fn add(&mut self, line: usize) {
-        if self.last != line {
-            self.count += 1;
-            self.last = line;
-        }
-    }
-}
-
-pub(crate) fn adjust(lang: Language, path: &str, text: &str, score: &Score) -> Option<Score> {
-    let tokens = lexer::tokens(text, lang);
-    let pairs = script::paired_for_score(&tokens);
-    let cases = roles::suite_regions(lang, path, text, &tokens, &pairs);
+        .filter(|finding| eligible(lang, finding));
+    let first = lengths.next()?;
+    let input = syntax.paired();
+    let tokens = input.tokens;
+    let cases = role.suite_regions(text, input, &syntax.ruby_blocks);
     if cases.is_empty() || cases.windows(2).any(|w| w[0].end > w[1].start) {
         return None;
     }
-    let facts = analyze(lang, text);
-    let units = scan::regions(lang, text, &tokens, &pairs, &facts);
-    let units = units.iter().peekable();
-    let mut stack = Vec::new();
-    let mut output = Vec::new();
-    let mut changed = false;
-    // Only the synthetic file unit or Dart's top-level suite entry can own this warning.
-    for finding in &score.findings {
-        if finding.rule != Rule::Length
-            || !(finding.unit == "<file>" || lang == Language::Dart && finding.unit == "main")
+    let mut measured = vec![Budget::new(first, cases.len())];
+    for finding in lengths {
+        let owner = (finding.unit.as_str(), finding.line);
+        if measured.iter().all(|b| b.owner != owner) {
+            measured.push(Budget::new(finding, cases.len()));
+        }
+    }
+    count_lines(&mut measured, syntax, tokens, &cases);
+    emit_findings(syntax, score, &cases, &measured)
+}
+
+fn count_lines(
+    measured: &mut [Budget<'_>],
+    syntax: &super::TestSyntax<'_, '_>,
+    tokens: &[super::Token<'_>],
+    cases: &[roles::Region],
+) {
+    let keys: Vec<_> = measured.iter().map(|budget| budget.owner).collect();
+    let owner_position = |owner| keys.iter().position(|&key| key == owner);
+    let file_owner = owner_position(("<file>", 1));
+    let mut openings = syntax
+        .regions()
+        .iter()
+        .map(|r| Opening {
+            start: r.start,
+            end: r.end,
+            owner: owner_position((r.name, tokens[r.start].line)),
+        })
+        .peekable();
+    let mut owners = OwnerCursor::new(tokens.len(), file_owner);
+    let mut cursor = 0;
+    while let Some((owner, run)) = owners.next_run(&mut openings, |_| {}) {
+        let Some(owner) = *owner else { continue };
+        for token in &tokens[run] {
+            measured[owner].count(token, cases, &mut cursor);
+        }
+    }
+}
+
+fn emit_findings(
+    syntax: &super::TestSyntax,
+    score: &Score,
+    cases: &[roles::Region],
+    measured: &[Budget<'_>],
+) -> Option<Score> {
+    // Copy unchanged findings only after confirming the native line count.
+    let mut findings = Vec::new();
+    let mut copied = 0;
+    let apportioned = score
+        .findings
+        .iter()
+        .enumerate()
+        .filter(|(_, finding)| eligible(syntax.lang, finding))
+        .filter_map(|(i, finding)| {
+            let budget = measured.iter().find(|budget| budget.apportions(finding))?;
+            Some((i, finding, budget))
+        });
+    for (i, f, budget) in apportioned {
+        findings.extend_from_slice(&score.findings[copied..i]);
+        budget.emit(f, cases, syntax.text, &mut findings);
+        copied = i + 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    findings.extend_from_slice(&score.findings[copied..]);
+    Some(Score {
+        lines: score.lines,
+        findings,
+    })
+}
+
+fn eligible(lang: Language, finding: &Finding) -> bool {
+    finding.rule == Rule::Length
+        && (finding.unit == "<file>" || lang == Language::Dart && finding.unit == "main")
+}
+
+struct Budget<'a> {
+    owner: (&'a str, usize),
+    last: usize,
+    total: usize,
+    residual: usize,
+    cases: Vec<usize>,
+}
+
+impl<'a> Budget<'a> {
+    fn new(finding: &'a Finding, cases: usize) -> Self {
+        Self {
+            owner: (&finding.unit, finding.line),
+            cases: vec![0; cases],
+            last: 0,
+            total: 0,
+            residual: 0,
+        }
+    }
+
+    fn apportions(&self, finding: &Finding) -> bool {
+        self.owner == (finding.unit.as_str(), finding.line)
+            && self.total == finding.value
+            && self.residual < self.total
+    }
+
+    fn count(&mut self, token: &super::Token, cases: &[roles::Region], cursor: &mut usize) {
+        // A line shared by adjacent registrations counts once for this owner.
+        if self.last == token.line {
+            return;
+        }
+        self.last = token.line;
+        self.total += 1;
+        while *cursor < cases.len() && cases[*cursor].end <= token.span.start {
+            if token.text == ";" && token.span.start == cases[*cursor].end {
+                break;
+            }
+            *cursor += 1;
+        }
+        if cases
+            .get(*cursor)
+            .is_some_and(|r| r.start <= token.span.start)
         {
-            output.push(finding.clone());
-            continue;
+            self.cases[*cursor] += 1;
+        } else {
+            self.residual += 1;
         }
-        let mut case_lines: Vec<Lines> = cases.iter().map(|_| Lines::default()).collect();
-        let mut total = Lines::default();
-        let mut residual = Lines::default();
-        let mut cursor = 0;
-        let mut iter = units.clone();
-        stack.clear();
-        for (i, t) in tokens.iter().enumerate() {
-            while stack.last().is_some_and(|u: &&scan::Region| u.end <= i) {
-                stack.pop();
-            }
-            while iter.peek().is_some_and(|u| u.start == i) {
-                stack.push(iter.next().unwrap());
-            }
-            let (name, start) = stack
-                .last()
-                .map_or(("<file>", 1), |u| (u.name, tokens[u.start].line));
-            if name != finding.unit || start != finding.line {
-                continue;
-            }
-            // Preserve the baseline line budget if two regions share a line.
-            if total.last == t.line {
-                continue;
-            }
-            total.add(t.line);
-            while cursor < cases.len() && cases[cursor].end <= t.span.start {
-                // A registration's trailing semicolon belongs to the call.
-                if t.text == ";" && t.span.start == cases[cursor].end {
-                    break;
-                }
-                cursor += 1;
-            }
-            if cases.get(cursor).is_some_and(|r| r.start <= t.span.start) {
-                case_lines[cursor].add(t.line);
-            } else {
-                residual.add(t.line);
-            }
-        }
-        // If the snapshot used a different language-specific tokenization, preserve its measurement.
-        if total.count != finding.value || case_lines.iter().all(|u| u.count == 0) {
-            output.push(finding.clone());
-            continue;
-        }
-        changed = true;
-        if residual.count >= Rule::Length.threshold() {
-            output.push(Finding {
-                value: residual.count,
-                ..finding.clone()
+    }
+
+    fn emit(
+        &self,
+        original: &Finding,
+        regions: &[roles::Region],
+        text: &str,
+        out: &mut Vec<Finding>,
+    ) {
+        let threshold = Rule::Length.threshold();
+        if self.residual >= threshold {
+            out.push(Finding {
+                value: self.residual,
+                ..original.clone()
             });
         }
-        for (region, part) in cases.iter().zip(case_lines) {
-            if part.count >= Rule::Length.threshold() {
-                let line = text[region.start..region.end]
+        for (region, &value) in regions.iter().zip(&self.cases) {
+            if value >= threshold {
+                let label = text[region.start..region.end]
                     .lines()
                     .next()
                     .unwrap_or("")
                     .trim();
-                output.push(Finding {
+                out.push(Finding {
                     rule: Rule::Length,
                     line: region.first,
-                    unit: line.chars().take(100).collect(),
-                    value: part.count,
+                    unit: label.chars().take(100).collect(),
+                    value,
                 });
             }
         }
     }
-    changed.then_some(Score {
-        lines: score.lines,
-        findings: output,
-    })
 }
 
 #[cfg(test)]
@@ -135,10 +191,13 @@ mod tests {
 
     fn find_lengths(path: &str, source: &str) -> (Vec<Finding>, Vec<Finding>) {
         let lang = Language::for_path(path).unwrap();
-        let original = crate::domain::code::scored(lang, source, path, None)
-            .1
-            .unwrap();
-        let adjusted = adjust(lang, path, source, &original);
+        let (facts, original) = crate::domain::code::scored(lang, source, path, None);
+        let original = original.unwrap();
+        let adjusted = adjust(
+            &roles::RolePath::new(path, lang),
+            &original,
+            &super::super::TestSyntax::new(lang, source, Some(&facts), super::super::Input::Source),
+        );
         let lengths = |s: &Score| {
             s.findings
                 .iter()

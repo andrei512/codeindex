@@ -10,6 +10,7 @@ import re
 import tempfile
 
 from language_conformance import ROOT, run_case
+from language_fixture_positions import advance
 
 
 # Path, language preamble, declaration that must be searchable by its written name.
@@ -36,23 +37,35 @@ class Fixture:
         (folder / "repo").mkdir()
 
     def write(self, path, annotated):
-        source = ""
-        start = 0
+        parts = []
+        line, col, start = 1, 1, 0
         for mark in re.finditer(r"«(\w+)\|([^»]+)»", annotated):
-            source += annotated[start:mark.start()]
-            line = 1 + source.count("\n")
-            col = 1 + len(source.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2
-            self.sites[mark[1]] = f"{path}:{line}:{col}"
-            source += mark[2]
+            prefix = annotated[start:mark.start()]
+            parts.append(prefix)
+            line, col = advance(line, col, prefix)
+            label, spelling = mark.groups()
+            if label in self.sites:
+                raise ValueError(f"duplicate fixture label {label} in {path}")
+            self.sites[label] = f"{path}:{line}:{col}"
+            parts.append(spelling)
+            line, col = advance(line, col, spelling)
             start = mark.end()
+        parts.extend((annotated[start:], "\n"))
+        source = "".join(parts)
+        if "«" in source or "»" in source:
+            raise ValueError(f"malformed fixture label in {path}")
         target = self.folder / "repo" / path
         target.parent.mkdir(exist_ok=True, parents=True)
-        target.write_text(source + annotated[start:] + "\n")
+        target.write_text(source)
 
     def check(self, op, subject, *labels, status=None):
         value = subject if op == "symbol" else self.sites[subject]
         expected = ",".join(self.sites[label] for label in labels) or "-"
         self.checks.append("\t".join([op, value, expected] + ([status] if status else [])))
+
+    def callers(self, target, *labels, caller):
+        expected = ",".join(f"{self.sites[label]}|{caller}" for label in labels)
+        self.checks.append("\t".join(["callers", self.sites[target], expected]))
 
     def ready(self):
         (self.folder / "checks.tsv").write_text("\n".join(self.checks) + "\n")
@@ -115,7 +128,7 @@ def same_line_uses(profile, f):
     f.check("definition", "two", "decl")
     f.check("references", "decl", "one", "two")
     if profile != "proto":
-        f.check("callers", "decl", "one", "two")
+        f.callers("decl", "one", "two", caller="runIt" if profile == "kotlin" else "run")
 
 
 def string_boundary(profile, f):
@@ -164,7 +177,7 @@ def isolated_edges(profile, f):
         f.check("definition", owner + "Use", owner + "Def")
         f.check("references", owner + "Def", owner + "Use")
         if profile != "proto":
-            f.check("callers", owner + "Def", owner + "Use")
+            f.callers(owner + "Def", owner + "Use", caller={"kotlin": "runIt", "csharp": "Run"}.get(profile, "run"))
     if profile == "rust":
         f.write("lib.rs", "mod first; mod second;")
 
@@ -191,7 +204,7 @@ def noncall_use(profile, f):
         f.check("callers", "decl", status="unsupported")
         f.check("references", "decl", "value")
     else:
-        f.check("callers", "decl", "invoked")
+        f.callers("decl", "invoked", caller={"kotlin": "runIt", "csharp": "Run"}.get(profile, "run"))
         f.check("definition", "invoked", "decl")
         # Profiles primarily promise direct call resolution. Keep this different
         # product question visible without changing the required caller result.
@@ -247,24 +260,27 @@ WAVES = {
 }
 
 
+def run_wave(binary, wave, profile):
+    with tempfile.TemporaryDirectory() as tmp:
+        case = Fixture(Path(tmp))
+        WAVES[wave](profile, case)
+        case.ready()
+        records = run_case(case.folder, binary, ROOT / "target/conformance-cache")
+    for row in records:
+        if row["diff"] and row["phase"] == "fresh":
+            print(wave, profile, row["op"], row["subject"], row["diff"])
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wave", choices=WAVES, action="append")
     parser.add_argument("--report", type=Path, default=ROOT / "target/language-compiled-sweeps.json")
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/cx")
     args = parser.parse_args()
-    results = {}
-    for wave in args.wave or WAVES:
-        for profile in PROFILES:
-            with tempfile.TemporaryDirectory() as tmp:
-                case = Fixture(Path(tmp))
-                WAVES[wave](profile, case)
-                case.ready()
-                rows = run_case(case.folder, args.binary.resolve(), ROOT / "target/conformance-cache")
-                results[f"{wave}/{profile}"] = rows
-            for row in rows:
-                if row["diff"] and row["phase"] == "fresh":
-                    print(wave, profile, row["op"], row["subject"], row["diff"])
+    binary = args.binary.resolve()
+    results = {f"{wave}/{profile}": run_wave(binary, wave, profile)
+               for wave in args.wave or WAVES for profile in PROFILES}
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(results, indent=2) + "\n")
     fails = sum(bool(row["diff"]) and not row["probe"] for rows in results.values() for row in rows)

@@ -32,12 +32,12 @@ def run_profile(binary, profile):
             path.write_bytes((contents + "\n").encode())
             return path
 
-        def verify(wave, step, paths, name=NAME, expected_line=line):
+        def verify(wave, step, paths, name=NAME):
             proc = subprocess.run([binary, "--symbol", name, "--json"], cwd=repo, text=True,
                                   capture_output=True, timeout=90, env={
                                       **os.environ, "HOME": str(home), "GIT_CONFIG_GLOBAL": "./.missing-config",
                                       "GIT_CONFIG_NOSYSTEM": "1"})
-            want = [(str(p.relative_to(repo)), expected_line, col, name) for p in sorted(paths)]
+            want = [(str(p.relative_to(repo)), line, col, name) for p in sorted(paths)]
             try:
                 answer = json.loads(proc.stdout)
                 got = [(r["path"], r["line"], r["col"], r["name"]) for r in answer["hits"]]

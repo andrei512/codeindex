@@ -3,6 +3,7 @@
 use super::*;
 use std::ops::Range;
 
+#[derive(Clone)]
 pub(super) enum Predicate {
     Atom(String, String),
     All(Vec<Predicate>),
@@ -15,7 +16,7 @@ pub(super) struct Condition {
     predicate: Predicate,
 }
 #[derive(Clone, Copy)]
-struct Target {
+pub(super) struct Target {
     os: &'static str,
     arch: &'static str,
     family: &'static str,
@@ -29,138 +30,287 @@ impl Target {
         }
     }
     fn triple(v: &str) -> Option<Self> {
-        let triple: Vec<_> = v.split('-').collect();
-        let os = match triple.as_slice() {
-            [_, "apple", "darwin"] => "macos",
-            [_, "linux", "android" | "androideabi"]
-            | [_, _, "linux", "android" | "androideabi"] => "android",
-            [_, _, "linux", _] => "linux",
-            [_, _, "windows", _] => "windows",
-            [_, _, "freebsd"] => "freebsd",
+        let mut parts = v.split('-');
+        let cpu = parts.next()?;
+        let os = match (parts.next()?, parts.next()?, parts.next(), parts.next()) {
+            ("apple", "darwin", None, None) => "macos",
+            ("linux", "android" | "androideabi", None, None)
+            | (_, "linux", Some("android" | "androideabi"), None) => "android",
+            (_, "linux", Some(_), None) => "linux",
+            (_, "windows", Some(_), None) => "windows",
+            (_, "freebsd", None, None) => "freebsd",
             _ => return None,
         };
-        let arch = match v.split('-').next()? {
-            "aarch64" => "aarch64",
-            "x86_64" => "x86_64",
-            "i686" | "i586" => "x86",
-            _ => "",
-        };
+        const ARCHITECTURES: &[(&str, &str)] = &[
+            ("aarch64", "aarch64"),
+            ("x86_64", "x86_64"),
+            ("i686", "x86"),
+            ("i586", "x86"),
+        ];
+        let arch = ARCHITECTURES.iter()
+            .find_map(|(spelling, arch)| (*spelling == cpu).then_some(*arch))
+            .unwrap_or("");
         Some(Self {
             os,
             arch,
             family: if os == "windows" { "windows" } else { "unix" },
         })
     }
+    fn matches(target: Option<Self>, key: &str, value: &str) -> Option<bool> {
+        match key {
+            "true" => Some(true),
+            "false" => Some(false),
+            "unix" | "windows" => Some(target?.family == key),
+            "target_family" => Some(target?.family == value),
+            "target_os" => Some(target?.os == value),
+            "target_arch" => {
+                let arch = target?.arch;
+                (!arch.is_empty()).then_some(arch == value)
+            }
+            _ => None,
+        }
+    }
     fn config(s: &str) -> Option<Option<Self>> {
         let mut build = false;
-        for l in s.lines() {
-            let l = l.split('#').next()?.trim();
-            if l.starts_with('[') {
-                build = l == "[build]";
-                continue;
-            }
-            let Some((key, val)) = l.split_once('=') else {
-                continue;
-            };
-            if build && key.trim() == "target" {
-                let text = val.trim().trim_matches(&['\'', '"'][..]);
-                return Some(Self::triple(text));
+        for raw in super::cargo::manifest_lines(s) {
+            match super::cargo::ManifestLine::parse(raw) {
+                super::cargo::ManifestLine::Section(section) => build = section == "[build]",
+                super::cargo::ManifestLine::Entry("target", value) if build => {
+                    let text = value.trim().trim_matches(&['\'', '"'][..]);
+                    return Some(Self::triple(text));
+                }
+                _ => {}
             }
         }
         None
     }
 }
 impl Predicate {
-    fn eval(&self, target: Option<Target>) -> Option<bool> {
+    // cfg_attr(g, cfg(p)) imposes the implication g -> p.
+    fn guarded_by(self, guards: &[Predicate]) -> Self {
+        if guards.is_empty() {
+            return self;
+        }
+        Predicate::Any(vec![
+            Predicate::Not(Box::new(Predicate::All(guards.to_vec()))),
+            self,
+        ])
+    }
+    pub(super) fn eval(&self, target: Option<Target>) -> Option<bool> {
         match self {
             Self::Unknown => None,
-            Self::Atom(k, v) => match k.as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                "unix" | "windows" => Some(target?.family == k),
-                "target_family" => Some(target?.family == v),
-                "target_os" => Some(target?.os == v),
-                "target_arch" if !target?.arch.is_empty() => Some(target?.arch == v),
-                _ => None,
-            },
+            Self::Atom(key, value) => Target::matches(target, key, value),
             Self::Not(x) => Some(!x.eval(target)?),
             Self::All(xs) | Self::Any(xs) => {
                 let all = matches!(self, Self::All(_));
-                let mut known = true;
-                for x in xs {
-                    match x.eval(target) {
-                        Some(v) if v != all => return Some(v),
-                        None => known = false,
-                        _ => {}
-                    }
-                }
-                known.then_some(all)
+                Self::combine(xs, target, all)
             }
         }
     }
-}
-fn parse(t: &[Token], i: &mut usize, end: usize, depth: usize) -> Predicate {
-    if *i >= end || depth > 32 {
-        *i = end;
-        return Predicate::Unknown;
-    }
-    let head = word(t, *i);
-    *i += 1;
-    if word(t, *i) == "=" {
-        *i += 1;
-        let value = word(t, *i);
-        *i += 1;
-        return value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .map_or(Predicate::Unknown, |s| {
-                Predicate::Atom(head.into(), s.into())
-            });
-    }
-    if word(t, *i) != "(" {
-        return Predicate::Atom(head.into(), String::new());
-    }
-    *i += 1;
-    let mut args = Vec::new();
-    while *i < end && word(t, *i) != ")" {
-        args.push(parse(t, i, end, depth + 1));
-        match word(t, *i) {
-            "," => *i += 1,
-            ")" => break,
-            _ => {
-                *i = end;
-                return Predicate::Unknown;
+    pub(super) fn combine(terms: &[Self], target: Option<Target>, all: bool) -> Option<bool> {
+        let mut result = Some(all);
+        for term in terms {
+            let value = term.eval(target);
+            if value == Some(!all) {
+                return value;
             }
+            result = result.and(value);
+        }
+        result
+    }
+}
+/// Attribute argument lists and boolean predicates use the same balanced
+/// meta-item boundaries, including commas inside nested calls.
+#[derive(Clone, Copy)]
+struct Meta<'a, 's> {
+    tokens: &'a [Token<'s>],
+    pairs: &'a [usize],
+    start: usize,
+    end: usize,
+}
+impl<'a, 's> Meta<'a, 's> {
+    fn args(self) -> Option<impl Iterator<Item = Self>> {
+        let open = self.start + 1;
+        let close = self.end.checked_sub(1)?;
+        let paired = self.tokens.get(open).filter(|token| token.text == "(")
+            .and_then(|_| self.pairs.get(open)).copied();
+        if open >= close || paired != Some(close) {
+            return None;
+        }
+        let mut start = open + 1;
+        Some(std::iter::from_fn(move || {
+            if start >= close {
+                return None;
+            }
+            let end = until_before(self.tokens, self.pairs, start..close, &[","]);
+            let arg = Self { start, end, ..self };
+            start = end + 1;
+            Some(arg)
+        }))
+    }
+    fn first_arg(self) -> Option<(Self, impl Iterator<Item = Self>)> {
+        let mut args = self.args()?;
+        Some((args.next()?, args))
+    }
+    fn value(self) -> Option<&'s str> {
+        match &self.tokens[self.start..self.end] {
+            [_, eq, value] if eq.text == "=" => Some(value.text),
+            _ => None,
         }
     }
-    if *i >= end {
-        return Predicate::Unknown;
+    fn predicate(self, depth: usize) -> Predicate {
+        let name = word(self.tokens, self.start);
+        if self.end == self.start + 1 {
+            return Predicate::Atom(name.into(), String::new());
+        }
+        if let Some(value) = self.value().and_then(path_string) {
+            return Predicate::Atom(name.into(), value.into());
+        }
+        self.group_predicate(name, depth).unwrap_or(Predicate::Unknown)
     }
-    *i += 1;
-    match head {
-        "all" => Predicate::All(args),
-        "any" => Predicate::Any(args),
-        "not" if args.len() == 1 => Predicate::Not(Box::new(args.pop().unwrap())),
-        _ => Predicate::Unknown,
+
+    fn group_predicate(self, name: &str, depth: usize) -> Option<Predicate> {
+        if depth >= 32 {
+            return None;
+        }
+        let mut terms = self.args()?.map(|arg| arg.predicate(depth + 1));
+        match name {
+            "all" => Some(Predicate::All(terms.collect())),
+            "any" => Some(Predicate::Any(terms.collect())),
+            "not" => {
+                let term = terms.next()?;
+                terms.next().is_none().then_some(Predicate::Not(Box::new(term)))
+            }
+            _ => None,
+        }
     }
 }
-pub(super) fn condition(t: &[Token], pairs: &[usize], hash: usize) -> Option<Condition> {
-    if word(t, hash + 2) != "cfg" || word(t, hash + 3) != "(" {
-        return None;
+/// Consume consecutive outer attributes once, before visibility or the item.
+pub(super) fn attributes(
+    t: &[Token],
+    pairs: &[usize],
+    mut at: usize,
+    conditions: &mut Vec<Condition>,
+) -> (usize, Option<(usize, ModulePaths)>) {
+    let mut attrs = OuterAttributes::default();
+    while word(t, at) == "#" && word(t, at + 1) == "[" {
+        let Some(after) = after_group(pairs, at + 1) else {
+            return (t.len(), None);
+        };
+        attrs.observe(Meta {
+            tokens: t,
+            pairs,
+            start: at + 2,
+            end: after - 1,
+        });
+        at = after;
     }
-    let close = *pairs.get(hash + 3)?;
-    if close == usize::MAX {
-        return None;
+    if !attrs.predicates.is_empty()
+        && let Some(span) = item_span(t, pairs, at)
+    {
+        conditions.extend(attrs.predicates.into_iter().map(|predicate| Condition {
+            span: span.clone(),
+            predicate,
+        }));
     }
-    let mut i = hash + 4;
-    let predicate = parse(t, &mut i, close, 0);
-    if i != close {
-        return None;
+    let paths = attrs.paths;
+    if paths.is_empty() {
+        return (at, None);
     }
-    let mut item = pairs[hash + 1].checked_add(1)?;
-    while word(t, item) == "#" && word(t, item + 1) == "[" {
-        item = pairs[item + 1].checked_add(1)?;
+    let keyword = after_visibility(t, pairs, at);
+    let module = (word(t, keyword) == "mod").then_some((keyword, paths));
+    (at, module)
+}
+
+fn after_visibility(tokens: &[Token], pairs: &[usize], at: usize) -> usize {
+    if word(tokens, at) != "pub" {
+        return at;
     }
+    let next = at + 1;
+    if word(tokens, next) == "(" {
+        return after_group(pairs, next).unwrap_or(tokens.len());
+    }
+    next
+}
+
+#[derive(Default)]
+struct OuterAttributes {
+    guards: Vec<Predicate>,
+    paths: Vec<(Vec<Predicate>, String)>,
+    predicates: Vec<Predicate>,
+}
+
+enum Attribute {
+    Path,
+    Predicate,
+    Guarded,
+}
+
+impl Attribute {
+    fn read(meta: Meta) -> Option<Self> {
+        match word(meta.tokens, meta.start) {
+            "path" => Some(Self::Path),
+            "cfg" => Some(Self::Predicate),
+            "cfg_attr" => Some(Self::Guarded),
+            _ => None,
+        }
+    }
+}
+
+impl OuterAttributes {
+    fn observe(&mut self, meta: Meta) {
+        match Attribute::read(meta) {
+            Some(Attribute::Path) => {
+                let path = meta.value().and_then(path_string).unwrap_or("");
+                self.paths.push((self.guards.clone(), path.into()));
+            }
+            Some(Attribute::Predicate) => self.observe_predicate(meta),
+            Some(Attribute::Guarded) => self.observe_guarded(meta),
+            None => {}
+        }
+    }
+
+    fn observe_predicate(&mut self, meta: Meta) {
+        let Some((first, mut rest)) = meta.first_arg() else {
+            return;
+        };
+        if rest.next().is_none() {
+            self.predicates
+                .push(first.predicate(0).guarded_by(&self.guards));
+        }
+    }
+
+    fn observe_guarded(&mut self, meta: Meta) {
+        let Some((first, rest)) = meta.first_arg() else {
+            return;
+        };
+        if self.guards.len() >= 32 {
+            self.paths.push((self.guards.clone(), String::new()));
+            return;
+        }
+        self.guards.push(first.predicate(0));
+        for nested in rest {
+            self.observe(nested);
+        }
+        self.guards.pop();
+    }
+}
+
+fn path_string(raw: &str) -> Option<&str> {
+    if let Some(raw) = raw.strip_prefix('r') {
+        let hashes = raw.find('"')?;
+        let (tag, rest) = raw.split_at(hashes);
+        if !tag.bytes().all(|b| b == b'#') {
+            return None;
+        }
+        return rest.strip_suffix(tag)?.strip_prefix('"')?.strip_suffix('"');
+    }
+    raw.strip_prefix('"')?
+        .strip_suffix('"')
+        .filter(|s| !s.contains('\\'))
+}
+
+fn item_span(t: &[Token], pairs: &[usize], item: usize) -> Option<Range<usize>> {
     let start = t.get(item)?.span.start;
     let delimiter = until(t, pairs, item, &["{", ";", ",", "}"]);
     let finish = if word(t, delimiter) == "{" && pairs[delimiter] != usize::MAX {
@@ -168,58 +318,106 @@ pub(super) fn condition(t: &[Token], pairs: &[usize], hash: usize) -> Option<Con
     } else {
         delimiter.min(t.len() - 1)
     };
-    Some(Condition {
-        span: start..t[finish].span.end,
-        predicate,
-    })
+    Some(start..t[finish].span.end)
 }
-pub(super) fn disabled(units: &[Unit]) -> Vec<Vec<Range<usize>>> {
-    let mut configs = HashMap::new();
-    for unit in units {
-        let p = Path::new(unit.path);
-        let Some(dir) = p
-            .parent()
-            .filter(|d| d.file_name().is_some_and(|n| n == ".cargo"))
-        else {
-            continue;
+fn cargo_config<'a>(unit: &Unit<'a>) -> Option<(&'a Path, usize)> {
+    let path = Path::new(unit.path);
+    let dir = path.parent()?;
+    if dir.file_name()? != ".cargo" {
+        return None;
+    }
+    let priority = match path.file_name()?.to_str()? {
+        "config" => 2,
+        "config.toml" => 1,
+        _ => return None,
+    };
+    Some((dir.parent()?, priority))
+}
+
+#[derive(Default)]
+pub(super) struct FileConfig {
+    pub ranges: Vec<Range<usize>>,
+    // Empty when every declaration is active. Only configured files need a bitmap.
+    active_declarations: Vec<bool>,
+    pub target: Option<Target>,
+}
+
+impl FileConfig {
+    fn new(
+        target: Option<Target>,
+        conditions: &[Condition],
+        declarations: &[super::Declaration],
+    ) -> Self {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for span in conditions
+            .iter()
+            .filter(|c| c.predicate.eval(target) == Some(false))
+            .map(|c| &c.span)
+        {
+            extend_inactive_ranges(&mut ranges, span);
+        }
+        let active_declarations = if ranges.is_empty() {
+            Vec::new()
+        } else {
+            declarations
+                .iter()
+                .map(|d| active(&ranges, d.span.start))
+                .collect()
         };
-        let priority = match p.file_name().and_then(|s| s.to_str()) {
-            Some("config") => 2,
-            Some("config.toml") => 1,
-            _ => continue,
-        };
-        let Some(base) = dir.parent() else {
-            continue;
-        };
-        if configs.get(base).is_none_or(|(old, _)| *old < priority) {
-            configs.insert(base, (priority, Target::config(unit.text)));
+        Self {
+            target,
+            ranges,
+            active_declarations,
         }
     }
+    pub(super) fn declaration_active(&self, local: usize) -> bool {
+        self.active_declarations.get(local).copied().unwrap_or(true)
+    }
+}
+
+fn extend_inactive_ranges(ranges: &mut Vec<Range<usize>>, span: &Range<usize>) {
+    if let Some(last) = ranges.last_mut().filter(|last| last.end >= span.start) {
+        last.end = last.end.max(span.end);
+    } else {
+        ranges.push(span.clone());
+    }
+}
+
+pub(super) fn file_configs(units: &[Unit]) -> Vec<FileConfig> {
+    let mut configs = HashMap::new();
+    let candidates = units
+        .iter()
+        .filter_map(|unit| cargo_config(unit).map(|(base, priority)| (base, priority, unit.text)));
+    for (base, priority, text) in candidates {
+        select_config(configs.entry(base).or_insert((0, None)), priority, text);
+    }
+    let mut targets = HashMap::new();
     units
         .iter()
         .map(|u| {
-            let target = Path::new(u.path)
-                .ancestors()
-                .find_map(|p| configs.get(p).and_then(|(_, t)| *t))
-                .unwrap_or(Some(Target::host()));
-            let mut ranges: Vec<Range<usize>> = Vec::new();
-            if let Some(e) = &u.analysis.rust {
-                for c in &e.conditions {
-                    if c.predicate.eval(target) == Some(false) {
-                        if let Some(last) =
-                            ranges.last_mut().filter(|last| last.end >= c.span.start)
-                        {
-                            last.end = last.end.max(c.span.end);
-                        } else {
-                            ranges.push(c.span.clone());
-                        }
-                    }
-                }
-            }
-            ranges
+            let Some(evidence) = u.analysis.rust.as_ref().filter(|evidence| needs_target(evidence)) else {
+                return FileConfig::default();
+            };
+            let file = Path::new(u.path);
+            let dir = file.parent().unwrap_or(file);
+            let target = crate::domain::code::nearest_owner(&mut targets, dir, |p| {
+                configs.get(p).and_then(|(_, t)| *t)
+            })
+            .unwrap_or_else(|| Some(Target::host()));
+            FileConfig::new(target, &evidence.conditions, &u.analysis.declarations)
         })
         .collect()
 }
+fn select_config(selected: &mut (usize, Option<Option<Target>>), priority: usize, text: &str) {
+    if priority > selected.0 {
+        *selected = (priority, Target::config(text));
+    }
+}
+
+fn needs_target(evidence: &Evidence) -> bool {
+    !evidence.conditions.is_empty() || !evidence.scopes[0].children.is_empty()
+}
+
 pub(super) fn active(ranges: &[Range<usize>], at: usize) -> bool {
     !ranges
         .get(ranges.partition_point(|r| r.end <= at))
@@ -228,4 +426,10 @@ pub(super) fn active(ranges: &[Range<usize>], at: usize) -> bool {
 
 crate::domain::code::cache::record!(Condition { span, predicate });
 
-impl crate::domain::code::cache::Wire for Predicate{fn save(&self,w:&mut impl crate::domain::code::cache::Output){match self{Self::Atom(a, b)=>{ w.push(0); a.save(w);b.save(w);},Self::All(a)=>{ w.push(1); a.save(w);},Self::Any(a)=>{ w.push(2); a.save(w);},Self::Not(a)=>{ w.push(3); a.save(w);},Self::Unknown=>{ w.push(4); }}}fn load(r:&mut &[u8])->std::io::Result<Self>{use crate::domain::code::cache::Wire;match usize::load(r)?{0=>Ok(Self::Atom(Wire::load(r)?, Wire::load(r)?)),1=>Ok(Self::All(Wire::load(r)?)),2=>Ok(Self::Any(Wire::load(r)?)),3=>Ok(Self::Not(Wire::load(r)?)),4=>Ok(Self::Unknown),_=>Err(crate::domain::code::cache::bad())}}}
+crate::domain::code::cache::tagged!(Predicate {
+    0 => Atom(key, value),
+    1 => All(terms),
+    2 => Any(terms),
+    3 => Not(term),
+    4 => Unknown,
+});

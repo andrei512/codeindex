@@ -6,6 +6,7 @@
 import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ from urllib.request import urlopen
 
 import html5lib
 
-from language_conformance import ROOT, git
+from language_conformance import ROOT, git, symbol_error
 
 # Cohorts frozen before measuring. Sample MDN by a hash of the path irrespective of source.
 CORPUS = (
@@ -37,7 +38,8 @@ def fetch(url):
         return response.read()
 
 
-def sources(project, commit, prefix, limit, cache):
+def sources(corpus, cache):
+    project, commit, prefix, limit = corpus
     directory = cache / commit
     directory.mkdir(parents=True, exist_ok=True)
     tree_file = directory / "tree.json"
@@ -50,26 +52,28 @@ def sources(project, commit, prefix, limit, cache):
             and r["path"].startswith(prefix) and r["path"].lower().endswith((".html", ".htm"))]
     rows.sort(key=lambda row: hashlib.sha256(row[0].encode()).digest())
 
-    def read(row):
-        path, blob = row
-        cached = directory / blob
-        body = cached.read_bytes() if cached.is_file() else fetch(
-            f"https://raw.githubusercontent.com/{project}/{commit}/{quote(path)}")
-        identity = hashlib.sha1(b"blob " + str(len(body)).encode() + b"\0" + body).hexdigest()
-        if identity != blob:
-            raise ValueError(f"blob mismatch for {project}/{path}")
-        if not cached.exists():
-            cached.write_bytes(body)
-        return path, body.decode("utf-8")
     with ThreadPoolExecutor(max_workers=6) as pool:
-        return list(pool.map(read, rows[:limit]))
+        return list(pool.map(partial(read_blob, project, commit, directory), rows[:limit]))
+
+
+def read_blob(project, commit, directory, row):
+    path, blob = row
+    cached = directory / blob
+    body = cached.read_bytes() if cached.is_file() else fetch(
+        f"https://raw.githubusercontent.com/{project}/{commit}/{quote(path)}")
+    identity = hashlib.sha1(b"blob " + str(len(body)).encode() + b"\0" + body).hexdigest()
+    if identity != blob:
+        raise ValueError(f"blob mismatch for {project}/{path}")
+    if not cached.exists():
+        cached.write_bytes(body)
+    return path, body.decode("utf-8")
 
 
 def dom_ids(source):
     return [e.attrib["id"] for e in html5lib.parse(source).iter() if "id" in e.attrib]
 
 
-def witness(source):
+def annotate_candidates(source):
     # Replace each lexical candidate's VALUE with a unique inert identifier, then
     # map only the identifiers observed in the parsed DOM back to original spans.
     prefix = "cxOracleTag"
@@ -89,6 +93,11 @@ def witness(source):
         return source[match.start():start] + tag + source[end:match.end()]
 
     marked = CANDIDATE.sub(mark, source)
+    return marked, sites, names
+
+
+def witness(source):
+    marked, sites, names = annotate_candidates(source)
     expected = defaultdict(list)
     reconstructed = []
     for tag in dom_ids(marked):
@@ -99,13 +108,29 @@ def witness(source):
         else:
             reconstructed.append(tag)
     original_ids = dom_ids(source)
-    if Counter(reconstructed) != Counter(original_ids):
-        raise ValueError("source annotation changed the HTML5 DOM id multiset")
+    if reconstructed != original_ids:
+        raise ValueError("source annotation changed the HTML5 DOM id sequence")
     # Entity spellings can decode to the same name as a literal candidate.
     # A missing independent source location leaves that name unverified.
     complete = Counter(original_ids)
     unanchored = sorted(n for n in names | set(original_ids) if len(expected[n]) != complete[n])
     return {n: sorted(expected[n]) for n in sorted(names) if n not in unanchored}, unanchored
+
+
+def compare_hits(result, path, name, sites):
+    answer, exit_code = result
+    hits = answer["hits"]
+    if error := symbol_error(answer, name):
+        return dict(name=name, **error)
+    if exit_code != int(not hits) or any(r["path"] != path for r in hits):
+        return dict(name=name, expected=sites, hits=hits, exit_code=exit_code)
+    if answer["truncated"]:
+        return None
+    # Embedded JS and CSS may have independent declarations of this name.
+    rows = [(r["line"], r["col"]) for r in hits if r["kind"] == "attribute"]
+    if sorted(rows) != sites:
+        return dict(name=name, expected=sites, actual=rows, exit_code=exit_code)
+    return None
 
 
 def query_file(binary, label, body):
@@ -123,15 +148,22 @@ def query_file(binary, label, body):
                                     env={**os.environ, "HOME":str(home), "GIT_CONFIG_GLOBAL":"./.missing-config",
                                          "GIT_CONFIG_NOSYSTEM":"1"}, capture_output=True, text=True, timeout=60)
             answer = json.loads(result.stdout)
-            # Embedded JS and CSS may have independent declarations of this name.
-            rows = [(r["line"], r["col"]) for r in answer["hits"] if r["kind"] == "attribute"]
-            if answer["truncated"]:
+            diff = compare_hits((answer, result.returncode), path, name, sites)
+            if diff:
+                diffs.append(diff)
+            elif answer["truncated"]:
                 unverified.append(name)
-            elif (sorted(rows) != sites or result.returncode != int(not answer["hits"])
-                  or any(r["path"] != path or r["name"] != name for r in answer["hits"])):
-                diffs.append(dict(name=name, expected=sites, actual=rows, exit_code=result.returncode))
     return dict(path=label, queries=len(expected), witnessed_ids=sum(map(len, expected.values())),
                 negative_queries=sum(not s for s in expected.values()), unverified=unverified, diffs=diffs)
+
+
+def check_witness():
+    # A false id in raw text and duplicate real ids must survive the independent
+    # mapping as three distinct source candidates, including the rejected one.
+    control = '<iframe><a id="x">x</a></iframe>\n<div id="y"></div><p id=y></p>'
+    expected, gaps = witness(control)
+    if expected != {"x": [], "y": [(2, 10), (2, 25)]} or gaps:
+        raise ValueError(f"HTML5 witness failed its controls: {expected} {gaps}")
 
 
 def main():
@@ -141,22 +173,22 @@ def main():
     args = parser.parse_args()
     if html5lib.__version__ != "1.1":
         raise ValueError("expected html5lib 1.1")
-    # A false id in raw text and duplicate real ids must survive the independent
-    # mapping as three distinct source candidates, including the rejected one.
-    control = '<iframe><a id="x">x</a></iframe>\n<div id="y"></div><p id=y></p>'
-    expected, gaps = witness(control)
-    if expected != {"x": [], "y": [(2, 10), (2, 25)]} or gaps:
-        raise ValueError(f"HTML5 witness failed its controls: {expected} {gaps}")
+    check_witness()
     result = {}
-    for project, commit, prefix, limit in CORPUS:
-        rows = sources(project, commit, prefix, limit, ROOT / "target/html-oracle-sources")
+    for corpus in CORPUS:
+        project, commit, _, _ = corpus
+        rows = sources(corpus, ROOT / "target/html-oracle-sources")
         reports = [query_file(args.binary.resolve(), path, source) for path, source in rows]
         result[project] = dict(commit=commit, files=reports)
         print(project, len(rows), "files", sum(r["queries"] for r in reports), "queries",
               sum(len(r["diffs"]) for r in reports), "mismatches", flush=True)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(result, indent=2) + "\n")
-    return int(any(f["diffs"] or f["unverified"] for pkg in result.values() for f in pkg["files"]))
+    return int(has_unverified_results(result))
+
+
+def has_unverified_results(result):
+    return any(f["diffs"] or f["unverified"] for pkg in result.values() for f in pkg["files"])
 
 
 if __name__ == "__main__":

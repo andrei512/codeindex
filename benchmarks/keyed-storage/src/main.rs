@@ -21,6 +21,36 @@ fn expected(rows: &Rows, from: &Vec<u8>, limit: usize) -> Vec<Entry> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
+fn measure_queries(store: &Store, truth: &Rows, keys: &BTreeSet<Vec<u8>>) -> Result<()> {
+    for key in keys {
+        let want = expected(truth, key, 20);
+        let start = Instant::now();
+        let answer = store.scan(key, 20)?;
+        let elapsed = micros(start);
+        if answer != want {
+            return Err("range scan differs from fresh projection".into());
+        }
+        println!("query_us {elapsed}");
+    }
+    Ok(())
+}
+
+fn measure_generation(
+    store: &mut Store,
+    truth: &mut Rows,
+    edits: &tree::Edits,
+    keys: &BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    let start = Instant::now();
+    store.edit(edits)?;
+    println!("edit_us {}", micros(start));
+    apply(truth, edits);
+    let start = Instant::now();
+    store.reopen()?;
+    println!("reopen_us {}", micros(start));
+    measure_queries(store, truth, keys)
+}
+
 fn run() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     if args.len() != 4 {
@@ -50,29 +80,8 @@ fn run() -> Result<()> {
         .collect();
     keys.insert(vec![255]);
     keys.extend(trace.edits.keys().cloned());
-    for i in 0..32 {
-        let edits = if i % 2 == 0 {
-            &trace.edits
-        } else {
-            &trace.undo
-        };
-        let t = Instant::now();
-        s.edit(edits)?;
-        println!("edit_us {}", micros(t));
-        apply(&mut truth, edits);
-        let t = Instant::now();
-        s.reopen()?;
-        println!("reopen_us {}", micros(t));
-        for k in &keys {
-            let want = expected(&truth, k, 20);
-            let t = Instant::now();
-            let answer = s.scan(k, 20)?;
-            let elapsed = micros(t);
-            if answer != want {
-                return Err("range scan differs from fresh projection".into());
-            }
-            println!("query_us {elapsed}");
-        }
+    for edits in [&trace.edits, &trace.undo].into_iter().cycle().take(32) {
+        measure_generation(&mut s, &mut truth, edits, &keys)?;
     }
     println!("churn_bytes {}", bytes(path)?);
     let t = Instant::now();
