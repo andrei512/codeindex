@@ -1,0 +1,17 @@
+name: Minimum Rust build
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with the declared minimum Rust version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then version="$version.0"; fi
+          rustup toolchain install "$version" --profile minimal
+          cargo "+$version" build --release --locked

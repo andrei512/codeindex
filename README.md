@@ -10,6 +10,8 @@ Outside Git, run the same commands from the folder you want to search. Pattern s
 
 ## Install
 
+Building Codeindex requires Rust 1.96 or newer.
+
 ```sh
 cargo install --locked codeindex
 ```
